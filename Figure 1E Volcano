@@ -1,0 +1,397 @@
+#############################
+# gene_stats.R  (deduplicated per gene)
+#############################
+
+# ---- Paths ----
+expression_matrix_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
+metadata_path          <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt"
+gene_annotations_path  <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
+output_dir_path        <- "/Users/adrian/Desktop/EQU.03/"
+volcano_pdf_path       <- "/Users/adrian/Desktop/EQU.03/volcano_plots_combined_with_edgeR.pdf"
+
+# ---- Libraries ----
+library(edgeR)
+library(ggplot2)
+library(dplyr)
+library(ggrepel)      # (not used for volcanoes but fine to keep)
+library(biomaRt)
+library(ggsci)
+library(gridExtra)
+library(ggtext)
+library(grid)
+
+#############################
+# Step 1: Load expression matrix
+#############################
+expression_matrix <- read.table(
+  expression_matrix_path,
+  header    = TRUE,
+  row.names = 1,
+  sep       = "\t",
+  check.names = FALSE
+)
+
+#############################
+# Step 2: Load sample metadata
+#############################
+metadata <- read.table(
+  metadata_path,
+  header = TRUE,
+  sep    = "\t"
+)
+rownames(metadata) <- metadata$Sample
+
+# align columns
+expression_matrix <- expression_matrix[, rownames(metadata)]
+
+#############################
+# Step 3: Group factor
+#############################
+metadata$Group <- factor(metadata$Group, levels = c("SE", "TE", "TL", "AE", "AL"))
+if (any(is.na(metadata$Group))) {
+  stop("Error: Some samples have invalid or missing group labels in the metadata.")
+}
+
+#############################
+# Step 4: DGEList + norm
+#############################
+dge <- DGEList(counts = expression_matrix, group = metadata$Group)
+dge <- calcNormFactors(dge)
+
+#############################
+# Step 5: Design + dispersion
+#############################
+design <- model.matrix(~ 0 + Group, data = metadata)  # no intercept
+colnames(design) <- levels(metadata$Group)
+
+dge  <- estimateDisp(dge, design)
+fit  <- glmQLFit(dge, design)
+
+#############################
+# Step 6: Contrasts
+#############################
+contrasts <- makeContrasts(
+  SE_vs_TE = SE - TE,
+  TE_vs_TL = TE - TL,
+  TL_vs_AE = TL - AE,
+  AE_vs_AL = AE - AL,
+  AL_vs_TE = AL - TE,
+  AL_vs_SE = AL - SE,
+  levels = design
+)
+
+#############################
+# Step 7: DE per contrast, keeping one row per gene
+#############################
+
+gene_annotations <- read.table(
+  gene_annotations_path,
+  header = TRUE,
+  sep    = "\t",
+  stringsAsFactors = FALSE
+)
+colnames(gene_annotations)[1] <- "GeneID"
+
+if (!dir.exists(output_dir_path)) {
+  dir.create(output_dir_path, recursive = TRUE)
+}
+output_dir <- output_dir_path
+
+results_list <- list()
+
+for (contrast_name in colnames(contrasts)) {
+
+  # 1) edgeR test
+  res <- glmQLFTest(fit, contrast = contrasts[, contrast_name])
+
+  # 2) raw table exactly like the Venn script
+  raw_tab <- topTags(res, n = Inf)$table
+  raw_tab$GeneID <- rownames(raw_tab)
+
+  # 3) enforce one row per gene (just in case)
+  raw_tab <- raw_tab %>%
+    dplyr::distinct(GeneID, .keep_all = TRUE)
+
+  # 4) classify significance (this object will drive volcano + counts)
+  raw_tab <- raw_tab %>%
+    mutate(Significance = case_when(
+      FDR < 0.01 & logFC > 0 ~ "Upregulated",
+      FDR < 0.01 & logFC < 0 ~ "Downregulated",
+      TRUE                   ~ "Not Significant"
+    ))
+
+  # 5) make an *annotated* version ONLY for writing to file
+  annotated_tab <- raw_tab %>%
+    left_join(gene_annotations, by = "GeneID")
+
+  write.table(
+    annotated_tab,
+    file      = file.path(output_dir, paste0(contrast_name, "_differential_expression.txt")),
+    sep       = "\t",
+    quote     = FALSE,
+    row.names = FALSE
+  )
+
+  # 6) gene list (one per line)
+  write.table(
+    raw_tab$GeneID,
+    file      = file.path(output_dir, paste0(contrast_name, "_gene_list.txt")),
+    quote     = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+
+  # 7) store the *raw* table (per-gene) for downstream plots & stats
+  results_list[[contrast_name]] <- raw_tab
+}
+
+
+#############################
+# Step 8: Volcano plots (shared legend, per-gene counts)
+#############################
+
+my_colors <- pal_jama("default")(3)
+color_values <- c(
+  "Upregulated"     = my_colors[3],
+  "Downregulated"   = my_colors[2],
+  "Not Significant" = my_colors[1]
+)
+
+global_x_min <- min(sapply(results_list, function(df) min(df$logFC, na.rm = TRUE)))
+global_x_max <- max(sapply(results_list, function(df) max(df$logFC, na.rm = TRUE)))
+global_y_max <- max(sapply(results_list, function(df) max(-log10(df$FDR), na.rm = TRUE)))
+
+plots_list <- list()
+
+for (contrast_name in names(results_list)) {
+  results <- results_list[[contrast_name]]
+
+  up_count   <- sum(results$Significance == "Upregulated")
+  down_count <- sum(results$Significance == "Downregulated")
+
+  plot_title <- gsub("_vs_", "-", contrast_name)
+
+  subtitle_text <- paste0(
+    "<span style='color:", color_values["Downregulated"], "'>Down: ", down_count, "</span>",
+    "  ",
+    "<span style='color:", color_values["Upregulated"], "'>Up: ", up_count, "</span>"
+  )
+
+  p <- ggplot(results, aes(x = logFC, y = -log10(FDR), color = Significance)) +
+    geom_point(alpha = 0.8, size = 2) +
+    scale_color_manual(values = color_values) +
+    labs(
+      title    = plot_title,
+      subtitle = subtitle_text,
+      x        = "Log Fold Change (log2)",
+      y        = "-Log10(FDR)",
+      color    = "Significance"
+    ) +
+    scale_x_continuous(limits = c(global_x_min, global_x_max), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, 6.5), expand = c(0, 0)) +
+    theme_classic() +
+    theme(
+      plot.title      = element_text(size = 16, face = "bold", hjust = 0.5),
+      plot.subtitle   = element_markdown(size = 14, face = "bold", hjust = 0.5),
+      axis.title      = element_text(size = 14, face = "bold"),
+      axis.text       = element_text(size = 12),
+      axis.line       = element_line(size = 1.2),
+      legend.title    = element_text(size = 12, face = "bold"),
+      legend.text     = element_text(size = 10)
+    )
+
+  plots_list[[contrast_name]] <- p
+}
+
+g_legend <- function(a.gplot) {
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  tmp$grobs[[leg]]
+}
+
+legend_grob <- g_legend(plots_list[[1]])
+plots_list  <- lapply(plots_list, function(x) x + theme(legend.position = "none"))
+
+pdf(volcano_pdf_path, width = 14, height = 10)
+grid.arrange(
+  arrangeGrob(grobs = plots_list, nrow = 2, ncol = 3),
+  legend_grob,
+  ncol    = 2,
+  widths  = c(10, 2)
+)
+dev.off()
+cat("Volcano plots saved in '", volcano_pdf_path, "'.\n", sep = "")
+
+#############################
+# Step 9: Collect Target_gene IDs of significant genes (per gene, per contrast)
+#############################
+
+all_target_ids <- c()
+
+for (contrast_name in names(results_list)) {
+  sig <- results_list[[contrast_name]] %>%
+    filter(FDR < 0.01) %>%
+    dplyr::distinct(GeneID, .keep_all = TRUE) %>%        # safety: unique genes
+    dplyr::select(GeneID, Target_gene)
+
+  all_target_ids <- c(all_target_ids, sig$Target_gene)
+
+  sig_ids <- sig$GeneID
+  write.table(
+    sig_ids,
+    file      = file.path(output_dir, paste0(contrast_name, "_significant_genes.txt")),
+    quote     = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+}
+
+all_target_ids <- unique(all_target_ids)
+all_target_ids <- all_target_ids[!is.na(all_target_ids) & all_target_ids != ""]
+
+gs_ids    <- all_target_ids[grepl("^ENSSTOG", all_target_ids)]
+other_ids <- all_target_ids[!grepl("^ENSSTOG", all_target_ids)]
+
+ensembl_main <- useMart("ensembl", host = "https://www.ensembl.org")
+
+safe_query_biomart <- function(dataset_name, gene_ids) {
+  tryCatch({
+    dataset_mart <- useMart("ensembl", dataset = dataset_name)
+    getBM(
+      attributes = c("ensembl_gene_id", "gene_biotype"),
+      filters    = "ensembl_gene_id",
+      values     = gene_ids,
+      mart       = dataset_mart
+    )
+  }, error = function(e) {
+    message(paste("Could not query dataset:", dataset_name, "- Error:", e$message))
+    data.frame(ensembl_gene_id = character(), gene_biotype = character())
+  })
+}
+
+# ground squirrel
+gs_info <- data.frame()
+if (length(gs_ids) > 0) {
+  message("Attempting to query ground squirrel genes from Ensembl...")
+  gs_dataset <- "itridecemlineatus_gene_ensembl"
+  gs_info <- safe_query_biomart(gs_dataset, gs_ids)
+
+  if (nrow(gs_info) == 0) {
+    datasets <- listDatasets(ensembl_main)
+    possible_gs <- datasets[grep("tridecemlineatus|squirrel|ictidomys",
+                                 datasets$description, ignore.case = TRUE), ]
+    if (nrow(possible_gs) > 0) {
+      alt_dataset <- possible_gs$dataset[1]
+      message(paste("Trying alternative dataset:", alt_dataset))
+      gs_info <- safe_query_biomart(alt_dataset, gs_ids)
+    }
+  }
+  if (nrow(gs_info) > 0) {
+    names(gs_info)[1] <- "Target_gene"
+    message(paste("Retrieved info for", nrow(gs_info), "ground squirrel genes"))
+  }
+}
+
+# others (mouse)
+other_info <- data.frame()
+if (length(other_ids) > 0) {
+  message("Attempting to query other genes from Ensembl using mouse dataset...")
+  mouse_dataset <- "mmusculus_gene_ensembl"
+  other_info <- safe_query_biomart(mouse_dataset, other_ids)
+
+  if (nrow(other_info) == 0) {
+    datasets <- listDatasets(ensembl_main)
+    possible_mouse <- datasets[grep("mouse|musculus",
+                                    datasets$description, ignore.case = TRUE), ]
+    if (nrow(possible_mouse) > 0) {
+      alt_dataset <- possible_mouse$dataset[1]
+      message(paste("Trying alternative dataset:", alt_dataset))
+      other_info <- safe_query_biomart(alt_dataset, other_ids)
+    }
+  }
+  if (nrow(other_info) > 0) {
+    names(other_info)[1] <- "Target_gene"
+    message(paste("Retrieved info for", nrow(other_info), "other genes"))
+  }
+}
+
+gene_info <- rbind(gs_info, other_info)
+if (nrow(gene_info) == 0) {
+  warning("No gene information returned from Ensembl. Creating minimal NA table.")
+  gene_info <- data.frame(
+    Target_gene  = all_target_ids,
+    gene_biotype = rep(NA, length(all_target_ids))
+  )
+}
+
+#############################
+# Step 10: Per-contrast summary of biotypes (per gene)
+#############################
+summary_list <- list()
+
+for (contrast_name in names(results_list)) {
+  message(paste("Processing contrast:", contrast_name))
+
+  significant_results <- results_list[[contrast_name]] %>%
+    filter(FDR < 0.01) %>%
+    dplyr::distinct(GeneID, .keep_all = TRUE)
+
+  if (nrow(significant_results) == 0) {
+    message(paste("No significant genes found for contrast:", contrast_name))
+    summary_list[[contrast_name]] <- data.frame(
+      Contrast          = contrast_name,
+      Total             = 0,
+      ProteinCoding     = 0,
+      ProteinCodingPct  = 0,
+      NonProteinCoding  = 0,
+      NonProteinCodingPct = 0,
+      Unannotated       = 0,
+      UnannotatedPct    = 0,
+      stringsAsFactors  = FALSE
+    )
+    next
+  }
+
+  significant_results <- merge(
+    significant_results,
+    gene_info,
+    by.x = "Target_gene",
+    by.y = "Target_gene",
+    all.x = TRUE
+  )
+
+  significant_results <- significant_results %>%
+    mutate(Category = case_when(
+      is.na(gene_biotype)             ~ "Unannotated",
+      gene_biotype == "protein_coding"~ "Protein coding",
+      TRUE                            ~ "Non protein coding"
+    ))
+
+  total_genes        <- nrow(significant_results)
+  protein_coding_cnt <- sum(significant_results$Category == "Protein coding")
+  non_protein_cnt    <- sum(significant_results$Category == "Non protein coding")
+  unannotated_cnt    <- sum(significant_results$Category == "Unannotated")
+
+  summary_list[[contrast_name]] <- data.frame(
+    Contrast            = contrast_name,
+    Total               = total_genes,
+    ProteinCoding       = protein_coding_cnt,
+    ProteinCodingPct    = round(100 * protein_coding_cnt / total_genes, 2),
+    NonProteinCoding    = non_protein_cnt,
+    NonProteinCodingPct = round(100 * non_protein_cnt / total_genes, 2),
+    Unannotated         = unannotated_cnt,
+    UnannotatedPct      = round(100 * unannotated_cnt / total_genes, 2),
+    stringsAsFactors    = FALSE
+  )
+}
+
+summary_df <- do.call(rbind, summary_list)
+write.table(
+  summary_df,
+  file      = file.path(output_dir, "significant_gene_annotation_summary.txt"),
+  sep       = "\t",
+  quote     = FALSE,
+  row.names = FALSE
+)
+cat("\nSignificant gene annotation summary saved in '",
+    file.path(output_dir, "significant_gene_annotation_summary.txt"), "'.\n", sep = "")
