@@ -1,0 +1,147 @@
+# ----------------------------
+# Install and load required packages
+# ----------------------------
+if (!requireNamespace("BiocManager", quietly=TRUE))
+  install.packages("BiocManager")
+pkgs <- c(
+  "clusterProfiler", "org.Hs.eg.db",
+  "ggplot2", "ggsci", "dplyr"
+)
+for (pkg in pkgs) {
+  if (!requireNamespace(pkg, quietly=TRUE))
+    BiocManager::install(pkg)
+  library(pkg, character.only=TRUE)
+}
+
+# ----------------------------
+# 1) Define your gene list exactly as given
+# ----------------------------
+genes <- c(
+  "GRN","COA3","PHB1","PELP1",
+  "SCAMP4","RPS15","NDUFS7","GPX4","BSG","HCN2",
+  "FCGR1A","GPR37L1","BCKDHA","AP1S1","VGF","ALDOA",
+  "TRAP1","SERPINA3","IFI27L2","LGALS3","GLDN","CIB1",
+  "NDN","TUBA4A","AHCY","HCK","SCG2","CYBA","ADGRG1",
+  "UCHL1","LAPTM5","TUBA1B","EXOC6B","SH3BGRL3",
+  "C1QB","C1QA","GRHPR","ITGB2","ATP5PO","SLC25A34",
+  "TMPRSS3","FBXO44","ME3","UCP2","CCKBR","CCDC86",
+  "NUDT22","ACOT7","PC","TF","GPX1","UQCRC1","GAPDH",
+  "LDHB","LDOC1","GDI1","G6PD","PCSK1N","UBA1","COPE",
+  "TMEM59L","THBS4","FKBP8","MPV17L2","PGLS","LCOR",
+  "CD74","FZD6","MRPL4","PPP1R11","MYO1F","HLA-DPB1",
+  "ALOX5AP","AGT","GPS1"
+)
+# remove any blanks or literal "NA"
+genes <- unique(genes[genes != "" & genes != "NA"])
+
+# ----------------------------
+# 2) Sanity check: map symbols to Entrez IDs and report unmapped
+# ----------------------------
+gene_map <- bitr(
+  genes,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+mapped   <- gene_map$SYMBOL
+unmapped <- setdiff(genes, mapped)
+
+cat("Total symbols provided:   ", length(genes),   "\n")
+cat("Successfully mapped:      ", length(mapped),  "\n")
+cat("Failed to map:            ", length(unmapped), "\n")
+if (length(unmapped) > 0) {
+  cat("Unmapped symbols:\n")
+  print(unmapped)
+}
+
+entrez_ids <- gene_map$ENTREZID
+
+# ----------------------------
+# 3) GO enrichment analysis
+# ----------------------------
+ego <- enrichGO(
+  gene         = entrez_ids,
+  OrgDb        = org.Hs.eg.db,
+  ont          = "BP",
+  pAdjustMethod= "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.10,
+  readable     = TRUE
+)
+ego_df <- as.data.frame(ego)
+# compute RichFactor = Count / (BgRatio numerator)
+ego_df$Bg        <- as.numeric(sub("/.*", "", ego_df$BgRatio))
+ego_df$RichFactor <- ego_df$Count / ego_df$Bg
+
+# ----------------------------
+# 4) KEGG pathway enrichment
+# ----------------------------
+ekegg <- enrichKEGG(
+  gene         = entrez_ids,
+  organism     = "hsa",
+  pvalueCutoff = 0.05
+)
+ekegg <- setReadable(ekegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+ekegg_df <- as.data.frame(ekegg)
+# strip "hsa" prefix from ID, compute RichFactor
+ekegg_df$ID         <- sub("^hsa", "", ekegg_df$ID)
+ekegg_df$Bg         <- as.numeric(sub("/.*", "", ekegg_df$BgRatio))
+ekegg_df$RichFactor <- ekegg_df$Count / ekegg_df$Bg
+
+# ----------------------------
+# 5) Create output directory
+# ----------------------------
+outdir <- "go_kegg_results"
+if (!dir.exists(outdir)) dir.create(outdir)
+
+# ----------------------------
+# 6) Write results to CSV
+# ----------------------------
+write.csv(ego_df,    file = file.path(outdir, "GO_BP_enrichment.csv"),    row.names = FALSE)
+write.csv(ekegg_df,  file = file.path(outdir, "KEGG_enrichment.csv"),    row.names = FALSE)
+
+# ----------------------------
+# 7) Visualization
+# ----------------------------
+# prepare a continuous NPG palette of 10 anchors
+npg_cols <- pal_npg("nrc")(10)
+
+# 7a) GO RichFactor dotplot (top 20)
+topGO <- ego_df %>% arrange(desc(RichFactor)) %>% head(20)
+p1 <- ggplot(topGO,
+             aes(x = RichFactor,
+                 y = reorder(Description, RichFactor),
+                 color = RichFactor,
+                 size  = Count)) +
+  geom_point() +
+  scale_color_gradientn(colors = npg_cols) +
+  labs(x = "Rich Factor",
+       y = "GO term",
+       color = "Rich\nFactor",
+       size  = "Gene\nCount") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 10))
+ggsave(file.path(outdir, "GO_RichFactor_dotplot.pdf"),
+       plot = p1, width = 8, height = 6)
+
+# 7b) KEGG RichFactor barplot (top 20)
+topKEGG <- ekegg_df %>% arrange(desc(RichFactor)) %>% head(20)
+p2 <- ggplot(topKEGG,
+             aes(x = RichFactor,
+                 y = reorder(Description, RichFactor),
+                 fill = RichFactor)) +
+  geom_col() +
+  scale_fill_gradientn(colors = npg_cols) +
+  labs(x = "Rich Factor",
+       y = "KEGG pathway",
+       fill= "Rich\nFactor") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 14))
+ggsave(file.path(outdir, "KEGG_RichFactor_barplot.pdf"),
+       plot = p2, width = 8, height = 6)
+
+# ----------------------------
+# 8) Save session info
+# ----------------------------
+writeLines(capture.output(sessionInfo()),
+           con = file.path(outdir, "sessionInfo.txt"))
