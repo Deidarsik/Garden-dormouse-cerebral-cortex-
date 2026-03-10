@@ -1,47 +1,53 @@
 #!/usr/bin/env Rscript
 library(ggplot2)
 
-# 1) Create time vector
-x <- seq(0, 20, length.out = 1000)
+x <- seq(0, 20, length.out = 2000)
 
-# 2) PARAMETERS
-high_temp     <- 37    # arousal plateau
-low_temp      <- 5     # torpor plateau
-high_duration <- 0.8   # days at high_temp (< 1 day)
-low_duration  <- 7     # days at low_temp
+high_temp     <- 37
+low_temp      <- 5
+high_duration <- 2.4
+low_duration  <- 5.4
 period        <- high_duration + low_duration
 
-# 3) Build a raw rectangular wave 
-#    exactly low_temp for most of the period,
-#    exactly high_temp for the first high_duration days
-t_mod  <- x %% period
-y_rect <- ifelse(t_mod < high_duration, high_temp, low_temp)
+transition <- 0.15   # width of each smooth edge in days
 
-# 4) Gaussian smoothing kernel (only to soften the two edges)
-sigma <- 0.2                       # smoothing width in days; tweak as needed
-dt    <- x[2] - x[1]              # ~0.02 days
-# build kernel covering ±3σ
-k_t   <- seq(-3*sigma, 3*sigma, by = dt)
-kernel <- dnorm(k_t, mean = 0, sd = sigma)
-kernel <- kernel / sum(kernel)    # normalize
+t_mod <- x %% period
 
-# 5) Convolve (moving‐average) with sides=2 for centered smoothing
-#    any constant region (the flat parts) remains exactly constant
-y_smooth <- stats::filter(y_rect, kernel, sides = 2)
-# at the very ends filter() produces NAs; just fall back to the raw
-y_smooth[is.na(y_smooth)] <- y_rect[is.na(y_smooth)]
+y <- numeric(length(x))
 
-# 6) Put into a data frame
-df <- data.frame(Days = x, Temperature = as.numeric(y_smooth))
+for (i in seq_along(t_mod)) {
+  t <- t_mod[i]
+  
+  if (t < (high_duration - transition)) {
+    # flat high plateau
+    y[i] <- high_temp
+    
+  } else if (t < high_duration) {
+    # smooth fall from high to low
+    u <- (t - (high_duration - transition)) / transition
+    s <- 0.5 - 0.5 * cos(pi * u)   # smooth cosine easing
+    y[i] <- high_temp + (low_temp - high_temp) * s
+    
+  } else if (t < (period - transition)) {
+    # flat low plateau
+    y[i] <- low_temp
+    
+  } else {
+    # smooth rise from low to high
+    u <- (t - (period - transition)) / transition
+    s <- 0.5 - 0.5 * cos(pi * u)
+    y[i] <- low_temp + (high_temp - low_temp) * s
+  }
+}
 
-# 7) Plot
+df <- data.frame(Days = x, Temperature = y)
+
 p <- ggplot(df, aes(x = Days, y = Temperature)) +
-  geom_line(size = 1) +
+  geom_line(linewidth = 1) +
   scale_x_continuous(
     breaks = seq(0, 20, by = 5),
     limits = c(0, 20)
   ) +
-  # keep y‐axis between 4 and 37 °C
   scale_y_continuous(
     breaks = c(4, 20, 37),
     limits = c(4, 37)
@@ -49,11 +55,14 @@ p <- ggplot(df, aes(x = Days, y = Temperature)) +
   labs(x = "Days", y = "Body Temperature (°C)") +
   theme_classic(base_size = 35) +
   theme(
-    axis.line   = element_line(color = "black", size = 1.5),
+    axis.line   = element_line(color = "black", linewidth = 1.5),
     axis.text.x = element_text(size = rel(1.5)),
     axis.text.y = element_text(size = rel(1.5))
   )
 
-# 8) Save to disk
 ggsave("torpor_arousal_cycle.pdf", plot = p, width = 12, height = 8, device = "pdf")
 ggsave("torpor_arousal_cycle.png", plot = p, width = 12, height = 8, dpi = 300)
+
+
+
+
