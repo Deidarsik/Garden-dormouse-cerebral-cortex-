@@ -1,0 +1,272 @@
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+# ============================ I/O ============================
+args <- commandArgs(trailingOnly = TRUE)
+count_file <- ifelse(length(args) >= 1, args[1],
+                     "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt")
+out_pdf <- ifelse(length(args) >= 2,
+                  args[2],
+                  "/Users/adrian/Desktop/EQU.03/PCA_pages_no_summer.pdf")
+
+max_pages  <- 20   # PC1 vs PCk for k=2.. up to this many pages
+
+# =================== read counts ===================
+sep_guess <- ifelse(grepl("\\.csv$", count_file, ignore.case = TRUE), ",", "\t")
+counts <- read.table(count_file, header = TRUE, sep = sep_guess,
+                     check.names = FALSE, stringsAsFactors = FALSE)
+
+if (!"Gene" %in% colnames(counts)) {
+  stop("First column must be named 'Gene'.")
+}
+rownames(counts) <- counts$Gene
+counts$Gene <- NULL
+
+# edgeR expects integer counts
+if (any(counts %% 1 != 0)) {
+  message("Non-integer counts detected; rounding to nearest integer for edgeR.")
+  counts <- round(as.matrix(counts))
+} else {
+  counts <- as.matrix(counts)
+}
+
+# =================== sample annotation (animal, sex, phase) ===================
+
+sample_names <- colnames(counts)
+
+sample_info <- data.frame(
+  sample = c(
+    "2EA4_TL_Cortex",
+    "4C46_TL_Cortex",
+    "5225_TE_Cortex",
+    "5C93_AL_Cortex",
+    "5FD7_AL_Cortex",
+    "609E_AL_Cortex",
+    "6C9D_AE_Cortex",
+    "80A1_AE_Cortex",
+    "80D8_SE_Cortex",
+    "9481_TL_Cortex",
+    "A9DF_AL_Cortex",
+    "AA8D_AE_Cortex",
+    "B384_TE_Cortex",
+    "B606_TL_Cortex",
+    "BA33_TL_Cortex",
+    "C367_TE_Cortex",
+    "CCCF_SE_Cortex",
+    "CE75_TE_Cortex",
+    "D33D_AE_Cortex",
+    "D744_SE_Cortex"
+  ),
+  animal = c(
+    "2EA4","4C46","5225","5C93","5FD7","609E","6C9D","80A1","80D8",
+    "9481","A9DF","AA8D","B384","B606","BA33","C367","CCCF","CE75",
+    "D33D","D744"
+  ),
+  tissue = rep("Cortex", 20),
+  group = c(
+    "TL","TL","TE","AL","AL","AL","AE","AE","SE",
+    "TL","AL","AE","TE","TL","TL","TE","SE","TE",
+    "AE","SE"
+  ),
+  sex_short = c(
+    "F","F","F","M","F","M","M","F","M",
+    "F","M","M","M","F","M","F","F","M",
+    "M","M"
+  ),
+  weight = c(
+    86.9, 92, 97, 89.4, 79.8, 92.2, 74.3, 82.7, 76.4,
+    84, 98.3, 99.7, 80.7, 89, 82.4, 67.6, 93.3, 92.8,
+    78.6, 89.4
+  ),
+  age = c(
+    31, 31, 70, 8.5, 7, 8.5, 8.5, 8.5, 12,
+    70, 19, 19, 9, 30, 9, 8, 14, 8,
+    7, 14
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Convert sex to "male"/"female"
+sample_info$sex <- ifelse(sample_info$sex_short == "M", "male", "female")
+
+# Map Group -> phase label
+phase_map <- c(
+  "SE" = "summer euthermia",
+  "TE" = "torpor (early)",
+  "TL" = "torpor (late)",
+  "AE" = "arousal (early)",
+  "AL" = "arousal (late)"
+)
+
+# Build meta in the order of colnames(counts)
+idx <- match(sample_names, sample_info$sample)
+if (any(is.na(idx))) {
+  warning(
+    "Some samples could not be matched to metadata: ",
+    paste(sample_names[is.na(idx)], collapse = ", ")
+  )
+}
+
+meta <- sample_info[idx, ]
+meta$phase <- phase_map[meta$group]
+
+# Factor ordering
+meta$phase <- factor(
+  meta$phase,
+  levels = c("summer euthermia",
+             "torpor (early)", "torpor (late)",
+             "arousal (early)", "arousal (late)")
+)
+
+meta$sex <- factor(meta$sex, levels = c("male", "female"))
+
+rownames(meta) <- meta$sample
+
+# =================== edgeR normalization ===================
+dge <- DGEList(counts = counts)
+keep <- filterByExpr(dge, group = meta$phase)
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+logCPM <- cpm(dge, log = TRUE, prior.count = 1)
+
+# =================== helpers ===================
+axis_lab <- function(pc_index, var_pct) {
+  paste0("PC", pc_index, " (", var_pct[pc_index], "%)")
+}
+
+# Plot WITHOUT ellipses and WITHOUT text labels
+plot_pc_pair <- function(df, i, j, var_pct, title_prefix = "PCA") {
+  dd <- df[, c(paste0("PC", i), paste0("PC", j),
+               "sample","animal","phase","sex")]
+  colnames(dd)[1:2] <- c("X","Y")
+  dd$phase <- droplevels(dd$phase)
+  dd$sex   <- droplevels(dd$sex)
+
+  ggplot(dd, aes(x = X, y = Y)) +
+    geom_point(
+      aes(color = phase, shape = sex),
+      size = 5,
+      alpha = 0.9,
+      stroke = 1.2
+    ) +
+    scale_color_manual(
+      values = pal_jco("default")(5)
+    ) +
+    scale_shape_manual(
+      values = c("male" = 16, "female" = 17)
+    ) +
+    labs(
+      title    = NULL,
+      subtitle = NULL,
+      x        = axis_lab(i, var_pct),
+      y        = axis_lab(j, var_pct),
+      color    = "Hibernation phase",
+      shape    = "Sex"
+    ) +
+    theme_minimal(base_size = 24, base_family = "Helvetica") +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 16, hjust = 0.5),
+      axis.title = element_text(size = 22),
+      axis.text = element_text(size = 16),
+      legend.title = element_text(size = 18),
+      legend.text = element_text(size = 15),
+      panel.grid.major = element_line(color = "#d9d9d9", linewidth = 0.5),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+    )
+}
+# =================== PCA: WITHOUT summer euthermia ===================
+keep_no_summer <- meta$phase != "summer euthermia" & !is.na(meta$phase)
+
+logCPM_no_summer <- logCPM[, keep_no_summer, drop = FALSE]
+meta_no_summer   <- meta[keep_no_summer, , drop = FALSE]
+
+pca_ns <- prcomp(t(logCPM_no_summer), center = TRUE, scale. = TRUE)
+var_expl_ns <- (pca_ns$sdev^2) / sum(pca_ns$sdev^2)
+var_pct_ns  <- sprintf("%.2f", 100 * var_expl_ns)
+
+score_df_ns <- as.data.frame(pca_ns$x)
+score_df_ns$sample <- meta_no_summer$sample
+score_df_ns$animal <- meta_no_summer$animal
+score_df_ns$phase  <- meta_no_summer$phase
+score_df_ns$sex    <- meta_no_summer$sex
+
+n_pc_ns <- ncol(pca_ns$x) - 0L
+K_ns <- min(max_pages + 1, n_pc_ns)
+
+pdf(out_pdf, width = 7, height = 6)
+for (k in 2:K_ns) {
+  print(
+    plot_pc_pair(score_df_ns, 1, k, var_pct_ns,
+                 title_prefix = "PCA (no summer euthermia)")
+  )
+}
+dev.off()
+message("Done. Wrote PCA pages (no summer euthermia) to: ", out_pdf)
+
+# ===============================================================
+#   TOP 30 GENES DRIVING PC1 & PC2 (NO-SUMMER PCA) + TRANSLATION
+# ===============================================================
+
+trans_file <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
+
+trans <- read.table(
+  trans_file,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# Clean possible BOM / whitespace
+colnames(trans) <- trimws(sub("^\\ufeff", "", colnames(trans)))
+trans$Source_gene <- trimws(trans$Source_gene)
+
+# PCA loadings
+loadings <- as.data.frame(pca_ns$rotation)
+loadings$Gene <- rownames(loadings)  # Equ02.xxxxx
+
+# Top 30 genes for PC1 & PC2
+top_PC1 <- loadings[order(abs(loadings$PC1), decreasing = TRUE), ][1:30, ]
+top_PC2 <- loadings[order(abs(loadings$PC2), decreasing = TRUE), ][1:30, ]
+
+# Merge with translation table (Source_gene column)
+top_PC1_merged <- merge(
+  top_PC1,
+  trans,
+  by.x = "Gene",
+  by.y = "Source_gene",
+  all.x = TRUE
+)
+
+top_PC2_merged <- merge(
+  top_PC2,
+  trans,
+  by.x = "Gene",
+  by.y = "Source_gene",
+  all.x = TRUE
+)
+
+# Save annotated tables
+write.table(
+  top_PC1_merged,
+  "/Users/adrian/Desktop/EQU.03/Top_PC1_genes_annotated.tsv",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  top_PC2_merged,
+  "/Users/adrian/Desktop/EQU.03/Top_PC2_genes_annotated.tsv",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+message("Saved: Top_PC1_genes_annotated.tsv and Top_PC2_genes_annotated.tsv")
