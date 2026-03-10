@@ -1,0 +1,247 @@
+# ----------------------------
+# Load Required Libraries
+# ----------------------------
+library(edgeR)
+library(ggplot2)
+library(dplyr)
+library(biomaRt)
+library(ggsci)
+library(ggVennDiagram)
+
+# ----------------------------
+# Load Data
+# ----------------------------
+expression_matrix <- read.table(
+  "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt",
+  header    = TRUE,
+  row.names = 1,
+  sep       = "\t",
+  check.names = FALSE
+)
+metadata <- read.table(
+  "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt",
+  header = TRUE,
+  sep    = "\t"
+)
+rownames(metadata) <- metadata$Sample
+
+gene_annotations <- read.table(
+  "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt",
+  header = TRUE,
+  sep    = "\t",
+  stringsAsFactors = FALSE
+)
+colnames(gene_annotations)[1] <- "GeneID"
+
+# Ensure the metadata and expression matrix are aligned
+expression_matrix <- expression_matrix[, rownames(metadata)]
+
+# ----------------------------
+# Create DGEList and Normalize Counts
+# ----------------------------
+dge <- DGEList(counts = expression_matrix, group = metadata$Group)
+dge <- calcNormFactors(dge)
+
+# ----------------------------
+# Design Matrix and Dispersion Estimation
+# ----------------------------
+metadata$Group <- factor(
+  metadata$Group,
+  levels = c("SE", "TE", "TL", "AE", "AL")
+)
+design <- model.matrix(~ 0 + Group, data = metadata)  # No intercept
+colnames(design) <- levels(metadata$Group)
+
+dge <- estimateDisp(dge, design)
+fit <- glmQLFit(dge, design)
+
+# ----------------------------
+# Define Contrasts for Comparisons
+# ----------------------------
+contrasts <- makeContrasts(
+  SE_vs_TE = SE - TE,
+  TE_vs_TL = TE - TL,
+  TL_vs_AE = TL - AE,
+  AE_vs_AL = AE - AL,
+  AL_vs_TE = AL - TE,
+  AL_vs_SE = AL - SE,
+  levels = design
+)
+
+# ----------------------------
+# Differential Expression Analysis & Merge Gene Annotations
+# ----------------------------
+output_dir <- "/Users/adrian/Desktop/EQU.03"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+results_list <- list()
+for (contrast_name in colnames(contrasts)) {
+  res <- glmQLFTest(fit, contrast = contrasts[, contrast_name])
+  top_table <- topTags(res, n = Inf)$table
+
+  # Merge with gene annotations
+  top_table <- merge(
+    top_table,
+    gene_annotations,
+    by.x = "row.names",
+    by.y = "GeneID",
+    all.x = TRUE
+  )
+  colnames(top_table)[1] <- "GeneID"
+
+  # Classify genes based on significance (FDR < 0.01)
+  top_table <- top_table %>%
+    mutate(Significance = case_when(
+      FDR < 0.01 & logFC > 0 ~ "Upregulated",
+      FDR < 0.01 & logFC < 0 ~ "Downregulated",
+      TRUE                   ~ "Not Significant"
+    ))
+
+  # Save full table and gene list
+  write.table(
+    top_table,
+    file      = file.path(output_dir, paste0(contrast_name, "_differential_expression.txt")),
+    sep       = "\t",
+    quote     = FALSE,
+    row.names = TRUE
+  )
+  gene_list <- top_table$GeneID
+  write.table(
+    gene_list,
+    file     = file.path(output_dir, paste0(contrast_name, "_gene_list.txt")),
+    quote    = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+
+  results_list[[contrast_name]] <- top_table
+}
+
+
+
+# ----------------------------
+# DEG Count and Annotation Summary
+# ----------------------------
+cat("Differential Expression Summary (using merged results):\n")
+for (contrast in names(deg_list)) {
+  total_deg         <- length(deg_list[[contrast]])
+  other_deg         <- unlist(deg_list[names(deg_list) != contrast])
+  unique_deg        <- length(setdiff(deg_list[[contrast]], other_deg))
+
+  sig_df            <- results_list[[contrast]][results_list[[contrast]]$FDR < 0.01, ]
+  annotated_count   <- sum(!is.na(sig_df$Gene_name) & sig_df$Gene_name != "")
+  not_annotated     <- nrow(sig_df) - annotated_count
+
+  cat(sprintf(
+    "Contrast %s: Total DEGs = %d, Unique DEGs = %d, Annotated = %d, Not Annotated = %d\n",
+    contrast, total_deg, unique_deg, annotated_count, not_annotated
+  ))
+}
+
+cat("\nUnique DEGs per contrast (non-overlapping with any other contrast):\n")
+for (contrast in names(deg_list)) {
+  unique_genes      <- setdiff(deg_list[[contrast]], unlist(deg_list[names(deg_list) != contrast]))
+  unique_count      <- length(unique_genes)
+
+  sig_df            <- results_list[[contrast]][results_list[[contrast]]$FDR < 0.01, ]
+  unique_sig_df     <- sig_df[sig_df$GeneID %in% unique_genes, ]
+  missing_annotation<- sum(
+    is.na(unique_sig_df$Gene_name) |
+      unique_sig_df$Gene_name %in% c("", "?", "NA")
+  )
+
+  cat(sprintf(
+    "Contrast %s: Unique DEGs = %d, Missing Annotation = %d\n",
+    contrast, unique_count, missing_annotation
+  ))
+}
+
+cat("Analysis complete. Check the output files for the Venn diagram and DEG summary.\n")
+
+# ----------------------------
+# Define Adjacent Contrast Pairs
+# ----------------------------
+adjacent_pairs <- list(
+  c("SE_vs_TE", "TE_vs_TL"),
+  c("TE_vs_TL", "TL_vs_AE"),
+  c("TL_vs_AE", "AE_vs_AL"),
+  c("AE_vs_AL", "TE_vs_TL"),
+  c("SE_vs_TE", "AL_vs_SE")
+)
+
+# Output directory for saving the merged overlap files
+output_dir <- "/Users/adrian/Desktop/EQU.03"
+
+# ----------------------------
+# Loop Through Each Pair to Filter Overlapping DEGs and Save Results
+# ----------------------------
+for (pair in adjacent_pairs) {
+  contrast1 <- pair[1]
+  contrast2 <- pair[2]
+
+  if (is.null(results_list[[contrast1]]) || is.null(results_list[[contrast2]])) {
+    cat(sprintf("One of the contrasts (%s or %s) is missing in results_list.\n",
+                contrast1, contrast2))
+    next
+  }
+
+  df1_sig <- results_list[[contrast1]][results_list[[contrast1]]$FDR < 0.01,
+                                       c("GeneID", "Gene_name", "logFC", "Significance")]
+  df2_sig <- results_list[[contrast2]][results_list[[contrast2]]$FDR < 0.01,
+                                       c("GeneID", "Gene_name", "logFC", "Significance")]
+
+  merged <- merge(
+    df1_sig,
+    df2_sig,
+    by       = "GeneID",
+    suffixes = c(paste0("_", contrast1), paste0("_", contrast2))
+  )
+
+  if (nrow(merged) == 0) {
+    cat(sprintf("\nNo overlapping DEGs between %s and %s.\n",
+                contrast1, contrast2))
+    next
+  }
+
+  merged$GeneName     <- merged[[paste0("Gene_name_", contrast1)]]
+  merged$Regulation_1 <- ifelse(
+    merged[[paste0("logFC_", contrast1)]] > 0,
+    "Upregulated", "Downregulated"
+  )
+  merged$Regulation_2 <- ifelse(
+    merged[[paste0("logFC_", contrast2)]] > 0,
+    "Upregulated", "Downregulated"
+  )
+
+  total_common   <- nrow(merged)
+  opposite_count <- sum(merged$Regulation_1 != merged$Regulation_2)
+  percent_opposite <- round((opposite_count / total_common) * 100, 1)
+
+  cat(sprintf(
+    "\nFor contrasts %s and %s: %d overlapping DEGs found, %d are oppositely regulated (%.1f%%).\n",
+    contrast1, contrast2, total_common, opposite_count, percent_opposite
+  ))
+  cat("GeneName\tRegulation_1\tRegulation_2\n")
+
+  for (i in seq_len(nrow(merged))) {
+    cat(
+      merged$GeneName[i], "\t",
+      merged$Regulation_1[i], "\t",
+      merged$Regulation_2[i], "\n"
+    )
+  }
+
+  output_file <- file.path(
+    output_dir,
+    paste0("Overlap_", contrast1, "_", contrast2, ".txt")
+  )
+  write.table(
+    merged,
+    file      = output_file,
+    sep       = "\t",
+    quote     = FALSE,
+    row.names = FALSE
+  )
+}
