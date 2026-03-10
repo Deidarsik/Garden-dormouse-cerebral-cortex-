@@ -1,0 +1,473 @@
+# ----------------------------
+# Install and load required packages
+# ----------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+pkgs <- c(
+  "edgeR",
+  "clusterProfiler", "org.Mm.eg.db",
+  "ggplot2", "ggsci", "dplyr", "cowplot"
+)
+
+for (pkg in pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    BiocManager::install(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+# ----------------------------
+# Global plotting theme
+# ----------------------------
+theme_set(
+  theme_minimal(base_size = 24, base_family = "Helvetica") +
+    theme(
+      plot.title   = element_text(face = "bold", hjust = 0.5),
+      axis.title   = element_text(size = 20),
+      axis.text    = element_text(size = 16),
+      legend.title = element_text(size = 20),
+      legend.text  = element_text(size = 16)
+    )
+)
+
+# ----------------------------
+# Input files
+# ----------------------------
+count_file <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
+trans_file <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
+outdir     <- "/Users/adrian/Desktop/EQU.03"
+
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+# ----------------------------
+# Helper: two-panel bubble plot
+# ----------------------------
+generate_bubble_plot_twopanel <- function(df, title_text, outfile, top_n = 20) {
+  if (is.null(df) || nrow(df) == 0) {
+    message("No significant terms for ", title_text)
+    return(invisible(NULL))
+  }
+
+  df2 <- df %>%
+    dplyr::arrange(desc(Count)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::mutate(
+      GeneRatio_num = sapply(strsplit(GeneRatio, "/"), function(x) {
+        as.numeric(x[1]) / as.numeric(x[2])
+      }),
+      Description = Description
+    ) %>%
+    dplyr::arrange(Count)
+
+  annot <- ggplot(
+    df2,
+    aes(
+      x = 1,
+      y = factor(Description, levels = df2$Description),
+      label = Description
+    )
+  ) +
+    geom_text(
+      hjust = 1,
+      size = 10,
+      family = "Helvetica"
+    ) +
+    scale_y_discrete(limits = rev(df2$Description)) +
+    theme_void() +
+    theme(
+      plot.margin = margin(10, 5, 10, 10)
+    ) +
+    xlim(0.85, 1)
+
+  bubble <- ggplot(
+    df2,
+    aes(
+      x = GeneRatio_num,
+      y = factor(Description, levels = df2$Description),
+      size = Count,
+      color = -log10(p.adjust)
+    )
+  ) +
+    geom_point(alpha = 0.8) +
+    scale_size_continuous(range = c(4, 12)) +
+    scale_color_gradientn(
+      colors = colorRampPalette(pal_jco("default")(3))(100)
+    ) +
+    labs(
+      title = title_text,
+      x = "Gene Ratio",
+      y = NULL,
+      size = "Gene Count",
+      color = "-log10(q-value)"
+    ) +
+    theme_minimal(base_size = 24, base_family = "Helvetica") +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.title.x = element_text(size = 24, margin = margin(t = 10)),
+      axis.text.x = element_text(size = 20),
+      plot.margin = margin(10, 30, 10, 0),
+      legend.title = element_text(size = 20),
+      legend.text = element_text(size = 16),
+      panel.grid.major.x = element_line(color = "#cccccc"),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.y = element_line(color = "#dddddd")
+    )
+
+  combined <- cowplot::plot_grid(
+    annot, bubble,
+    nrow = 1,
+    rel_widths = c(2, 1),
+    align = "h",
+    axis = "tb"
+  )
+
+  ggsave(
+    filename = outfile,
+    plot = combined,
+    width = 20,
+    height = 8,
+    units = "in",
+    dpi = 300,
+    bg = "white"
+  )
+
+  message("Saved plot: ", outfile)
+}
+
+# ----------------------------
+# Helper: clean genes
+# ----------------------------
+clean_genes <- function(x) {
+  unique(x[!is.na(x) & x != "" & x != "NA"])
+}
+
+# ----------------------------
+# 1) Recreate the PCA input from the previous script
+# ----------------------------
+sep_guess <- ifelse(grepl("\\.csv$", count_file, ignore.case = TRUE), ",", "\t")
+counts <- read.table(
+  count_file,
+  header = TRUE,
+  sep = sep_guess,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+if (!"Gene" %in% colnames(counts)) {
+  stop("First column must be named 'Gene'.")
+}
+
+rownames(counts) <- counts$Gene
+counts$Gene <- NULL
+
+if (any(counts %% 1 != 0)) {
+  message("Non-integer counts detected; rounding to nearest integer for edgeR.")
+  counts <- round(as.matrix(counts))
+} else {
+  counts <- as.matrix(counts)
+}
+
+sample_names <- colnames(counts)
+
+sample_info <- data.frame(
+  sample = c(
+    "2EA4_TL_Cortex",
+    "4C46_TL_Cortex",
+    "5225_TE_Cortex",
+    "5C93_AL_Cortex",
+    "5FD7_AL_Cortex",
+    "609E_AL_Cortex",
+    "6C9D_AE_Cortex",
+    "80A1_AE_Cortex",
+    "80D8_SE_Cortex",
+    "9481_TL_Cortex",
+    "A9DF_AL_Cortex",
+    "AA8D_AE_Cortex",
+    "B384_TE_Cortex",
+    "B606_TL_Cortex",
+    "BA33_TL_Cortex",
+    "C367_TE_Cortex",
+    "CCCF_SE_Cortex",
+    "CE75_TE_Cortex",
+    "D33D_AE_Cortex",
+    "D744_SE_Cortex"
+  ),
+  animal = c(
+    "2EA4","4C46","5225","5C93","5FD7","609E","6C9D","80A1","80D8",
+    "9481","A9DF","AA8D","B384","B606","BA33","C367","CCCF","CE75",
+    "D33D","D744"
+  ),
+  tissue = rep("Cortex", 20),
+  group = c(
+    "TL","TL","TE","AL","AL","AL","AE","AE","SE",
+    "TL","AL","AE","TE","TL","TL","TE","SE","TE",
+    "AE","SE"
+  ),
+  sex_short = c(
+    "F","F","F","M","F","M","M","F","M",
+    "F","M","M","M","F","M","F","F","M",
+    "M","M"
+  ),
+  weight = c(
+    86.9, 92, 97, 89.4, 79.8, 92.2, 74.3, 82.7, 76.4,
+    84, 98.3, 99.7, 80.7, 89, 82.4, 67.6, 93.3, 92.8,
+    78.6, 89.4
+  ),
+  age = c(
+    31, 31, 70, 8.5, 7, 8.5, 8.5, 8.5, 12,
+    70, 19, 19, 9, 30, 9, 8, 14, 8,
+    7, 14
+  ),
+  stringsAsFactors = FALSE
+)
+
+sample_info$sex <- ifelse(sample_info$sex_short == "M", "male", "female")
+
+phase_map <- c(
+  "SE" = "summer euthermia",
+  "TE" = "torpor (early)",
+  "TL" = "torpor (late)",
+  "AE" = "arousal (early)",
+  "AL" = "arousal (late)"
+)
+
+idx <- match(sample_names, sample_info$sample)
+if (any(is.na(idx))) {
+  warning(
+    "Some samples could not be matched to metadata: ",
+    paste(sample_names[is.na(idx)], collapse = ", ")
+  )
+}
+
+meta <- sample_info[idx, ]
+meta$phase <- phase_map[meta$group]
+
+meta$phase <- factor(
+  meta$phase,
+  levels = c(
+    "summer euthermia",
+    "torpor (early)", "torpor (late)",
+    "arousal (early)", "arousal (late)"
+  )
+)
+
+meta$sex <- factor(meta$sex, levels = c("male", "female"))
+rownames(meta) <- meta$sample
+
+# ----------------------------
+# 2) Same edgeR normalization and no-summer PCA
+# ----------------------------
+dge <- DGEList(counts = counts)
+keep <- filterByExpr(dge, group = meta$phase)
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+dge  <- calcNormFactors(dge, method = "TMM")
+logCPM <- cpm(dge, log = TRUE, prior.count = 1)
+
+keep_no_summer <- meta$phase != "summer euthermia" & !is.na(meta$phase)
+logCPM_no_summer <- logCPM[, keep_no_summer, drop = FALSE]
+meta_no_summer   <- meta[keep_no_summer, , drop = FALSE]
+
+pca_ns <- prcomp(t(logCPM_no_summer), center = TRUE, scale. = TRUE)
+
+# ----------------------------
+# 3) Read translation table and detect symbol column
+# ----------------------------
+trans <- read.table(
+  trans_file,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+colnames(trans) <- trimws(sub("^\\ufeff", "", colnames(trans)))
+trans$Source_gene <- trimws(trans$Source_gene)
+
+candidate_symbol_cols <- c(
+  "Gene_name.y", "Gene_name", "gene_name", "gene_symbol",
+  "SYMBOL", "Symbol", "mouse_symbol", "Mouse_symbol",
+  "Mmu_symbol", "external_gene_name"
+)
+
+symbol_col <- candidate_symbol_cols[candidate_symbol_cols %in% colnames(trans)][1]
+
+if (is.na(symbol_col) || length(symbol_col) == 0) {
+  stop(
+    "Could not find a mouse gene symbol column in the translation file.\n",
+    "Available columns are:\n",
+    paste(colnames(trans), collapse = ", ")
+  )
+}
+
+message("Using translation column: ", symbol_col)
+
+# ----------------------------
+# 4) Take top 10% genes by absolute loading for PC1 and PC2
+# ----------------------------
+loadings <- as.data.frame(pca_ns$rotation)
+loadings$Gene <- rownames(loadings)
+
+n_top <- max(1, ceiling(nrow(loadings) * 0.10))
+message("Selecting top ", n_top, " genes (10%) for each PC.")
+
+top_PC1 <- loadings[order(abs(loadings$PC1), decreasing = TRUE), ][1:n_top, ]
+top_PC2 <- loadings[order(abs(loadings$PC2), decreasing = TRUE), ][1:n_top, ]
+
+top_PC1_merged <- merge(
+  top_PC1,
+  trans,
+  by.x = "Gene",
+  by.y = "Source_gene",
+  all.x = TRUE
+)
+
+top_PC2_merged <- merge(
+  top_PC2,
+  trans,
+  by.x = "Gene",
+  by.y = "Source_gene",
+  all.x = TRUE
+)
+
+genes_PC1 <- clean_genes(top_PC1_merged[[symbol_col]])
+genes_PC2 <- clean_genes(top_PC2_merged[[symbol_col]])
+
+cat("PC1 translated genes:", length(genes_PC1), "\n")
+cat("PC2 translated genes:", length(genes_PC2), "\n")
+
+write.table(
+  top_PC1_merged,
+  file.path(outdir, "Top10pct_PC1_genes_annotated.tsv"),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+
+write.table(
+  top_PC2_merged,
+  file.path(outdir, "Top10pct_PC2_genes_annotated.tsv"),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+
+# ----------------------------
+# 5) Helper: map symbols to Entrez IDs and run enrichment
+# ----------------------------
+run_enrichment <- function(symbols, label) {
+
+  gene_map <- bitr(
+    symbols,
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Mm.eg.db
+  )
+
+  mapped   <- gene_map$SYMBOL
+  unmapped <- setdiff(symbols, mapped)
+
+  cat("=== ", label, " ===\n", sep = "")
+  cat("Total symbols provided: ", length(symbols), "\n")
+  cat("Successfully mapped:    ", length(mapped),  "\n")
+  cat("Failed to map:          ", length(unmapped), "\n")
+  if (length(unmapped) > 0) {
+    cat("Unmapped symbols:\n")
+    print(unmapped)
+  }
+
+  entrez_ids <- unique(gene_map$ENTREZID)
+  if (length(entrez_ids) == 0L) {
+    warning("No genes could be mapped for ", label, "; skipping enrichment.")
+    return(NULL)
+  }
+
+  ego <- enrichGO(
+    gene          = entrez_ids,
+    OrgDb         = org.Mm.eg.db,
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.10,
+    readable      = TRUE
+  )
+  ego_df <- as.data.frame(ego)
+  if (nrow(ego_df) > 0) {
+    ego_df$Bg         <- as.numeric(sub("/.*", "", ego_df$BgRatio))
+    ego_df$RichFactor <- ego_df$Count / ego_df$Bg
+  }
+
+  ekegg <- enrichKEGG(
+    gene         = entrez_ids,
+    organism     = "mmu",
+    pvalueCutoff = 0.05
+  )
+
+  if (!is.null(ekegg) && nrow(as.data.frame(ekegg)) > 0) {
+    ekegg <- setReadable(ekegg, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+    ekegg_df <- as.data.frame(ekegg)
+    ekegg_df$ID         <- sub("^mmu", "", ekegg_df$ID)
+    ekegg_df$Bg         <- as.numeric(sub("/.*", "", ekegg_df$BgRatio))
+    ekegg_df$RichFactor <- ekegg_df$Count / ekegg_df$Bg
+  } else {
+    ekegg_df <- data.frame()
+  }
+
+  list(
+    ego = ego, ego_df = ego_df,
+    ekegg = ekegg, ekegg_df = ekegg_df
+  )
+}
+
+# ----------------------------
+# 6) Run enrichment
+# ----------------------------
+res_PC1 <- run_enrichment(genes_PC1, "PC1")
+res_PC2 <- run_enrichment(genes_PC2, "PC2")
+
+# ----------------------------
+# 7) Save results and plots
+# ----------------------------
+save_results <- function(res, label) {
+  if (is.null(res)) return(invisible(NULL))
+
+  ego_df   <- res$ego_df
+  ekegg_df <- res$ekegg_df
+
+  write.csv(
+    ego_df,
+    file = file.path(outdir, paste0("GO_BP_", label, ".csv")),
+    row.names = FALSE
+  )
+
+  write.csv(
+    ekegg_df,
+    file = file.path(outdir, paste0("KEGG_", label, ".csv")),
+    row.names = FALSE
+  )
+
+  if (!is.null(ego_df) && nrow(ego_df) > 0) {
+    generate_bubble_plot_twopanel(
+      df = ego_df,
+      title_text = paste("GO Enrichment -", label),
+      outfile = file.path(outdir, paste0("GO_BP_", label, "_bubble_twopanel.png")),
+      top_n = 20
+    )
+  }
+
+  if (!is.null(ekegg_df) && nrow(ekegg_df) > 0) {
+    generate_bubble_plot_twopanel(
+      df = ekegg_df,
+      title_text = paste("KEGG Enrichment -", label),
+      outfile = file.path(outdir, paste0("KEGG_", label, "_bubble_twopanel.png")),
+      top_n = 20
+    )
+  }
+}
+
+save_results(res_PC1, "PC1_top10pct")
+save_results(res_PC2, "PC2_top10pct")
+
+# ----------------------------
+# 8) Save session info
+# ----------------------------
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(outdir, "sessionInfo.txt")
