@@ -1,0 +1,118 @@
+#!/usr/bin/env Rscript
+
+# ----------------------------
+# venn_only_with_VennDiagram.R
+# ----------------------------
+
+# 1) Load Required Libraries
+library(edgeR)
+library(VennDiagram)
+library(grid)       # for grid.draw()
+library(ggsci)      # for ggsci palettes
+
+# 2) Load Data
+counts <- read.table(
+  "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt",
+  header    = TRUE,
+  row.names = 1,
+  sep       = "\t",
+  check.names = FALSE
+)
+
+metadata <- read.table(
+  "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt",
+  header = TRUE,
+  sep    = "\t"
+)
+rownames(metadata) <- metadata$Sample
+
+gene_mapping <- read.table(
+  "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt",
+  header = TRUE,
+  sep    = "\t",
+  stringsAsFactors = FALSE
+)
+colnames(gene_mapping)[1] <- "Source_gene"
+
+# 3) Align samples
+common   <- intersect(colnames(counts), rownames(metadata))
+counts   <- counts[, common]
+metadata <- metadata[common, , drop = FALSE]
+counts   <- counts[, rownames(metadata)]
+
+# 4) DGEList and Normalize
+dge <- DGEList(counts = counts, group = metadata$Group)
+dge <- calcNormFactors(dge)
+
+# 5) Design Matrix & Dispersion
+metadata$Group <- factor(metadata$Group, levels = c("SE","TE","TL","AE","AL"))
+design <- model.matrix(~ 0 + Group, data = metadata)
+colnames(design) <- levels(metadata$Group)
+
+dge <- estimateDisp(dge, design)
+fit <- glmQLFit(dge, design)
+
+# 6) Define Contrasts & Run QLTests
+contrast_matrix <- makeContrasts(
+  AL_TE = AL - TE,
+  TE_TL = TE - TL,
+  TL_AE = TL - AE,
+  AE_AL = AE - AL,
+  levels = design
+)
+
+qlf_list <- lapply(colnames(contrast_matrix), function(ct) {
+  glmQLFTest(fit, contrast = contrast_matrix[, ct])
+})
+names(qlf_list) <- colnames(contrast_matrix)
+
+# 7) Build deg_list (FDR < 0.01)
+deg_list <- lapply(qlf_list, function(qlf) {
+  tbl <- topTags(qlf, n = Inf)$table
+  rownames(tbl)[tbl$FDR < 0.01]
+})
+
+deg_list <- deg_list[c("AL_TE","TE_TL","TL_AE","AE_AL")]
+
+# ---- Rename categories: use hyphens instead of underscores ----
+names(deg_list) <- gsub("_", "-", names(deg_list))
+
+# 8) Sanity check: print how many genes in each set
+counts_per_set <- sapply(deg_list, length)
+print(counts_per_set)
+if (all(counts_per_set == 0)) {
+  stop("No genes passed FDR < 0.01 in any of the four contrasts; Venn will be empty.")
+}
+
+# 9) Set font-size multipliers for VennDiagram (relative to 12 pt)
+cex_counts <- 16/12   # count labels at 16 pt
+cat_cex    <- 20/12   # category labels at 20 pt
+
+# 10) Pick 4 blue shades from a ggsci palette
+fills <- pal_material("blue")(4)
+
+# 11) Generate the Venn grob using Helvetica/sans
+venn_grob <- venn.diagram(
+  x              = deg_list,
+  category.names = names(deg_list),
+  filename       = NULL,
+  fill           = fills,
+  alpha          = 0.4,
+  cex            = cex_counts,
+  cat.cex        = cat_cex,
+  fontfamily     = "sans",
+  cat.fontfamily = "sans",
+  margin         = 0.1
+)
+
+# 12) Save as a 12×8" PDF using Helvetica/sans
+pdf(
+  file   = "/Users/adrian/Desktop/EQU.03/venn_diagram.pdf",
+  width  = 12,
+  height = 8,
+  family = "sans"
+)
+grid.draw(venn_grob)
+dev.off()
+
+message("Venn diagram saved to '/Users/adrian/Desktop/EQU.03/venn_diagram.pdf'")
