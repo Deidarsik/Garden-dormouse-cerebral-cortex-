@@ -3,6 +3,9 @@
 # Columns = animals in fixed order: SE, AE, AL, TE, TL
 # Rows = genes passing FDR < 1e-4 in warm vs cold
 # Values = logCPM z-scored across animals
+# Top annotation = group colours
+#   SE, AE, AL = light colours
+#   TE, TL = dark colours
 # Right sidebar = mouse ortholog present / absent
 # Black = has mouse ortholog
 # White = no mouse ortholog
@@ -33,7 +36,6 @@ install_if_missing_cran("pheatmap")
 install_if_missing_cran("grid")
 install_if_missing_bioc("ComplexHeatmap")
 install_if_missing_cran("circlize")
-install_if_missing_cran("ggsci")
 
 suppressPackageStartupMessages({
   library(edgeR)
@@ -42,7 +44,6 @@ suppressPackageStartupMessages({
   library(grid)
   library(ComplexHeatmap)
   library(circlize)
-  library(ggsci)
 })
 
 # ----------------------------
@@ -65,6 +66,10 @@ cluster_cols <- FALSE
 use_annotation_colors <- TRUE
 order_by_group <- TRUE
 
+# Make legend letters approximately twice the default size
+legend_title_fontsize <- 20
+legend_label_fontsize <- 20
+
 # Number of row clusters to cut from the dendrogram
 k_row <- 6
 
@@ -72,34 +77,32 @@ k_row <- 6
 warm_groups <- c("SE", "AE", "AL")
 cold_groups <- c("TE", "TL")
 
-# Choose ggsci palette for group annotation colors
-# Options: "npg", "aaas", "lancet", "jco", "jama", "bmj", "ucscgb", "d3"
-ggsci_palette_name <- "npg"
+# ----------------------------
+# Manual colours for group annotation
+# ----------------------------
+# SE, AE, AL = lighter colours
+# TE, TL = darker colours
 
-# Mouse ortholog sidebar colors
+group_levels <- c("SE", "AE", "AL", "TE", "TL")
+
+group_cols <- c(
+  SE = "#BFD7EA",  # light blue
+  AE = "#C7E9C0",  # light green
+  AL = "#FDDDB6",  # light orange
+  TE = "#08519C",  # dark blue
+  TL = "#54278F"   # dark purple
+)
+
+# Mouse ortholog sidebar colours
 mouse_ortholog_colors <- c(
   Yes = "black",
   No = "white"
 )
 
-# ----------------------------
-# Helper: get ggsci palette
-# ----------------------------
-get_ggsci_palette <- function(name, n) {
-  cols <- switch(
-    name,
-    npg    = ggsci::pal_npg("nrc")(n),
-    aaas   = ggsci::pal_aaas()(n),
-    lancet = ggsci::pal_lancet()(n),
-    jco    = ggsci::pal_jco()(n),
-    jama   = ggsci::pal_jama()(n),
-    bmj    = ggsci::pal_bmj()(n),
-    ucscgb = ggsci::pal_ucscgb()(n),
-    d3     = ggsci::pal_d3()(n),
-    stop("Unsupported ggsci palette name.")
-  )
-  return(cols)
-}
+# Heatmap body colours
+# Keep these separate from the group annotation colours.
+heatmap_low  <- "#2166AC"   # blue for low z-score
+heatmap_high <- "#B2182B"   # red for high z-score
 
 # ----------------------------
 # Helper: detect mouse ortholog column
@@ -217,7 +220,7 @@ expression_matrix <- expression_matrix[, rownames(metadata), drop = FALSE]
 # ----------------------------
 metadata$Group <- factor(
   metadata$Group,
-  levels = c("SE", "AE", "AL", "TE", "TL")
+  levels = group_levels
 )
 
 if (any(is.na(metadata$Group))) {
@@ -356,17 +359,8 @@ z_mat[z_mat > z_cap] <- z_cap
 z_mat[z_mat < -z_cap] <- -z_cap
 
 # ----------------------------
-# Column annotation with ggsci colors
+# Column annotation with manual colours
 # ----------------------------
-group_levels <- c("SE", "AE", "AL", "TE", "TL")
-
-group_cols <- get_ggsci_palette(
-  ggsci_palette_name,
-  length(group_levels)
-)
-
-names(group_cols) <- group_levels
-
 annotation_col <- data.frame(
   Group = metadata$Group
 )
@@ -376,17 +370,6 @@ rownames(annotation_col) <- rownames(metadata)
 annotation_colors <- list(
   Group = group_cols
 )
-
-# Heatmap body colors using ggsci-inspired low/high colors
-# blue-ish low, white middle, red-ish high
-heatmap_low  <- group_cols["TE"]
-heatmap_high <- group_cols["SE"]
-
-# Fallback if names somehow do not match
-if (is.na(heatmap_low) || is.na(heatmap_high)) {
-  heatmap_low  <- group_cols[4]
-  heatmap_high <- group_cols[1]
-}
 
 # ----------------------------
 # Save base tables
@@ -431,6 +414,7 @@ hm <- pheatmap::pheatmap(
   border_color = NA,
   show_rownames = FALSE,
   show_colnames = TRUE,
+  fontsize = legend_label_fontsize,
   fontsize_row = 5,
   fontsize_col = 8,
   angle_col = 45,
@@ -567,6 +551,7 @@ write.table(
 # ----------------------------
 # Build ComplexHeatmap versions
 # ----------------------------
+
 # Keep the same row order as the pheatmap clustering
 row_order <- hm$tree_row$order
 ordered_gene_ids <- rownames(z_mat)[row_order]
@@ -595,7 +580,14 @@ col_fun <- circlize::colorRamp2(
 ha <- ComplexHeatmap::HeatmapAnnotation(
   Group = metadata$Group,
   col = if (use_annotation_colors) annotation_colors else NULL,
-  annotation_name_side = "left"
+  annotation_name_side = "left",
+  simple_anno_size = grid::unit(5, "mm"),
+  annotation_legend_param = list(
+    Group = list(
+      title_gp = grid::gpar(fontsize = legend_title_fontsize),
+      labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+    )
+  )
 )
 
 mouse_ra <- ComplexHeatmap::rowAnnotation(
@@ -606,7 +598,13 @@ mouse_ra <- ComplexHeatmap::rowAnnotation(
   annotation_name_side = "top",
   show_annotation_name = FALSE,
   simple_anno_size = grid::unit(4, "mm"),
-  border = TRUE
+  border = TRUE,
+  annotation_legend_param = list(
+    Mouse_ortholog = list(
+      title_gp = grid::gpar(fontsize = legend_title_fontsize),
+      labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+    )
+  )
 )
 
 # Version 1: clean heatmap, no title, no animal names, no gene names
@@ -622,7 +620,11 @@ ht_clean <- ComplexHeatmap::Heatmap(
   show_column_names = FALSE,
   top_annotation = ha,
   column_title = NULL,
-  border = FALSE
+  border = FALSE,
+  heatmap_legend_param = list(
+    title_gp = grid::gpar(fontsize = legend_title_fontsize),
+    labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+  )
 )
 
 # Version 2: heatmap with mouse ortholog sidebar
@@ -639,7 +641,11 @@ ht_mouse_ortholog <- ComplexHeatmap::Heatmap(
   top_annotation = ha,
   right_annotation = mouse_ra,
   column_title = NULL,
-  border = FALSE
+  border = FALSE,
+  heatmap_legend_param = list(
+    title_gp = grid::gpar(fontsize = legend_title_fontsize),
+    labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+  )
 )
 
 # ----------------------------
@@ -647,7 +653,7 @@ ht_mouse_ortholog <- ComplexHeatmap::Heatmap(
 # ----------------------------
 pdf(
   file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_clean.pdf")),
-  width = 10,
+  width = 11.5,
   height = max(8, nrow(z_mat_plot) * 0.05)
 )
 
@@ -661,7 +667,7 @@ dev.off()
 
 png(
   file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_clean.png")),
-  width = 2200,
+  width = 2600,
   height = max(2200, nrow(z_mat_plot) * 12),
   res = 200
 )
@@ -679,7 +685,7 @@ dev.off()
 # ----------------------------
 pdf(
   file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_mouse_ortholog_sidebar.pdf")),
-  width = 10.5,
+  width = 12,
   height = max(8, nrow(z_mat_plot) * 0.05)
 )
 
@@ -693,7 +699,7 @@ dev.off()
 
 png(
   file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_mouse_ortholog_sidebar.png")),
-  width = 2400,
+  width = 2800,
   height = max(2200, nrow(z_mat_plot) * 12),
   res = 200
 )
@@ -717,8 +723,8 @@ sample_cor <- cor(
 
 pdf(
   file.path(output_dir, paste0("FDR_lt_", fdr_label, "_sample_correlation_heatmap_fixed_order.pdf")),
-  width = 8,
-  height = 7
+  width = 9,
+  height = 8
 )
 
 pheatmap::pheatmap(
@@ -729,6 +735,9 @@ pheatmap::pheatmap(
   annotation_col = annotation_col,
   annotation_row = annotation_col,
   annotation_colors = if (use_annotation_colors) annotation_colors else NULL,
+  fontsize = legend_label_fontsize,
+  fontsize_row = 14,
+  fontsize_col = 14,
   main = paste0("Sample-to-sample correlation | genes with FDR < ", fdr_label)
 )
 
@@ -746,6 +755,13 @@ cat("Genes in selected cluster:", nrow(target_gene_table), "\n")
 cat("Mouse ortholog column used:", ortholog_col, "\n")
 cat("Genes with mouse ortholog:", sum(gene_info$Has_mouse_ortholog == "Yes"), "\n")
 cat("Genes without mouse ortholog:", sum(gene_info$Has_mouse_ortholog == "No"), "\n\n")
+
+cat("Group colours used:\n")
+print(group_cols)
+
+cat("\nLegend font sizes:\n")
+cat("Legend title fontsize:", legend_title_fontsize, "\n")
+cat("Legend label fontsize:", legend_label_fontsize, "\n\n")
 
 cat("Saved files:\n")
 cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_warm_vs_cold_full_results.txt")), "\n")
