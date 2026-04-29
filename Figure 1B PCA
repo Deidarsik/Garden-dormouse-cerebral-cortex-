@@ -41,12 +41,24 @@ phase_map <- c(
   "AL" = "arousal (late)"
 )
 
+# Same order as your heatmap: SE, AE, AL, TE, TL
 ordered_phases <- c(
   "summer euthermia",
-  "torpor (early)",
-  "torpor (late)",
   "arousal (early)",
-  "arousal (late)"
+  "arousal (late)",
+  "torpor (early)",
+  "torpor (late)"
+)
+
+# Same colours as your heatmap group annotation
+# SE, AE, AL = lighter colours
+# TE, TL = darker colours
+phase_cols <- c(
+  "summer euthermia" = "#BFD7EA",  # SE light blue
+  "arousal (early)"  = "#C7E9C0",  # AE light green
+  "arousal (late)"   = "#FDDDB6",  # AL light orange
+  "torpor (early)"   = "#08519C",  # TE dark blue
+  "torpor (late)"    = "#54278F"   # TL dark purple
 )
 
 preferred_tissue_order <- c(
@@ -110,7 +122,8 @@ plot_pc12 <- function(df, tissue, var_pct, outfile_png, outfile_pdf) {
       stroke = 1.1
     ) +
     scale_color_manual(
-      values = ggsci::pal_jco("default")(5),
+      values = phase_cols,
+      breaks = ordered_phases,
       drop = FALSE
     ) +
     scale_shape_manual(
@@ -660,4 +673,3 @@ writeLines(
   con = file.path(outdir, "sessionInfo_Cortex_with_summer.txt")
 )
 
-message("\nAll done. Cortex outputs written to: ", file.path(outdir, target_tissue))
