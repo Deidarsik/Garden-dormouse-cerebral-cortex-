@@ -1,0 +1,716 @@
+#############################
+# radar_ALL_HEATMAP_GENES_per_gene_NO_TITLE.R
+#
+# PURPOSE:
+# Plot EVERY gene from the heatmap gene set on one radar plot.
+#
+# NO row-cluster filtering.
+# NO reversed-gene filtering.
+# NO selected cluster.
+# NO title on the plot.
+#
+# The plotted genes are exactly:
+#   warm-vs-cold significant genes passing heatmap_fdr_cutoff
+#   after finite z-score filtering.
+#############################
+
+#############################
+# Paths
+#############################
+
+expression_matrix_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
+metadata_path          <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt"
+gene_annotations_path  <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
+output_dir             <- "/Users/adrian/Desktop/EQU.03/"
+
+#############################
+# Package loader
+#############################
+
+load_or_install <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager", repos = "https://cloud.r-project.org")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg, repos = "https://cloud.r-project.org")
+    }
+  }
+  suppressPackageStartupMessages(
+    library(pkg, character.only = TRUE)
+  )
+}
+
+#############################
+# Libraries
+#############################
+
+load_or_install("edgeR", bioc = TRUE)
+load_or_install("limma", bioc = TRUE)
+load_or_install("dplyr")
+load_or_install("tidyr")
+load_or_install("tibble")
+load_or_install("ggplot2")
+load_or_install("openxlsx")
+load_or_install("pheatmap")
+
+#############################
+# Settings
+#############################
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Same heatmap-style filter:
+# rows = genes passing warm-vs-cold FDR cutoff
+heatmap_fdr_cutoff <- 1e-4
+heatmap_fdr_label  <- "1e-4"
+
+# Group order matching heatmap order
+group_levels <- c("SE", "AE", "AL", "TE", "TL")
+
+# Warm/cold definition from heatmap script
+warm_groups <- c("SE", "AE", "AL")
+cold_groups <- c("TE", "TL")
+
+# Optional row clustering only for annotation
+k_row <- 6
+
+# IMPORTANT:
+# NULL = plot ALL heatmap genes
+max_genes_to_plot <- NULL
+
+# Draw black mean profile across all genes
+show_mean_profile <- TRUE
+
+# Increase all text by 3x
+text_scale <- 3
+
+# With many genes, legend becomes useless
+# Options: "none", "auto", "right"
+gene_legend_position <- "none"
+
+# Output files
+radar_pdf_path <- file.path(
+  output_dir,
+  "radar_ALL_HEATMAP_GENES_per_gene_NO_TITLE.pdf"
+)
+
+radar_png_path <- file.path(
+  output_dir,
+  "radar_ALL_HEATMAP_GENES_per_gene_NO_TITLE.png"
+)
+
+xlsx_output_path <- file.path(
+  output_dir,
+  "radar_ALL_HEATMAP_GENES_per_gene_NO_TITLE_tables.xlsx"
+)
+
+#############################
+# Helper functions
+#############################
+
+find_gene_name_col <- function(df) {
+  candidates <- c(
+    "Gene_name.y", "Gene_name", "gene_name",
+    "external_gene_name", "SYMBOL", "Symbol",
+    "Target_gene", "GeneID"
+  )
+  hit <- candidates[candidates %in% colnames(df)][1]
+  if (length(hit) == 0 || is.na(hit)) {
+    return("GeneID")
+  }
+  return(hit)
+}
+
+make_gene_label <- function(df) {
+  gene_name_col <- find_gene_name_col(df)
+  
+  if (gene_name_col == "GeneID") {
+    return(as.character(df$GeneID))
+  }
+  
+  gene_name <- as.character(df[[gene_name_col]])
+  gene_id   <- as.character(df$GeneID)
+  
+  ifelse(
+    !is.na(gene_name) & gene_name != "" & gene_name != "NA",
+    paste0(gene_name, " (", gene_id, ")"),
+    gene_id
+  )
+}
+
+make_gene_zcpm_matrix <- function(dge_object) {
+  logcpm <- edgeR::cpm(
+    dge_object,
+    log = TRUE,
+    prior.count = 1,
+    normalized.lib.sizes = TRUE
+  )
+  
+  zmat <- t(scale(t(logcpm)))
+  zmat[!is.finite(zmat)] <- 0
+  return(zmat)
+}
+
+compute_warm_vs_cold <- function(dge_object,
+                                 metadata,
+                                 warm_groups,
+                                 cold_groups) {
+  de_group <- ifelse(
+    metadata$Group %in% warm_groups,
+    "warm",
+    ifelse(metadata$Group %in% cold_groups, "cold", NA)
+  )
+  
+  if (any(is.na(de_group))) {
+    stop("Some samples were not assigned to warm/cold. Check warm_groups and cold_groups.")
+  }
+  
+  de_group <- factor(de_group, levels = c("cold", "warm"))
+  design_wc <- model.matrix(~ de_group)
+  
+  dge_wc <- edgeR::estimateDisp(dge_object, design_wc)
+  fit_wc <- edgeR::glmQLFit(dge_wc, design_wc, robust = TRUE)
+  qlf_wc <- edgeR::glmQLFTest(fit_wc, coef = 2)
+  
+  de_table_wc <- edgeR::topTags(qlf_wc, n = Inf, sort.by = "PValue")$table
+  de_table_wc$GeneID <- rownames(de_table_wc)
+  
+  return(de_table_wc)
+}
+
+make_radar_plot_all_genes <- function(gene_group_values,
+                                      group_levels,
+                                      show_mean_profile = TRUE,
+                                      gene_legend_position = "none",
+                                      text_scale = 3) {
+  
+  if (nrow(gene_group_values) == 0) {
+    stop("No gene-level data to plot.")
+  }
+  
+  gene_group_values <- gene_group_values %>%
+    dplyr::mutate(
+      Group = factor(Group, levels = group_levels),
+      axis_id = as.numeric(Group)
+    ) %>%
+    dplyr::arrange(GeneID, Group)
+  
+  # Close each gene curve
+  gene_closed_df <- gene_group_values %>%
+    dplyr::group_by(GeneID, GeneLabel) %>%
+    dplyr::group_modify(function(.x, .y) {
+      first_row <- .x[1, , drop = FALSE]
+      first_row$axis_id <- length(group_levels) + 1
+      dplyr::bind_rows(.x, first_row)
+    }) %>%
+    dplyr::ungroup()
+  
+  # Mean profile across all heatmap genes
+  mean_profile <- gene_group_values %>%
+    dplyr::group_by(Group, axis_id) %>%
+    dplyr::summarise(
+      mean_zCPM = mean(mean_zCPM, na.rm = TRUE),
+      n_genes = dplyr::n_distinct(GeneID),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(Group)
+  
+  mean_closed_df <- mean_profile %>%
+    dplyr::group_modify(function(.x, .y) {
+      first_row <- .x[1, , drop = FALSE]
+      first_row$axis_id <- length(group_levels) + 1
+      dplyr::bind_rows(.x, first_row)
+    }) %>%
+    dplyr::ungroup()
+  
+  # Shift for radar display
+  min_z <- min(gene_closed_df$mean_zCPM, mean_closed_df$mean_zCPM, na.rm = TRUE)
+  
+  gene_closed_df <- gene_closed_df %>%
+    dplyr::mutate(radius = mean_zCPM - min_z + 0.1)
+  
+  mean_closed_df <- mean_closed_df %>%
+    dplyr::mutate(radius = mean_zCPM - min_z + 0.1)
+  
+  gene_labels <- unique(gene_closed_df$GeneLabel)
+  n_genes <- length(gene_labels)
+  
+  gene_cols <- grDevices::hcl.colors(n_genes, palette = "Dynamic")
+  names(gene_cols) <- gene_labels
+  
+  if (gene_legend_position == "auto") {
+    legend_position <- if (n_genes <= 35) "right" else "none"
+  } else if (gene_legend_position %in% c("none", "right", "bottom", "left", "top")) {
+    legend_position <- gene_legend_position
+  } else {
+    legend_position <- "none"
+  }
+  
+  p <- ggplot2::ggplot(
+    gene_closed_df,
+    ggplot2::aes(
+      x = axis_id,
+      y = radius,
+      group = GeneLabel,
+      color = GeneLabel
+    )
+  ) +
+    ggplot2::geom_line(linewidth = 0.45, alpha = 0.65) +
+    ggplot2::geom_point(size = 0.8, alpha = 0.65) +
+    ggplot2::scale_color_manual(values = gene_cols) +
+    ggplot2::coord_polar(start = pi / 2) +
+    ggplot2::scale_x_continuous(
+      breaks = seq_along(group_levels),
+      labels = group_levels,
+      limits = c(1, length(group_levels) + 1)
+    ) +
+    ggplot2::scale_y_continuous(
+      labels = function(x) round(x + min_z - 0.1, 2)
+    ) +
+    ggplot2::labs(
+      x = NULL,
+      y = "Gene-level mean zCPM",
+      color = "Gene",
+      title = NULL
+    ) +
+    ggplot2::theme_minimal(base_size = 13 * text_scale) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(face = "bold", size = 12 * text_scale),
+      axis.text.y = ggplot2::element_text(size = 12 * text_scale),
+      axis.title.x = ggplot2::element_text(size = 12 * text_scale),
+      axis.title.y = ggplot2::element_text(size = 12 * text_scale),
+      legend.title = ggplot2::element_text(size = 12 * text_scale),
+      legend.text = ggplot2::element_text(size = 10 * text_scale),
+      panel.grid.major = ggplot2::element_line(linewidth = 0.4 * text_scale),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = legend_position,
+      plot.title = ggplot2::element_blank()
+    )
+  
+  if (show_mean_profile) {
+    p <- p +
+      ggplot2::geom_line(
+        data = mean_closed_df,
+        ggplot2::aes(
+          x = axis_id,
+          y = radius,
+          group = 1
+        ),
+        inherit.aes = FALSE,
+        color = "black",
+        linewidth = 1.8
+      ) +
+      ggplot2::geom_point(
+        data = mean_closed_df,
+        ggplot2::aes(
+          x = axis_id,
+          y = radius
+        ),
+        inherit.aes = FALSE,
+        color = "black",
+        size = 2.8
+      )
+  }
+  
+  return(
+    list(
+      plot = p,
+      gene_closed_df = gene_closed_df,
+      mean_profile = mean_profile
+    )
+  )
+}
+
+#############################
+# Step 1: Load count matrix
+#############################
+
+expression_matrix <- read.table(
+  expression_matrix_path,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+
+#############################
+# Step 2: Load metadata
+#############################
+
+metadata <- read.table(
+  metadata_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+if (!"Sample" %in% colnames(metadata)) {
+  stop("Metadata must contain a column named 'Sample'.")
+}
+
+if (!"Group" %in% colnames(metadata)) {
+  stop("Metadata must contain a column named 'Group'.")
+}
+
+rownames(metadata) <- metadata$Sample
+
+missing_in_counts <- setdiff(rownames(metadata), colnames(expression_matrix))
+if (length(missing_in_counts) > 0) {
+  stop(
+    "These metadata samples are missing from the count matrix: ",
+    paste(missing_in_counts, collapse = ", ")
+  )
+}
+
+expression_matrix <- expression_matrix[, rownames(metadata), drop = FALSE]
+
+metadata$Group <- factor(metadata$Group, levels = group_levels)
+
+if (any(is.na(metadata$Group))) {
+  stop("Some samples have invalid Group labels. Expected: ", paste(group_levels, collapse = ", "))
+}
+
+metadata <- metadata[order(metadata$Group), , drop = FALSE]
+expression_matrix <- expression_matrix[, rownames(metadata), drop = FALSE]
+
+#############################
+# Step 3: Load gene annotations
+#############################
+
+gene_annotations <- read.table(
+  gene_annotations_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+colnames(gene_annotations)[1] <- "GeneID"
+
+gene_annotations <- gene_annotations %>%
+  dplyr::distinct(GeneID, .keep_all = TRUE)
+
+#############################
+# Step 4: DGEList + filtering + normalization
+#############################
+
+dge <- edgeR::DGEList(
+  counts = expression_matrix,
+  group = metadata$Group
+)
+
+keep <- edgeR::filterByExpr(dge, group = metadata$Group)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+
+dge <- edgeR::calcNormFactors(dge)
+
+cat("Genes after filterByExpr:", nrow(dge), "\n")
+
+#############################
+# Step 5: Warm-vs-cold DE = heatmap gene set
+#############################
+
+warm_vs_cold_table <- compute_warm_vs_cold(
+  dge_object = dge,
+  metadata = metadata,
+  warm_groups = warm_groups,
+  cold_groups = cold_groups
+)
+
+warm_vs_cold_sig <- warm_vs_cold_table %>%
+  dplyr::filter(FDR < heatmap_fdr_cutoff) %>%
+  dplyr::arrange(FDR)
+
+heatmap_gene_ids <- warm_vs_cold_sig$GeneID
+
+if (length(heatmap_gene_ids) == 0) {
+  stop("No heatmap genes found with FDR < ", heatmap_fdr_cutoff)
+}
+
+cat("Heatmap genes passing warm-vs-cold FDR <", heatmap_fdr_cutoff, ":", length(heatmap_gene_ids), "\n")
+
+write.table(
+  warm_vs_cold_table,
+  file = file.path(output_dir, paste0("warm_vs_cold_full_results_FDR_", heatmap_fdr_label, ".txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  warm_vs_cold_sig,
+  file = file.path(output_dir, paste0("warm_vs_cold_significant_genes_FDR_", heatmap_fdr_label, ".txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+#############################
+# Step 6: Build heatmap-style z-score matrix
+#############################
+
+logCPM_heatmap <- edgeR::cpm(dge, log = TRUE, prior.count = 2)
+
+z_heatmap <- t(scale(t(logCPM_heatmap[heatmap_gene_ids, , drop = FALSE])))
+
+keep_rows <- apply(z_heatmap, 1, function(x) all(is.finite(x)))
+z_heatmap <- z_heatmap[keep_rows, , drop = FALSE]
+
+heatmap_gene_ids_final <- rownames(z_heatmap)
+
+if (length(heatmap_gene_ids_final) == 0) {
+  stop("No heatmap genes left after finite z-score filtering.")
+}
+
+cat("Final heatmap genes after z-score finite filtering:", length(heatmap_gene_ids_final), "\n")
+
+write.table(
+  z_heatmap,
+  file = file.path(output_dir, paste0("ALL_HEATMAP_GENES_zscore_logCPM_matrix_FDR_", heatmap_fdr_label, ".txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+#############################
+# Step 7: Optional row clusters for annotation only
+#############################
+
+if (nrow(z_heatmap) >= 2) {
+  hm <- pheatmap::pheatmap(
+    z_heatmap,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    cutree_rows = min(k_row, nrow(z_heatmap)),
+    show_rownames = FALSE,
+    show_colnames = TRUE,
+    silent = TRUE
+  )
+  
+  row_clusters <- cutree(hm$tree_row, k = min(k_row, nrow(z_heatmap)))
+} else {
+  row_clusters <- setNames(1, rownames(z_heatmap))
+}
+
+cluster_assignment_df <- data.frame(
+  GeneID = names(row_clusters),
+  RowCluster = as.integer(row_clusters),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::left_join(gene_annotations, by = "GeneID") %>%
+  dplyr::left_join(
+    warm_vs_cold_table %>%
+      dplyr::select(
+        GeneID,
+        WarmCold_logFC = logFC,
+        WarmCold_FDR = FDR,
+        WarmCold_PValue = PValue
+      ),
+    by = "GeneID"
+  )
+
+cluster_summary_df <- cluster_assignment_df %>%
+  dplyr::count(RowCluster, name = "NGenes") %>%
+  dplyr::arrange(RowCluster)
+
+write.table(
+  cluster_assignment_df,
+  file = file.path(output_dir, "ALL_HEATMAP_GENES_row_cluster_annotation.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  cluster_summary_df,
+  file = file.path(output_dir, "ALL_HEATMAP_GENES_row_cluster_counts.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+print(cluster_summary_df)
+
+#############################
+# Step 8: Build zCPM values for radar
+#############################
+
+zcpm_mat <- make_gene_zcpm_matrix(dge)
+
+metadata_for_join <- metadata
+metadata_for_join$Sample <- rownames(metadata_for_join)
+metadata_for_join <- metadata_for_join %>%
+  dplyr::select(Sample, Group)
+
+zcpm_long <- as.data.frame(zcpm_mat) %>%
+  tibble::rownames_to_column("GeneID") %>%
+  tidyr::pivot_longer(
+    cols = -GeneID,
+    names_to = "Sample",
+    values_to = "zCPM"
+  ) %>%
+  dplyr::left_join(metadata_for_join, by = "Sample") %>%
+  dplyr::mutate(Group = factor(Group, levels = group_levels))
+
+all_heatmap_gene_info <- data.frame(
+  GeneID = heatmap_gene_ids_final,
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::left_join(cluster_assignment_df, by = "GeneID")
+
+all_heatmap_gene_info$GeneLabel <- make_gene_label(all_heatmap_gene_info)
+
+# CRITICAL:
+# filter ONLY by all heatmap genes, not by any row cluster
+gene_group_values <- zcpm_long %>%
+  dplyr::filter(GeneID %in% heatmap_gene_ids_final) %>%
+  dplyr::group_by(GeneID, Group) %>%
+  dplyr::summarise(
+    mean_zCPM = mean(zCPM, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::left_join(
+    all_heatmap_gene_info %>%
+      dplyr::select(
+        GeneID,
+        GeneLabel,
+        RowCluster,
+        WarmCold_logFC,
+        WarmCold_FDR,
+        WarmCold_PValue
+      ),
+    by = "GeneID"
+  ) %>%
+  dplyr::arrange(GeneID, Group)
+
+# Optional cap only if max_genes_to_plot is NOT NULL
+if (!is.null(max_genes_to_plot)) {
+  genes_keep <- gene_group_values %>%
+    dplyr::distinct(GeneID, WarmCold_FDR) %>%
+    dplyr::arrange(WarmCold_FDR) %>%
+    dplyr::slice_head(n = max_genes_to_plot) %>%
+    dplyr::pull(GeneID)
+  
+  gene_group_values <- gene_group_values %>%
+    dplyr::filter(GeneID %in% genes_keep)
+}
+
+n_genes_plotted <- dplyr::n_distinct(gene_group_values$GeneID)
+
+cat("GENES PLOTTED ON RADAR:", n_genes_plotted, "\n")
+cat("This should equal final heatmap genes after finite z-score filtering unless max_genes_to_plot is not NULL.\n")
+
+write.table(
+  gene_group_values,
+  file = file.path(output_dir, "ALL_HEATMAP_GENES_radar_gene_group_values.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+all_heatmap_gene_table <- gene_group_values %>%
+  dplyr::distinct(GeneID, .keep_all = TRUE) %>%
+  dplyr::select(
+    GeneID,
+    GeneLabel,
+    RowCluster,
+    WarmCold_logFC,
+    WarmCold_FDR,
+    WarmCold_PValue
+  )
+
+write.table(
+  all_heatmap_gene_table,
+  file = file.path(output_dir, "ALL_HEATMAP_GENES_radar_gene_table.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+#############################
+# Step 9: Plot radar with ALL heatmap genes
+#############################
+
+radar_obj <- make_radar_plot_all_genes(
+  gene_group_values = gene_group_values,
+  group_levels = group_levels,
+  show_mean_profile = show_mean_profile,
+  gene_legend_position = gene_legend_position,
+  text_scale = text_scale
+)
+
+pdf(
+  radar_pdf_path,
+  width = 18,
+  height = 16
+)
+print(radar_obj$plot)
+dev.off()
+
+png(
+  radar_png_path,
+  width = 4800,
+  height = 4200,
+  res = 300
+)
+print(radar_obj$plot)
+dev.off()
+
+cat("Radar PDF saved:", radar_pdf_path, "\n")
+cat("Radar PNG saved:", radar_png_path, "\n")
+
+#############################
+# Step 10: Save workbook
+#############################
+
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "all_heatmap_genes")
+openxlsx::writeDataTable(wb, "all_heatmap_genes", all_heatmap_gene_table)
+
+openxlsx::addWorksheet(wb, "gene_group_values")
+openxlsx::writeDataTable(wb, "gene_group_values", gene_group_values)
+
+openxlsx::addWorksheet(wb, "row_cluster_annotation")
+openxlsx::writeDataTable(wb, "row_cluster_annotation", cluster_assignment_df)
+
+openxlsx::addWorksheet(wb, "row_cluster_counts")
+openxlsx::writeDataTable(wb, "row_cluster_counts", cluster_summary_df)
+
+openxlsx::addWorksheet(wb, "warm_vs_cold_sig")
+openxlsx::writeDataTable(wb, "warm_vs_cold_sig", warm_vs_cold_sig)
+
+openxlsx::saveWorkbook(wb, xlsx_output_path, overwrite = TRUE)
+
+cat("Workbook saved:", xlsx_output_path, "\n")
+
+#############################
+# Step 11: Session info
+#############################
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(output_dir, "sessionInfo_radar_ALL_HEATMAP_GENES_per_gene_NO_TITLE.txt")
+)
+
+#############################
+# Final report
+#############################
+
+cat("\nDone.\n")
+cat("This script plotted ALL heatmap genes.\n")
+cat("Warm-vs-cold FDR cutoff:", heatmap_fdr_cutoff, "\n")
+cat("Initial heatmap genes passing FDR:", length(heatmap_gene_ids), "\n")
+cat("Final heatmap genes after z-score finite filtering:", length(heatmap_gene_ids_final), "\n")
+cat("Genes plotted on radar:", n_genes_plotted, "\n")
+cat("Max genes cap:", ifelse(is.null(max_genes_to_plot), "NULL / no cap", max_genes_to_plot), "\n")
+cat("Text scale:", text_scale, "\n")
+cat("Radar PDF:", radar_pdf_path, "\n")
+cat("Radar PNG:", radar_png_path, "\n")
+cat("Workbook:", xlsx_output_path, "\n")
