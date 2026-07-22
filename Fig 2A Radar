@@ -4,11 +4,6 @@
 # PURPOSE:
 # Plot EVERY gene from the heatmap gene set on one radar plot.
 #
-# NO row-cluster filtering.
-# NO reversed-gene filtering.
-# NO selected cluster.
-# NO title on the plot.
-#
 # The plotted genes are exactly:
 #   warm-vs-cold significant genes passing heatmap_fdr_cutoff
 #   after finite z-score filtering.
