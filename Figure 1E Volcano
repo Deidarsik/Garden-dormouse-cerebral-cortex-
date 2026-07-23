@@ -1787,6 +1787,246 @@ cat("FILTERED ROBUST UNADJUSTED VERSUS SEX-ADJUSTED SUMMARY\n")
 cat("============================================================\n")
 print(comparison_summary)
 
+#############################
+# Step 18B: Construct corrected manuscript Table 1
+#############################
+
+contrast_order <- c(
+  "SE_vs_TE",
+  "TE_vs_TL",
+  "TL_vs_AE",
+  "AE_vs_AL",
+  "AL_vs_TE",
+  "AL_vs_SE"
+)
+
+contrast_labels <- c(
+  "SE-TE",
+  "TE-TL",
+  "TL-AE",
+  "AE-AL",
+  "AL-TE",
+  "AL-SE"
+)
+
+get_significant_table <- function(
+    results_list,
+    contrast_name,
+    fdr_cutoff
+) {
+  results_list[[contrast_name]] %>%
+    dplyr::filter(
+      FDR < fdr_cutoff
+    ) %>%
+    dplyr::distinct(
+      GeneID,
+      .keep_all = TRUE
+    )
+}
+
+# Significant tables for both models
+unadjusted_significant_tables <- setNames(
+  lapply(
+    contrast_order,
+    function(contrast_name) {
+      get_significant_table(
+        results_list = unadjusted_analysis$results_list,
+        contrast_name = contrast_name,
+        fdr_cutoff = fdr_cutoff
+      )
+    }
+  ),
+  contrast_order
+)
+
+sex_adjusted_significant_tables <- setNames(
+  lapply(
+    contrast_order,
+    function(contrast_name) {
+      get_significant_table(
+        results_list = sex_adjusted_analysis$results_list,
+        contrast_name = contrast_name,
+        fdr_cutoff = fdr_cutoff
+      )
+    }
+  ),
+  contrast_order
+)
+
+# Gene-ID sets for overlap calculations
+unadjusted_gene_sets <- lapply(
+  unadjusted_significant_tables,
+  function(x) {
+    unique(x$GeneID)
+  }
+)
+
+sex_adjusted_gene_sets <- lapply(
+  sex_adjusted_significant_tables,
+  function(x) {
+    unique(x$GeneID)
+  }
+)
+
+# DEGs occurring in only one of the six unadjusted contrasts
+unique_unadjusted_counts <- vapply(
+  seq_along(unadjusted_gene_sets),
+  function(i) {
+    genes_in_other_contrasts <- unique(
+      unlist(
+        unadjusted_gene_sets[-i],
+        use.names = FALSE
+      )
+    )
+    
+    sum(
+      !unadjusted_gene_sets[[i]] %in%
+        genes_in_other_contrasts
+    )
+  },
+  FUN.VALUE = integer(1)
+)
+
+# Count non-empty Target_gene assignments.
+#
+# IMPORTANT:
+# This is a 1:1 mouse-ortholog count only if Target_gene in your
+# annotation file contains exclusively validated 1:1 mouse orthologs.
+ortholog_counts <- vapply(
+  unadjusted_significant_tables,
+  function(x) {
+    target_gene <- trimws(
+      as.character(x$Target_gene)
+    )
+    
+    sum(
+      !is.na(target_gene) &
+        target_gene != ""
+    )
+  },
+  FUN.VALUE = integer(1)
+)
+
+# Helper for extracting summary columns in the correct order
+extract_summary_values <- function(
+    summary_df,
+    value_column
+) {
+  summary_df[
+    match(
+      contrast_order,
+      summary_df$Contrast
+    ),
+    value_column
+  ]
+}
+
+unadjusted_total <- extract_summary_values(
+  unadjusted_analysis$deg_summary,
+  "Total_DEGs"
+)
+
+sex_adjusted_total <- extract_summary_values(
+  sex_adjusted_analysis$deg_summary,
+  "Total_DEGs"
+)
+
+unadjusted_up <- extract_summary_values(
+  unadjusted_analysis$deg_summary,
+  "Upregulated"
+)
+
+unadjusted_down <- extract_summary_values(
+  unadjusted_analysis$deg_summary,
+  "Downregulated"
+)
+
+significant_in_both <- extract_summary_values(
+  comparison_summary,
+  "Significant_in_both"
+)
+
+lost_after_adjustment <- extract_summary_values(
+  comparison_summary,
+  "Lost_after_sex_adjustment"
+)
+
+gained_after_adjustment <- extract_summary_values(
+  comparison_summary,
+  "Gained_after_sex_adjustment"
+)
+
+ortholog_percentages <- ifelse(
+  unadjusted_total > 0,
+  100 * ortholog_counts / unadjusted_total,
+  0
+)
+
+ortholog_display <- sprintf(
+  "%d (%.1f%%)",
+  ortholog_counts,
+  ortholog_percentages
+)
+
+table1_matrix <- rbind(
+  "Unadjusted total DEGs" =
+    unadjusted_total,
+  
+  "Sex-adjusted total DEGs" =
+    sex_adjusted_total,
+  
+  "Upregulated, unadjusted" =
+    unadjusted_up,
+  
+  "Downregulated, unadjusted" =
+    unadjusted_down,
+  
+  "Significant in both models" =
+    significant_in_both,
+  
+  "Lost after sex adjustment" =
+    lost_after_adjustment,
+  
+  "Gained after sex adjustment" =
+    gained_after_adjustment,
+  
+  "Unique unadjusted DEGs" =
+    unique_unadjusted_counts,
+  
+  "Assigned 1:1 mouse orthologs" =
+    ortholog_display
+)
+
+colnames(table1_matrix) <- contrast_labels
+
+table1_df <- data.frame(
+  Feature = rownames(table1_matrix),
+  table1_matrix,
+  row.names = NULL,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+cat("\nCorrected manuscript Table 1:\n")
+print(
+  table1_df,
+  row.names = FALSE
+)
+
+write.table(
+  table1_df,
+  file = file.path(
+    comparison_output_dir,
+    paste0(
+      "corrected_manuscript_Table_1_FDR_lt_",
+      fdr_label,
+      ".txt"
+    )
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
 
 #############################
 # Step 19: Save session information
