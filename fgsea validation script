@@ -1,0 +1,672 @@
+#!/usr/bin/env Rscript
+
+output_dir_default <- "/Users/adrian/Desktop/EQU.03/stability_between_stage_variance"
+second_output_dir_default <- NULL
+# Example:
+# second_output_dir_default <-
+#   "/Users/adrian/Desktop/EQU.03/stability_between_stage_variance_run2"
+
+args <- commandArgs(trailingOnly = TRUE)
+
+if (length(args) > 2L) {
+  stop(
+    "Usage: Rscript validate_stability_outputs_v2.R ",
+    "OUTPUT_DIR [SECOND_OUTPUT_DIR]"
+  )
+}
+
+if (length(args) >= 1L) {
+  outdir_input <- args[1]
+  second_outdir_input <- if (length(args) == 2L) args[2] else NULL
+} else {
+  message(
+    "No command-line directory supplied. Using the configured RStudio path:\n",
+    output_dir_default
+  )
+  outdir_input <- output_dir_default
+  second_outdir_input <- second_output_dir_default
+}
+
+if (
+  is.null(outdir_input) ||
+  is.na(outdir_input) ||
+  !nzchar(outdir_input)
+) {
+  stop(
+    "No output directory was supplied. Set output_dir_default near the top ",
+    "of the script or run it from Terminal with an output-directory argument."
+  )
+}
+
+outdir <- normalizePath(
+  outdir_input,
+  mustWork = TRUE
+)
+
+second_outdir <- if (
+  !is.null(second_outdir_input) &&
+  !is.na(second_outdir_input) &&
+  nzchar(second_outdir_input)
+) {
+  normalizePath(
+    second_outdir_input,
+    mustWork = TRUE
+  )
+} else {
+  NULL
+}
+
+tolerance <- 1e-10
+fdr_cutoff <- 0.05
+
+pass <- function(label, detail = NULL) {
+  cat("[PASS] ", label, if (!is.null(detail)) paste0(": ", detail), "\n", sep = "")
+}
+
+fail <- function(label, detail = NULL) {
+  stop(
+    "[FAIL] ",
+    label,
+    if (!is.null(detail)) paste0(": ", detail) else "",
+    call. = FALSE
+  )
+}
+
+assert_true <- function(condition, label, detail = NULL) {
+  if (!isTRUE(condition)) fail(label, detail)
+  pass(label, detail)
+}
+
+read_required <- function(filename) {
+  path <- file.path(outdir, filename)
+  if (!file.exists(path)) {
+    fail("Required file exists", filename)
+  }
+  read.csv(
+    path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+}
+
+required_files <- c(
+  "per_gene_primary_stability_statistics.csv",
+  "ranking_primary_stable_first.csv",
+  "ranking_primary_variable_first.csv",
+  "fgsea_primary_combined_global_FDR.csv",
+  "fgsea_primary_stable_all.csv",
+  "fgsea_primary_variable_all.csv",
+  "fgsea_primary_stable_collapsed.csv",
+  "fgsea_primary_variable_collapsed.csv",
+  "qc_pathway_coverage.csv"
+)
+
+missing_files <- required_files[
+  !file.exists(file.path(outdir, required_files))
+]
+
+assert_true(
+  length(missing_files) == 0L,
+  "All required primary files exist",
+  if (length(missing_files)) paste(missing_files, collapse = ", ") else
+    paste(length(required_files), "files")
+)
+
+gene_stats <- read_required(
+  "per_gene_primary_stability_statistics.csv"
+)
+stable_rank <- read_required(
+  "ranking_primary_stable_first.csv"
+)
+variable_rank <- read_required(
+  "ranking_primary_variable_first.csv"
+)
+primary <- read_required(
+  "fgsea_primary_combined_global_FDR.csv"
+)
+stable_all <- read_required(
+  "fgsea_primary_stable_all.csv"
+)
+variable_all <- read_required(
+  "fgsea_primary_variable_all.csv"
+)
+stable_collapsed <- read_required(
+  "fgsea_primary_stable_collapsed.csv"
+)
+variable_collapsed <- read_required(
+  "fgsea_primary_variable_collapsed.csv"
+)
+coverage <- read_required(
+  "qc_pathway_coverage.csv"
+)
+
+# =============================================================================
+# 1. Gene-universe and ranking checks
+# =============================================================================
+
+assert_true(
+  !anyDuplicated(gene_stats$Gene_name),
+  "Per-gene table contains unique symbols"
+)
+
+assert_true(
+  !anyDuplicated(stable_rank$Gene_name) &&
+    !anyDuplicated(variable_rank$Gene_name),
+  "Both primary rankings contain unique symbols"
+)
+
+assert_true(
+  setequal(gene_stats$Gene_name, stable_rank$Gene_name) &&
+    setequal(gene_stats$Gene_name, variable_rank$Gene_name),
+  "Per-gene table and both rankings contain the same genes",
+  paste(nrow(gene_stats), "genes")
+)
+
+assert_true(
+  identical(
+    stable_rank$Gene_name,
+    rev(variable_rank$Gene_name)
+  ),
+  "Variable ranking is the exact reverse of the stable ranking"
+)
+
+assert_true(
+  all(
+    stable_rank$rank_position +
+      rev(variable_rank$rank_position) ==
+      nrow(stable_rank) + 1L
+  ),
+  "Opposite rank positions sum to N + 1"
+)
+
+assert_true(
+  all(diff(stable_rank$between_stage_var_adjusted) >= -tolerance),
+  "Stable ranking is ordered low-to-high by adjusted between-stage variance"
+)
+
+assert_true(
+  all(diff(variable_rank$between_stage_var_adjusted) <= tolerance),
+  "Variable ranking is ordered high-to-low by adjusted between-stage variance"
+)
+
+assert_true(
+  all(stable_rank$priority_score > 0) &&
+    all(variable_rank$priority_score > 0) &&
+    !anyDuplicated(stable_rank$priority_score) &&
+    !anyDuplicated(variable_rank$priority_score),
+  "Priority scores are unique and strictly positive"
+)
+
+assert_true(
+  all(diff(stable_rank$priority_score) < 0) &&
+    all(diff(variable_rank$priority_score) < 0),
+  "Priority scores decrease strictly down each file"
+)
+
+# =============================================================================
+# 2. Independent recalculation of gene-level quantities
+# =============================================================================
+
+stage_columns <- grep(
+  "^stage_mean_",
+  colnames(gene_stats),
+  value = TRUE
+)
+
+assert_true(
+  length(stage_columns) >= 2L,
+  "At least two exported stage-mean columns are available",
+  paste(stage_columns, collapse = ", ")
+)
+
+stage_matrix <- as.matrix(
+  gene_stats[, stage_columns, drop = FALSE]
+)
+storage.mode(stage_matrix) <- "double"
+
+recalculated_variance <- apply(
+  stage_matrix,
+  1L,
+  stats::var
+)
+
+maximum_variance_error <- max(
+  abs(
+    recalculated_variance -
+      gene_stats$between_stage_var_raw
+  ),
+  na.rm = TRUE
+)
+
+assert_true(
+  is.finite(maximum_variance_error) &&
+    maximum_variance_error < tolerance,
+  "Exported raw between-stage variance matches an independent recalculation",
+  format(maximum_variance_error, scientific = TRUE, digits = 4)
+)
+
+recalculated_max_contrast <- apply(
+  stage_matrix,
+  1L,
+  function(x) max(x) - min(x)
+)
+
+maximum_contrast_error <- max(
+  abs(
+    recalculated_max_contrast -
+      gene_stats$max_contrast_log2
+  ),
+  na.rm = TRUE
+)
+
+assert_true(
+  is.finite(maximum_contrast_error) &&
+    maximum_contrast_error < tolerance,
+  "Exported maximum stage contrast matches an independent recalculation",
+  format(maximum_contrast_error, scientific = TRUE, digits = 4)
+)
+
+rho_adjusted <- suppressWarnings(
+  cor(
+    gene_stats$between_stage_var_adjusted,
+    gene_stats$mean_logCPM,
+    method = "spearman",
+    use = "complete.obs"
+  )
+)
+
+assert_true(
+  is.finite(rho_adjusted) &&
+    abs(rho_adjusted) < 0.01,
+  "Adjusted primary statistic has negligible residual rank correlation with mean expression",
+  paste("Spearman rho =", format(rho_adjusted, digits = 5))
+)
+
+# Verify that rank-table statistics match the per-gene source table.
+gene_index <- match(
+  stable_rank$Gene_name,
+  gene_stats$Gene_name
+)
+
+rank_stat_error <- max(
+  abs(
+    stable_rank$between_stage_var_adjusted -
+      gene_stats$between_stage_var_adjusted[gene_index]
+  ),
+  na.rm = TRUE
+)
+
+assert_true(
+  rank_stat_error < tolerance,
+  "Stable ranking contains the same adjusted statistic as the per-gene table",
+  format(rank_stat_error, scientific = TRUE, digits = 4)
+)
+
+# =============================================================================
+# 3. Independent multiple-testing audit
+# =============================================================================
+
+assert_true(
+  nrow(primary) == nrow(stable_all) + nrow(variable_all),
+  "Combined primary table contains both complete directional result tables"
+)
+
+recalculated_bh <- p.adjust(
+  primary$pval,
+  method = "BH"
+)
+
+maximum_bh_error <- max(
+  abs(
+    recalculated_bh -
+      primary$padj_primary_global
+  ),
+  na.rm = TRUE
+)
+
+assert_true(
+  is.finite(maximum_bh_error) &&
+    maximum_bh_error < tolerance,
+  "Joint primary BH-adjusted P values match an independent recalculation",
+  format(maximum_bh_error, scientific = TRUE, digits = 4)
+)
+
+assert_true(
+  all(
+    primary$padj_primary_global >= 0 &
+      primary$padj_primary_global <= 1
+  ),
+  "All joint adjusted P values lie between zero and one"
+)
+
+n_stable_significant <- sum(
+  primary$direction == "stable_end" &
+    primary$padj_primary_global < fdr_cutoff,
+  na.rm = TRUE
+)
+
+n_variable_significant <- sum(
+  primary$direction == "variable_end" &
+    primary$padj_primary_global < fdr_cutoff,
+  na.rm = TRUE
+)
+
+pass(
+  "Primary significant-term counts",
+  paste(
+    n_stable_significant,
+    "stable-end and",
+    n_variable_significant,
+    "variable-end terms at FDR <",
+    fdr_cutoff
+  )
+)
+
+# =============================================================================
+# 4. Pathway-universe, size, and leading-edge checks
+# =============================================================================
+
+coverage_index <- match(
+  primary$pathway,
+  coverage$pathway
+)
+
+assert_true(
+  !anyNA(coverage_index),
+  "Every primary result is present in the pathway-coverage table"
+)
+
+expected_sizes <- coverage$size_in_tested_universe[
+  coverage_index
+]
+
+assert_true(
+  all(primary$size == expected_sizes),
+  "Every fgsea pathway size matches its represented size in the tested universe"
+)
+
+universe <- gene_stats$Gene_name
+
+split_leading_edge <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(character())
+  strsplit(x, ";", fixed = TRUE)[[1]]
+}
+
+leading_edges <- lapply(
+  primary$leadingEdge,
+  split_leading_edge
+)
+
+recalculated_leading_sizes <- lengths(
+  leading_edges
+)
+
+assert_true(
+  all(
+    recalculated_leading_sizes ==
+      primary$leadingEdge_size
+  ),
+  "Every leading-edge size equals the number of exported leading-edge genes"
+)
+
+outside_universe <- unique(
+  unlist(
+    lapply(
+      leading_edges,
+      function(x) setdiff(x, universe)
+    )
+  )
+)
+
+assert_true(
+  length(outside_universe) == 0L,
+  "Every leading-edge gene occurs in the tested gene universe",
+  if (length(outside_universe)) {
+    paste(head(outside_universe, 20), collapse = ", ")
+  } else {
+    "no out-of-universe genes"
+  }
+)
+
+# =============================================================================
+# 5. Collapsing checks
+# =============================================================================
+
+stable_significant_names <- stable_all$pathway[
+  stable_all$padj_primary_global < fdr_cutoff
+]
+
+variable_significant_names <- variable_all$pathway[
+  variable_all$padj_primary_global < fdr_cutoff
+]
+
+assert_true(
+  all(
+    stable_collapsed$pathway %in%
+      stable_significant_names
+  ),
+  "Every collapsed stable pathway was significant before collapsing"
+)
+
+assert_true(
+  all(
+    variable_collapsed$pathway %in%
+      variable_significant_names
+  ),
+  "Every collapsed variable pathway was significant before collapsing"
+)
+
+assert_true(
+  length(
+    intersect(
+      stable_collapsed$pathway,
+      variable_collapsed$pathway
+    )
+  ) == 0L,
+  "No collapsed pathway is classified at both ranking ends"
+)
+
+pass(
+  "Collapsed representative counts",
+  paste(
+    nrow(stable_collapsed),
+    "stable and",
+    nrow(variable_collapsed),
+    "variable pathways"
+  )
+)
+
+# =============================================================================
+# 6. Optional synthetic known-answer test of fgsea orientation
+# =============================================================================
+
+if (
+  requireNamespace("fgsea", quietly = TRUE) &&
+  requireNamespace("BiocParallel", quietly = TRUE)
+) {
+  set.seed(73191)
+  
+  genes <- paste0(
+    "SyntheticGene",
+    seq_len(1000)
+  )
+  
+  stable_priority <- setNames(
+    as.numeric(1000:1),
+    genes
+  )
+  
+  variable_priority <- setNames(
+    as.numeric(1000:1),
+    rev(genes)
+  )
+  
+  synthetic_pathways <- list(
+    KNOWN_STABLE_SET = genes[1:50],
+    KNOWN_VARIABLE_SET = genes[951:1000],
+    BACKGROUND_SET = sample(
+      genes[101:900],
+      50
+    )
+  )
+  
+  stable_test <- fgsea::fgseaMultilevel(
+    pathways = synthetic_pathways,
+    stats = stable_priority,
+    minSize = 10,
+    maxSize = 100,
+    scoreType = "pos",
+    gseaParam = 0,
+    eps = 1e-20,
+    nPermSimple = 10000,
+    BPPARAM = BiocParallel::SerialParam()
+  )
+  
+  variable_test <- fgsea::fgseaMultilevel(
+    pathways = synthetic_pathways,
+    stats = variable_priority,
+    minSize = 10,
+    maxSize = 100,
+    scoreType = "pos",
+    gseaParam = 0,
+    eps = 1e-20,
+    nPermSimple = 10000,
+    BPPARAM = BiocParallel::SerialParam()
+  )
+  
+  p_stable_in_stable <- stable_test$pval[
+    match(
+      "KNOWN_STABLE_SET",
+      stable_test$pathway
+    )
+  ]
+  
+  p_variable_in_stable <- stable_test$pval[
+    match(
+      "KNOWN_VARIABLE_SET",
+      stable_test$pathway
+    )
+  ]
+  
+  p_variable_in_variable <- variable_test$pval[
+    match(
+      "KNOWN_VARIABLE_SET",
+      variable_test$pathway
+    )
+  ]
+  
+  p_stable_in_variable <- variable_test$pval[
+    match(
+      "KNOWN_STABLE_SET",
+      variable_test$pathway
+    )
+  ]
+  
+  assert_true(
+    p_stable_in_stable < 1e-6 &&
+      p_variable_in_stable > 0.05,
+    "Synthetic stable-first test identifies only the known top-ranked stable set",
+    paste(
+      "P(stable set) =",
+      signif(p_stable_in_stable, 3),
+      "; P(variable set) =",
+      signif(p_variable_in_stable, 3)
+    )
+  )
+  
+  assert_true(
+    p_variable_in_variable < 1e-6 &&
+      p_stable_in_variable > 0.05,
+    "Synthetic variable-first test identifies only the known top-ranked variable set",
+    paste(
+      "P(variable set) =",
+      signif(p_variable_in_variable, 3),
+      "; P(stable set) =",
+      signif(p_stable_in_variable, 3)
+    )
+  )
+} else {
+  cat(
+    "[SKIP] Synthetic fgsea known-answer test: fgsea and/or BiocParallel ",
+    "is not installed.\n",
+    sep = ""
+  )
+}
+
+# =============================================================================
+# 7. Optional byte-for-byte reproducibility comparison
+# =============================================================================
+
+if (!is.null(second_outdir)) {
+  reproducibility_files <- c(
+    "per_gene_primary_stability_statistics.csv",
+    "ranking_primary_stable_first.csv",
+    "ranking_primary_variable_first.csv",
+    "fgsea_primary_combined_global_FDR.csv",
+    "fgsea_primary_stable_collapsed.csv",
+    "fgsea_primary_variable_collapsed.csv"
+  )
+  
+  missing_second <- reproducibility_files[
+    !file.exists(
+      file.path(
+        second_outdir,
+        reproducibility_files
+      )
+    )
+  ]
+  
+  assert_true(
+    length(missing_second) == 0L,
+    "All files required for the second-run comparison exist",
+    if (length(missing_second)) {
+      paste(missing_second, collapse = ", ")
+    } else {
+      paste(length(reproducibility_files), "files")
+    }
+  )
+  
+  first_md5 <- tools::md5sum(
+    file.path(
+      outdir,
+      reproducibility_files
+    )
+  )
+  
+  second_md5 <- tools::md5sum(
+    file.path(
+      second_outdir,
+      reproducibility_files
+    )
+  )
+  
+  identical_files <- unname(first_md5) ==
+    unname(second_md5)
+  
+  if (!all(identical_files)) {
+    fail(
+      "Second complete run is byte-for-byte reproducible",
+      paste(
+        reproducibility_files[
+          !identical_files
+        ],
+        collapse = ", "
+      )
+    )
+  }
+  
+  pass(
+    "Second complete run is byte-for-byte reproducible",
+    paste(
+      length(reproducibility_files),
+      "primary output files"
+    )
+  )
+}
+
+cat(
+  "\n============================================================\n",
+  "ALL REQUIRED INDEPENDENT CHECKS PASSED\n",
+  "============================================================\n",
+  sep = ""
+)
