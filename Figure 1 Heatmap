@@ -1,17 +1,3 @@
-#############################
-# fdr_heatmap_mouse_ortholog_sidebar.R
-# Columns = animals in fixed order: SE, AE, AL, TE, TL
-# Rows = genes passing FDR < 1e-4 in warm vs cold
-# Values = logCPM z-scored across animals
-# Top annotation = group colours
-#   SE, AE, AL = light colours
-#   TE, TL = dark colours
-# Right sidebar = mouse ortholog present / absent
-# Black = has mouse ortholog
-# White = no mouse ortholog
-# Also extracts row-cluster gene blocks
-#############################
-
 # ----------------------------
 # Install/load packages
 # ----------------------------
@@ -57,8 +43,8 @@ output_dir             <- "/Users/adrian/Desktop/EQU.03/"
 # ----------------------------
 # Settings
 # ----------------------------
-fdr_cutoff <- 1e-4
-fdr_label <- "1e-4"
+fdr_cutoff <- 1e-2
+fdr_label <- "1e-2"
 
 z_cap <- 2
 cluster_rows <- TRUE
@@ -71,7 +57,7 @@ legend_title_fontsize <- 20
 legend_label_fontsize <- 20
 
 # Number of row clusters to cut from the dendrogram
-k_row <- 6
+k_row <- 2
 
 # Define warm vs cold groups for extracting the block
 warm_groups <- c("SE", "AE", "AL")
@@ -233,19 +219,55 @@ if (order_by_group) {
 }
 
 # ----------------------------
-# DGEList + filtering + normalization
+# DGEList + stage-based filtering + normalization
 # ----------------------------
 dge <- edgeR::DGEList(
   counts = expression_matrix,
   group = metadata$Group
 )
 
-keep <- edgeR::filterByExpr(dge, group = metadata$Group)
+keep <- edgeR::filterByExpr(
+  dge,
+  group = metadata$Group
+)
+
 dge <- dge[keep, , keep.lib.sizes = FALSE]
 
-cat("Genes after filterByExpr:", nrow(dge), "\n")
+cat(
+  "Genes after stage-based filterByExpr:",
+  nrow(dge),
+  "\n"
+)
 
 dge <- edgeR::calcNormFactors(dge)
+
+# ----------------------------
+# Differential expression: warm vs cold
+# ----------------------------
+de_group <- ifelse(
+  metadata$Group %in% warm_groups,
+  "warm",
+  ifelse(
+    metadata$Group %in% cold_groups,
+    "cold",
+    NA
+  )
+)
+
+if (any(is.na(de_group))) {
+  stop("Some samples were not assigned to warm or cold.")
+}
+
+de_group <- factor(
+  de_group,
+  levels = c("cold", "warm")
+)
+
+design <- model.matrix(~ de_group)
+
+dge <- edgeR::estimateDisp(dge, design)
+fit <- edgeR::glmQLFit(dge, design, robust = TRUE)
+qlf <- edgeR::glmQLFTest(fit, coef = 2)
 
 # ----------------------------
 # Compute logCPM
@@ -607,6 +629,81 @@ mouse_ra <- ComplexHeatmap::rowAnnotation(
   )
 )
 
+# ---------------------------------------------------------
+# Prepare correctly aligned matrix, gene names and sidebar
+# for the dendrogram heatmap
+# ---------------------------------------------------------
+
+# Use the original z-score matrix because hm$tree_row
+# was calculated from this exact row order
+z_mat_named <- z_mat
+
+# Obtain gene symbols in the same order as the heatmap rows
+gene_labels <- gene_info$Gene_name[
+  match(rownames(z_mat_named), gene_info$GeneID)
+]
+
+# Identify genes without an available gene symbol
+missing_gene_name <- is.na(gene_labels) |
+  trimws(gene_labels) == "" |
+  gene_labels %in% c(
+    "-", ".", "NA", "na",
+    "None", "none",
+    "NULL", "null"
+  )
+
+# Only use Equ03 GeneID when no gene symbol is available
+gene_labels[missing_gene_name] <-
+  rownames(z_mat_named)[missing_gene_name]
+
+# Mouse-ortholog annotation in exactly the same row order
+mouse_ortholog_named <- gene_info$Has_mouse_ortholog[
+  match(rownames(z_mat_named), gene_info$GeneID)
+]
+
+mouse_ortholog_named <- factor(
+  mouse_ortholog_named,
+  levels = c("Yes", "No")
+)
+
+mouse_ra_named <- ComplexHeatmap::rowAnnotation(
+  Mouse_ortholog = mouse_ortholog_named,
+  col = list(
+    Mouse_ortholog = mouse_ortholog_colors
+  ),
+  annotation_name_side = "top",
+  show_annotation_name = FALSE,
+  simple_anno_size = grid::unit(4, "mm"),
+  border = TRUE,
+  annotation_legend_param = list(
+    Mouse_ortholog = list(
+      title_gp = grid::gpar(
+        fontsize = legend_title_fontsize
+      ),
+      labels_gp = grid::gpar(
+        fontsize = legend_label_fontsize
+      )
+    )
+  )
+)
+
+
+cat("\nAll gene names in heatmap row order:\n")
+cat(gene_labels[hm$tree_row$order], sep = "\n")
+
+heatmap_gene_list <- data.frame(
+  GeneID = rownames(z_mat_named)[hm$tree_row$order],
+  Gene_name = gene_labels[hm$tree_row$order],
+  stringsAsFactors = FALSE
+)
+
+print(
+  heatmap_gene_list,
+  row.names = FALSE,
+  max = nrow(heatmap_gene_list)
+)
+
+
 # Version 1: clean heatmap, no title, no animal names, no gene names
 ht_clean <- ComplexHeatmap::Heatmap(
   z_mat_plot,
@@ -627,27 +724,48 @@ ht_clean <- ComplexHeatmap::Heatmap(
   )
 )
 
-# Version 2: heatmap with mouse ortholog sidebar
+# Version 2: heatmap with dendrogram, mouse ortholog sidebar
+# and annotated gene names
 ht_mouse_ortholog <- ComplexHeatmap::Heatmap(
-  z_mat_plot,
+  z_mat_named,
   name = "z-score",
   col = col_fun,
-  cluster_rows = FALSE,
-  cluster_columns = FALSE,
-  row_split = row_split_factor,
+  
+  # Dendrogram calculated from the original z-score matrix
+  cluster_rows = hm$tree_row,
+  show_row_dend = TRUE,
+  row_dend_side = "left",
+  
+  # Cut the dendrogram into six clusters
+  row_split = k_row,
   cluster_row_slices = FALSE,
+  
+  # Print annotated gene symbols
   show_row_names = FALSE,
+  #row_labels = gene_labels,
+  #row_names_side = "right",
+  #row_names_gp = grid::gpar(fontsize = 6),
+  #row_names_max_width = grid::unit(5, "cm"),
+  
+  # Keep animals in SE, AE, AL, TE, TL order
+  cluster_columns = FALSE,
   show_column_names = FALSE,
+  
   top_annotation = ha,
-  right_annotation = mouse_ra,
+  right_annotation = mouse_ra_named,
+  
   column_title = NULL,
   border = FALSE,
+  
   heatmap_legend_param = list(
-    title_gp = grid::gpar(fontsize = legend_title_fontsize),
-    labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+    title_gp = grid::gpar(
+      fontsize = legend_title_fontsize
+    ),
+    labels_gp = grid::gpar(
+      fontsize = legend_label_fontsize
+    )
   )
 )
-
 # ----------------------------
 # Save clean version
 # ----------------------------
