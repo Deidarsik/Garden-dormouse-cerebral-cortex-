@@ -1,118 +1,882 @@
 #!/usr/bin/env Rscript
 
 # ----------------------------
-# venn_only_with_VennDiagram.R
+# venn_unadjusted_and_common_genes.R
 # ----------------------------
 
+# ----------------------------
 # 1) Load Required Libraries
-library(edgeR)
-library(VennDiagram)
-library(grid)       # for grid.draw()
-library(ggsci)      # for ggsci palettes
+# ----------------------------
+required_packages <- c(
+  "edgeR",
+  "limma",
+  "dplyr",
+  "VennDiagram",
+  "grid",
+  "ggsci"
+)
 
-# 2) Load Data
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    quietly = TRUE,
+    FUN.VALUE = logical(1)
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "The following required packages are missing: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(limma)
+  library(dplyr)
+  library(VennDiagram)
+  library(grid)
+  library(ggsci)
+})
+
+# ----------------------------
+# 2) User Settings
+# ----------------------------
+counts_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
+metadata_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt"
+annotation_path <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
+
+group_levels <- c(
+  "SE",
+  "TE",
+  "TL",
+  "AE",
+  "AL"
+)
+
+fdr_cutoff <- 0.01
+
+fdr_label <- format(
+  fdr_cutoff,
+  scientific = FALSE,
+  trim = TRUE
+)
+
+output_dir <- file.path(
+  "/Users/adrian/Desktop/EQU.03",
+  paste0(
+    "Venn_filtered_robust_unadjusted_FDR_",
+    fdr_label
+  )
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# ----------------------------
+# 3) Load Data
+# ----------------------------
 counts <- read.table(
-  "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt",
-  header    = TRUE,
+  counts_path,
+  header = TRUE,
   row.names = 1,
-  sep       = "\t",
-  check.names = FALSE
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  quote = "",
+  comment.char = ""
 )
 
 metadata <- read.table(
-  "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt",
+  metadata_path,
   header = TRUE,
-  sep    = "\t"
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  quote = "",
+  comment.char = ""
 )
+
+gene_annotations <- read.table(
+  annotation_path,
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+# ----------------------------
+# 4) Validate and Align Data
+# ----------------------------
+required_metadata_columns <- c(
+  "Sample",
+  "Group"
+)
+
+missing_metadata_columns <- setdiff(
+  required_metadata_columns,
+  colnames(metadata)
+)
+
+if (length(missing_metadata_columns) > 0) {
+  stop(
+    "The metadata is missing these required columns: ",
+    paste(missing_metadata_columns, collapse = ", ")
+  )
+}
+
+metadata$Sample <- trimws(
+  as.character(metadata$Sample)
+)
+
+metadata$Group <- trimws(
+  as.character(metadata$Group)
+)
+
+if (any(is.na(metadata$Sample) | metadata$Sample == "")) {
+  stop(
+    "The metadata contains missing or empty Sample values."
+  )
+}
+
+if (anyDuplicated(metadata$Sample)) {
+  stop(
+    "The metadata contains duplicated Sample values."
+  )
+}
+
+if (anyDuplicated(colnames(counts))) {
+  stop(
+    "The count matrix contains duplicated sample-column names."
+  )
+}
+
+unexpected_groups <- setdiff(
+  unique(metadata$Group),
+  group_levels
+)
+
+if (length(unexpected_groups) > 0) {
+  stop(
+    "Unexpected Group values were found: ",
+    paste(unexpected_groups, collapse = ", ")
+  )
+}
+
+missing_groups <- setdiff(
+  group_levels,
+  unique(metadata$Group)
+)
+
+if (length(missing_groups) > 0) {
+  stop(
+    "The following required groups are absent: ",
+    paste(missing_groups, collapse = ", ")
+  )
+}
+
+metadata$Group <- factor(
+  metadata$Group,
+  levels = group_levels
+)
+
 rownames(metadata) <- metadata$Sample
 
-gene_mapping <- read.table(
-  "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt",
-  header = TRUE,
-  sep    = "\t",
-  stringsAsFactors = FALSE
+missing_count_samples <- setdiff(
+  metadata$Sample,
+  colnames(counts)
 )
-colnames(gene_mapping)[1] <- "Source_gene"
 
-# 3) Align samples
-common   <- intersect(colnames(counts), rownames(metadata))
-counts   <- counts[, common]
-metadata <- metadata[common, , drop = FALSE]
-counts   <- counts[, rownames(metadata)]
+if (length(missing_count_samples) > 0) {
+  stop(
+    "These metadata samples are absent from the count matrix: ",
+    paste(missing_count_samples, collapse = ", ")
+  )
+}
 
-# 4) DGEList and Normalize
-dge <- DGEList(counts = counts, group = metadata$Group)
-dge <- calcNormFactors(dge)
+counts <- counts[
+  ,
+  metadata$Sample,
+  drop = FALSE
+]
 
-# 5) Design Matrix & Dispersion
-metadata$Group <- factor(metadata$Group, levels = c("SE","TE","TL","AE","AL"))
-design <- model.matrix(~ 0 + Group, data = metadata)
-colnames(design) <- levels(metadata$Group)
+counts <- as.matrix(
+  counts
+)
 
-dge <- estimateDisp(dge, design)
-fit <- glmQLFit(dge, design)
+suppressWarnings(
+  storage.mode(counts) <- "numeric"
+)
 
-# 6) Define Contrasts & Run QLTests
-contrast_matrix <- makeContrasts(
-  AL_TE = AL - TE,
-  TE_TL = TE - TL,
-  TL_AE = TL - AE,
-  AE_AL = AE - AL,
+if (anyNA(counts)) {
+  stop(
+    "The count matrix contains missing or non-numeric values."
+  )
+}
+
+if (any(!is.finite(counts))) {
+  stop(
+    "The count matrix contains non-finite values."
+  )
+}
+
+if (any(counts < 0)) {
+  stop(
+    "The count matrix contains negative values."
+  )
+}
+
+if (!all(abs(counts - round(counts)) < 1e-8)) {
+  stop(
+    "The expression matrix is not integer-like. ",
+    "edgeR requires raw read counts."
+  )
+}
+
+if (anyDuplicated(rownames(counts))) {
+  stop(
+    "The count matrix contains duplicated GeneIDs."
+  )
+}
+
+if (any(colSums(counts) == 0)) {
+  stop(
+    "At least one sample has zero total counts."
+  )
+}
+
+if (ncol(gene_annotations) == 0) {
+  stop(
+    "The annotation file contains no columns."
+  )
+}
+
+colnames(gene_annotations)[1] <- "GeneID"
+
+gene_annotations$GeneID <- trimws(
+  as.character(gene_annotations$GeneID)
+)
+
+gene_annotations <- gene_annotations %>%
+  dplyr::filter(
+    !is.na(GeneID),
+    GeneID != ""
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    .keep_all = TRUE
+  )
+
+if (!"Gene_name" %in% colnames(gene_annotations)) {
+  stop(
+    "The annotation file does not contain the required Gene_name column."
+  )
+}
+
+# ----------------------------
+# 5) Helper Functions
+# ----------------------------
+is_annotated <- function(x) {
+  cleaned <- toupper(
+    trimws(
+      as.character(x)
+    )
+  )
+  
+  !is.na(cleaned) &
+    !cleaned %in% c(
+      "",
+      "NA",
+      "N/A",
+      "?",
+      "UNKNOWN",
+      "UNANNOTATED"
+    )
+}
+
+write_tab_file <- function(
+    x,
+    filename
+) {
+  write.table(
+    x,
+    file = filename,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    na = ""
+  )
+}
+
+# ----------------------------
+# 6) Create DGEList and Filter Low-Expression Genes
+# ----------------------------
+dge <- edgeR::DGEList(
+  counts = counts,
+  group = metadata$Group
+)
+
+genes_before_filtering <- nrow(
+  dge
+)
+
+keep <- edgeR::filterByExpr(
+  dge,
+  group = metadata$Group
+)
+
+dge <- dge[
+  keep,
+  ,
+  keep.lib.sizes = FALSE
+]
+
+dge <- edgeR::normLibSizes(
+  dge,
+  method = "TMM"
+)
+
+genes_after_filtering <- nrow(
+  dge
+)
+
+cat(
+  "Genes before filtering:",
+  genes_before_filtering,
+  "\n"
+)
+
+cat(
+  "Genes retained:",
+  genes_after_filtering,
+  "\n"
+)
+
+cat(
+  "Genes removed:",
+  genes_before_filtering - genes_after_filtering,
+  "\n"
+)
+
+# ----------------------------
+# 7) Create Unadjusted Design Matrix
+# ----------------------------
+design <- model.matrix(
+  ~ 0 + Group,
+  data = metadata
+)
+
+colnames(design) <- sub(
+  "^Group",
+  "",
+  colnames(design)
+)
+
+missing_design_groups <- setdiff(
+  group_levels,
+  colnames(design)
+)
+
+if (length(missing_design_groups) > 0) {
+  stop(
+    "The design matrix is missing these group coefficients: ",
+    paste(missing_design_groups, collapse = ", ")
+  )
+}
+
+if (qr(design)$rank < ncol(design)) {
+  stop(
+    "The unadjusted design matrix is not full rank."
+  )
+}
+
+# ----------------------------
+# 8) Estimate Dispersion and Fit Robust QL Model
+# ----------------------------
+dge_model <- edgeR::estimateDisp(
+  dge,
+  design,
+  robust = TRUE
+)
+
+fit <- edgeR::glmQLFit(
+  dge_model,
+  design,
+  robust = TRUE
+)
+
+# ----------------------------
+# 9) Define the Same Six Contrasts
+# ----------------------------
+contrast_matrix <- limma::makeContrasts(
+  SE_vs_TE = SE - TE,
+  TE_vs_TL = TE - TL,
+  TL_vs_AE = TL - AE,
+  AE_vs_AL = AE - AL,
+  AL_vs_TE = AL - TE,
+  AL_vs_SE = AL - SE,
   levels = design
 )
 
-qlf_list <- lapply(colnames(contrast_matrix), function(ct) {
-  glmQLFTest(fit, contrast = contrast_matrix[, ct])
-})
-names(qlf_list) <- colnames(contrast_matrix)
+# ----------------------------
+# 10) Run Differential-Expression Tests
+# ----------------------------
+results_list <- list()
 
-# 7) Build deg_list (FDR < 0.01)
-deg_list <- lapply(qlf_list, function(qlf) {
-  tbl <- topTags(qlf, n = Inf)$table
-  rownames(tbl)[tbl$FDR < 0.01]
-})
-
-deg_list <- deg_list[c("AL_TE","TE_TL","TL_AE","AE_AL")]
-
-# ---- Rename categories: use hyphens instead of underscores ----
-names(deg_list) <- gsub("_", "-", names(deg_list))
-
-# 8) Sanity check: print how many genes in each set
-counts_per_set <- sapply(deg_list, length)
-print(counts_per_set)
-if (all(counts_per_set == 0)) {
-  stop("No genes passed FDR < 0.01 in any of the four contrasts; Venn will be empty.")
+for (contrast_name in colnames(contrast_matrix)) {
+  cat(
+    "Testing contrast:",
+    contrast_name,
+    "\n"
+  )
+  
+  test <- edgeR::glmQLFTest(
+    fit,
+    contrast = contrast_matrix[, contrast_name]
+  )
+  
+  result_table <- edgeR::topTags(
+    test,
+    n = Inf,
+    sort.by = "PValue"
+  )$table
+  
+  result_table$GeneID <- rownames(
+    result_table
+  )
+  
+  rownames(result_table) <- NULL
+  
+  result_table <- result_table %>%
+    dplyr::distinct(
+      GeneID,
+      .keep_all = TRUE
+    ) %>%
+    dplyr::left_join(
+      gene_annotations,
+      by = "GeneID"
+    ) %>%
+    dplyr::mutate(
+      Gene_label = ifelse(
+        is_annotated(Gene_name),
+        Gene_name,
+        GeneID
+      )
+    ) %>%
+    dplyr::relocate(
+      GeneID,
+      Gene_label,
+      Gene_name
+    )
+  
+  if (nrow(result_table) != nrow(dge)) {
+    stop(
+      "Annotation joining changed the number of rows for ",
+      contrast_name,
+      "."
+    )
+  }
+  
+  results_list[[contrast_name]] <- result_table
 }
 
-# 9) Set font-size multipliers for VennDiagram (relative to 12 pt)
-cex_counts <- 16/12   # count labels at 16 pt
-cat_cex    <- 20/12   # category labels at 20 pt
-
-# 10) Pick 4 blue shades from a ggsci palette
-fills <- pal_material("blue")(4)
-
-# 11) Generate the Venn grob using Helvetica/sans
-venn_grob <- venn.diagram(
-  x              = deg_list,
-  category.names = names(deg_list),
-  filename       = NULL,
-  fill           = fills,
-  alpha          = 0.4,
-  cex            = cex_counts,
-  cat.cex        = cat_cex,
-  fontfamily     = "sans",
-  cat.fontfamily = "sans",
-  margin         = 0.1
+# ----------------------------
+# 11) Build Significant DEG Sets
+# ----------------------------
+deg_list <- lapply(
+  results_list,
+  function(result_table) {
+    unique(
+      result_table$GeneID[
+        !is.na(result_table$FDR) &
+          result_table$FDR < fdr_cutoff &
+          !is.na(result_table$GeneID) &
+          result_table$GeneID != ""
+      ]
+    )
+  }
 )
 
-# 12) Save as a 12×8" PDF using Helvetica/sans
-pdf(
-  file   = "/Users/adrian/Desktop/EQU.03/venn_diagram.pdf",
-  width  = 12,
+venn_contrasts <- c(
+  "AL_vs_TE",
+  "TE_vs_TL",
+  "TL_vs_AE",
+  "AE_vs_AL"
+)
+
+venn_sets <- deg_list[
+  venn_contrasts
+]
+
+names(venn_sets) <- c(
+  "AL-TE",
+  "TE-TL",
+  "TL-AE",
+  "AE-AL"
+)
+
+# ----------------------------
+# 12) Check DEG Counts Used in the Venn Diagram
+# ----------------------------
+venn_counts <- vapply(
+  venn_sets,
+  length,
+  FUN.VALUE = integer(1)
+)
+
+cat(
+  "\nDEG counts used in the Venn diagram:\n"
+)
+
+print(
+  venn_counts
+)
+
+expected_counts <- c(
+  "AL-TE" = 301L,
+  "TE-TL" = 588L,
+  "TL-AE" = 855L,
+  "AE-AL" = 1L
+)
+
+if (!identical(
+  venn_counts,
+  expected_counts
+)) {
+  warning(
+    "The DEG totals differ from the previously observed filtered robust ",
+    "unadjusted results. Check the input files and package versions."
+  )
+}
+
+write_tab_file(
+  data.frame(
+    Contrast = names(venn_counts),
+    Number_of_DEGs = as.integer(venn_counts),
+    stringsAsFactors = FALSE
+  ),
+  file.path(
+    output_dir,
+    "Venn_DEG_counts.txt"
+  )
+)
+
+# ----------------------------
+# 13) Generate Four-Set Venn Diagram
+# ----------------------------
+venn_fills <- ggsci::pal_material(
+  palette = "blue"
+)(4)
+
+venn_grob <- VennDiagram::venn.diagram(
+  x = venn_sets,
+  category.names = names(venn_sets),
+  filename = NULL,
+  fill = venn_fills,
+  alpha = 0.4,
+  cex = 16 / 12,
+  cat.cex = 20 / 12,
+  fontfamily = "sans",
+  cat.fontfamily = "sans",
+  margin = 0.1
+)
+
+venn_pdf_path <- file.path(
+  output_dir,
+  paste0(
+    "Venn_AL-TE_TE-TL_TL-AE_AE-AL_",
+    "filtered_robust_unadjusted_FDR_lt_",
+    fdr_label,
+    ".pdf"
+  )
+)
+
+grDevices::pdf(
+  file = venn_pdf_path,
+  width = 12,
   height = 8,
   family = "sans"
 )
-grid.draw(venn_grob)
-dev.off()
 
-message("Venn diagram saved to '/Users/adrian/Desktop/EQU.03/venn_diagram.pdf'")
+grid::grid.newpage()
+
+grid::grid.draw(
+  venn_grob
+)
+
+grDevices::dev.off()
+
+message(
+  "Venn diagram saved to:\n",
+  venn_pdf_path
+)
+
+# ----------------------------
+# 14) Identify Genes Shared Across All Four Contrasts
+# ----------------------------
+common_all_four_ids <- Reduce(
+  intersect,
+  venn_sets
+)
+
+cat(
+  "\nNumber of DEGs shared across all four contrasts:",
+  length(common_all_four_ids),
+  "\n"
+)
+
+cat(
+  "Shared GeneID(s):\n"
+)
+
+print(
+  common_all_four_ids
+)
+
+common_all_four_annotation <- gene_annotations %>%
+  dplyr::filter(
+    GeneID %in% common_all_four_ids
+  ) %>%
+  dplyr::mutate(
+    Gene_label = ifelse(
+      is_annotated(Gene_name),
+      Gene_name,
+      GeneID
+    )
+  ) %>%
+  dplyr::relocate(
+    GeneID,
+    Gene_label,
+    Gene_name
+  )
+
+if (length(common_all_four_ids) > 0) {
+  missing_common_annotations <- setdiff(
+    common_all_four_ids,
+    common_all_four_annotation$GeneID
+  )
+  
+  if (length(missing_common_annotations) > 0) {
+    fallback_rows <- data.frame(
+      GeneID = missing_common_annotations,
+      Gene_label = missing_common_annotations,
+      Gene_name = NA_character_,
+      stringsAsFactors = FALSE
+    )
+    
+    common_all_four_annotation <- dplyr::bind_rows(
+      common_all_four_annotation,
+      fallback_rows
+    )
+  }
+}
+
+cat(
+  "\nAnnotation for genes shared across all four contrasts:\n"
+)
+
+print(
+  common_all_four_annotation
+)
+
+write_tab_file(
+  common_all_four_annotation,
+  file.path(
+    output_dir,
+    "DEGs_shared_across_all_four_contrasts_annotation.txt"
+  )
+)
+
+# ----------------------------
+# 15) Extract Statistics for Genes Shared Across All Four Contrasts
+# ----------------------------
+common_all_four_statistics <- dplyr::bind_rows(
+  lapply(
+    venn_contrasts,
+    function(contrast_name) {
+      results_list[[contrast_name]] %>%
+        dplyr::filter(
+          GeneID %in% common_all_four_ids
+        ) %>%
+        dplyr::select(
+          GeneID,
+          Gene_label,
+          Gene_name,
+          logFC,
+          logCPM,
+          F,
+          PValue,
+          FDR
+        ) %>%
+        dplyr::mutate(
+          Contrast = contrast_name,
+          .before = logFC
+        )
+    }
+  )
+)
+
+cat(
+  "\nDifferential-expression statistics for genes shared ",
+  "across all four contrasts:\n"
+)
+
+print(
+  common_all_four_statistics
+)
+
+write_tab_file(
+  common_all_four_statistics,
+  file.path(
+    output_dir,
+    "DEGs_shared_across_all_four_contrasts_statistics.txt"
+  )
+)
+
+# ----------------------------
+# 16) Identify Genes in Every Exact Venn Intersection
+# ----------------------------
+all_venn_gene_ids <- unique(
+  unlist(
+    venn_sets,
+    use.names = FALSE
+  )
+)
+
+venn_membership <- data.frame(
+  GeneID = all_venn_gene_ids,
+  stringsAsFactors = FALSE
+)
+
+for (set_name in names(venn_sets)) {
+  venn_membership[[set_name]] <- (
+    all_venn_gene_ids %in%
+      venn_sets[[set_name]]
+  )
+}
+
+venn_membership <- venn_membership %>%
+  dplyr::left_join(
+    gene_annotations,
+    by = "GeneID"
+  ) %>%
+  dplyr::mutate(
+    Gene_label = ifelse(
+      is_annotated(Gene_name),
+      Gene_name,
+      GeneID
+    ),
+    Number_of_contrasts = rowSums(
+      dplyr::across(
+        dplyr::all_of(names(venn_sets))
+      )
+    ),
+    Intersection = apply(
+      dplyr::select(
+        .,
+        dplyr::all_of(names(venn_sets))
+      ),
+      1,
+      function(x) {
+        included_sets <- names(venn_sets)[
+          as.logical(x)
+        ]
+        
+        paste(
+          included_sets,
+          collapse = ";"
+        )
+      }
+    )
+  ) %>%
+  dplyr::relocate(
+    GeneID,
+    Gene_label,
+    Gene_name,
+    Number_of_contrasts,
+    Intersection
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(Number_of_contrasts),
+    Intersection,
+    Gene_label
+  )
+
+write_tab_file(
+  venn_membership,
+  file.path(
+    output_dir,
+    "All_Venn_genes_and_intersection_membership.txt"
+  )
+)
+
+# ----------------------------
+# 17) Save Session Information
+# ----------------------------
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    output_dir,
+    "R_sessionInfo.txt"
+  )
+)
+
+# ----------------------------
+# 18) Final Message
+# ----------------------------
+cat(
+  "\n============================================================\n"
+)
+
+cat(
+  "ANALYSIS COMPLETE\n"
+)
+
+cat(
+  "============================================================\n"
+)
+
+cat(
+  "Output folder:\n",
+  output_dir,
+  "\n\n"
+)
+
+cat(
+  "Venn diagram:\n",
+  venn_pdf_path,
+  "\n\n"
+)
+
+cat(
+  "Genes shared across all four contrasts:\n"
+)
+
+if (nrow(common_all_four_annotation) > 0) {
+  print(
+    common_all_four_annotation[
+      ,
+      intersect(
+        c(
+          "GeneID",
+          "Gene_label",
+          "Gene_name",
+          "Target_gene"
+        ),
+        colnames(common_all_four_annotation)
+      ),
+      drop = FALSE
+    ]
+  )
+} else {
+  cat(
+    "No gene was significant in all four contrasts.\n"
+  )
+}
