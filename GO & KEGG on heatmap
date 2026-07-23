@@ -1,0 +1,1578 @@
+#!/usr/bin/env Rscript
+
+###############################################################################
+# GO_KEGG_heatmap_clusters_strict.R
+#
+# PURPOSE
+#   Run GO Biological Process and KEGG enrichment separately for row cluster 1
+#   and row cluster 2 from the heatmap.
+#
+# STRICT FOREGROUND RULE
+#   Cluster 1 enrichment = only usable mouse-mapped genes originating from
+#                          heatmap row cluster 1.
+#   Cluster 2 enrichment = only usable mouse-mapped genes originating from
+#                          heatmap row cluster 2.
+#
+# A heatmap gene is usable for enrichment only when:
+#   1. it has a non-empty mouse ortholog identifier;
+#   2. that identifier maps to a mouse Entrez ID in org.Mm.eg.db; and
+#   3. that Entrez ID is present in the mapped tested-gene universe.
+#
+# The script stops if:
+#   - the cluster-assignment file does not exactly match the heatmap rows;
+#   - clusters 1 and 2 do not together contain all heatmap genes;
+#   - one Equ03 gene is assigned to more than one row cluster;
+#   - an enrichment source gene does not belong to its stated heatmap cluster;
+#   - a mapped foreground gene is unexpectedly absent from the universe.
+###############################################################################
+
+# =============================================================================
+# 0. USER SETTINGS
+# =============================================================================
+
+base_dir <- "/Users/adrian/Desktop/EQU.03"
+
+cluster_assignment_path <- file.path(
+  base_dir,
+  "FDR_lt_1e-2_row_cluster_assignments.txt"
+)
+
+heatmap_zscore_path <- file.path(
+  base_dir,
+  "FDR_lt_1e-2_zscore_logCPM_matrix.txt"
+)
+
+full_de_results_path <- file.path(
+  base_dir,
+  "FDR_lt_1e-2_warm_vs_cold_full_results.txt"
+)
+
+gene_annotations_path <- file.path(
+  base_dir,
+  "20251016_Equ03_CDS_Mmu_genes.txt"
+)
+
+output_root <- file.path(
+  base_dir,
+  "GO_KEGG_FROM_EXACT_HEATMAP_CLUSTERS"
+)
+
+# The heatmap was cut into exactly two row clusters.
+clusters_to_analyse <- c(1L, 2L)
+
+# OPTIONAL MANUAL IDENTIFIER SELECTION
+#
+# Leave both values NULL to let the script choose the recognised annotation
+# column that maps the largest number of heatmap genes to mouse Entrez IDs.
+#
+# Examples:
+#   manual_mouse_ortholog_col <- "Target_gene"
+#   manual_mouse_key_type     <- "ENSEMBL"
+#
+# or:
+#   manual_mouse_ortholog_col <- "ENTREZID"
+#   manual_mouse_key_type     <- "ENTREZID"
+#
+# or, when Mmu_gene_name contains mouse gene symbols:
+#   manual_mouse_ortholog_col <- "Mmu_gene_name"
+#   manual_mouse_key_type     <- "SYMBOL"
+
+manual_mouse_ortholog_col <- NULL
+manual_mouse_key_type <- NULL
+
+# Enrichment settings
+pvalue_cutoff <- 0.05
+qvalue_cutoff <- 0.10
+top_terms_to_plot <- 20L
+
+# =============================================================================
+# 1. INSTALL AND LOAD PACKAGES
+# =============================================================================
+
+install_cran_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+install_bioc_if_missing <- function(pkg) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  }
+  
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+install_bioc_if_missing("clusterProfiler")
+install_bioc_if_missing("org.Mm.eg.db")
+install_bioc_if_missing("AnnotationDbi")
+
+install_cran_if_missing("dplyr")
+install_cran_if_missing("tidyr")
+install_cran_if_missing("ggplot2")
+install_cran_if_missing("ggsci")
+
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggsci)
+})
+
+if (!dir.exists(output_root)) {
+  dir.create(output_root, recursive = TRUE)
+}
+
+# =============================================================================
+# 2. HELPERS
+# =============================================================================
+
+is_valid_identifier <- function(x) {
+  x <- trimws(as.character(x))
+  
+  !is.na(x) &
+    x != "" &
+    !(x %in% c(
+      "-", ".", "NA", "na", "N/A", "n/a",
+      "None", "none", "NULL", "null",
+      "No", "no", "FALSE", "False", "false"
+    ))
+}
+
+find_column_case_insensitive <- function(df, requested_name) {
+  hit <- which(tolower(colnames(df)) == tolower(requested_name))
+  
+  if (length(hit) == 0) {
+    return(NA_character_)
+  }
+  
+  colnames(df)[hit[1]]
+}
+
+expand_identifier_column <- function(
+    df,
+    identifier_col,
+    keep_cluster = FALSE) {
+  
+  required_cols <- "GeneID"
+  
+  if (keep_cluster) {
+    required_cols <- c(required_cols, "RowCluster")
+  }
+  
+  missing_cols <- setdiff(required_cols, colnames(df))
+  
+  if (length(missing_cols) > 0) {
+    stop(
+      "Missing required columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+  
+  if (!identifier_col %in% colnames(df)) {
+    stop("Identifier column not found: ", identifier_col)
+  }
+  
+  if (keep_cluster) {
+    out <- df %>%
+      dplyr::transmute(
+        GeneID = as.character(GeneID),
+        RowCluster = as.integer(RowCluster),
+        MouseInput = as.character(.data[[identifier_col]])
+      )
+  } else {
+    out <- df %>%
+      dplyr::transmute(
+        GeneID = as.character(GeneID),
+        MouseInput = as.character(.data[[identifier_col]])
+      )
+  }
+  
+  out %>%
+    dplyr::filter(is_valid_identifier(MouseInput)) %>%
+    tidyr::separate_rows(
+      MouseInput,
+      sep = "\\s*[,;|]+\\s*"
+    ) %>%
+    dplyr::mutate(
+      MouseInput = trimws(MouseInput)
+    ) %>%
+    dplyr::filter(is_valid_identifier(MouseInput)) %>%
+    dplyr::distinct()
+}
+
+map_mouse_identifiers <- function(ids, from_type) {
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[is_valid_identifier(ids)]
+  
+  empty_result <- data.frame(
+    MouseInput = character(),
+    ENTREZID = character(),
+    MouseSymbol = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  if (length(ids) == 0) {
+    return(empty_result)
+  }
+  
+  supported_keytypes <- AnnotationDbi::keytypes(org.Mm.eg.db)
+  
+  if (!from_type %in% supported_keytypes) {
+    stop(
+      "Key type '", from_type,
+      "' is not supported by org.Mm.eg.db.\nSupported key types include:\n",
+      paste(supported_keytypes, collapse = ", ")
+    )
+  }
+  
+  mapped <- tryCatch(
+    {
+      suppressMessages(
+        AnnotationDbi::select(
+          org.Mm.eg.db,
+          keys = ids,
+          keytype = from_type,
+          columns = unique(c("ENTREZID", "SYMBOL"))
+        )
+      )
+    },
+    error = function(e) {
+      warning(
+        "Mapping failed for key type ", from_type,
+        ": ", conditionMessage(e)
+      )
+      
+      return(NULL)
+    }
+  )
+  
+  if (is.null(mapped) || nrow(mapped) == 0) {
+    return(empty_result)
+  }
+  
+  input_values <- as.character(mapped[[from_type]])
+  
+  out <- data.frame(
+    MouseInput = input_values,
+    ENTREZID = as.character(mapped$ENTREZID),
+    MouseSymbol = as.character(mapped$SYMBOL),
+    stringsAsFactors = FALSE
+  )
+  
+  out %>%
+    dplyr::filter(
+      is_valid_identifier(MouseInput),
+      is_valid_identifier(ENTREZID)
+    ) %>%
+    dplyr::distinct()
+}
+
+add_rich_factor <- function(df) {
+  if (nrow(df) == 0) {
+    return(df)
+  }
+  
+  df %>%
+    dplyr::mutate(
+      BackgroundTermGenes = as.numeric(
+        sub("/.*", "", BgRatio)
+      ),
+      RichFactor = Count / BackgroundTermGenes
+    )
+}
+
+add_rich_group <- function(df) {
+  if (nrow(df) == 0) {
+    return(df)
+  }
+  
+  rich_breaks <- stats::quantile(
+    df$RichFactor,
+    probs = c(0, 1 / 3, 2 / 3, 1),
+    na.rm = TRUE
+  )
+  
+  if (length(unique(rich_breaks)) == 4) {
+    return(
+      df %>%
+        dplyr::mutate(
+          RichGroup = cut(
+            RichFactor,
+            breaks = rich_breaks,
+            include.lowest = TRUE,
+            labels = c("Low", "Medium", "High")
+          )
+        )
+    )
+  }
+  
+  distinct_values <- sort(unique(df$RichFactor))
+  
+  if (length(distinct_values) == 1) {
+    df$RichGroup <- factor(
+      rep("Low", nrow(df)),
+      levels = c("Low", "Medium", "High")
+    )
+  } else if (length(distinct_values) == 2) {
+    df$RichGroup <- factor(
+      ifelse(
+        df$RichFactor == min(distinct_values),
+        "Low",
+        "High"
+      ),
+      levels = c("Low", "Medium", "High")
+    )
+  } else {
+    df$RichGroup <- factor(
+      c("Low", "Medium", "High")[
+        dplyr::ntile(
+          rank(df$RichFactor, ties.method = "first"),
+          3
+        )
+      ],
+      levels = c("Low", "Medium", "High")
+    )
+  }
+  
+  df
+}
+
+# =============================================================================
+# 3. READ THE HEATMAP OUTPUT FILES
+# =============================================================================
+
+cluster_df <- read.table(
+  cluster_assignment_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = ""
+)
+
+if (!all(c("GeneID", "RowCluster") %in% colnames(cluster_df))) {
+  stop(
+    "The cluster-assignment file must contain GeneID and RowCluster."
+  )
+}
+
+cluster_df <- cluster_df %>%
+  dplyr::transmute(
+    GeneID = as.character(GeneID),
+    RowCluster = as.integer(RowCluster)
+  ) %>%
+  dplyr::distinct()
+
+heatmap_zscore <- read.table(
+  heatmap_zscore_path,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = ""
+)
+
+heatmap_gene_ids <- unique(as.character(rownames(heatmap_zscore)))
+cluster_assignment_gene_ids <- unique(as.character(cluster_df$GeneID))
+
+# =============================================================================
+# 4. STRICTLY VERIFY THAT THE CLUSTER FILE IS FROM THIS HEATMAP
+# =============================================================================
+
+heatmap_missing_from_clusters <- setdiff(
+  heatmap_gene_ids,
+  cluster_assignment_gene_ids
+)
+
+cluster_genes_missing_from_heatmap <- setdiff(
+  cluster_assignment_gene_ids,
+  heatmap_gene_ids
+)
+
+write.csv(
+  data.frame(
+    GeneID = heatmap_missing_from_clusters,
+    stringsAsFactors = FALSE
+  ),
+  file = file.path(
+    output_root,
+    "AUDIT_heatmap_genes_missing_from_cluster_file.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(
+    GeneID = cluster_genes_missing_from_heatmap,
+    stringsAsFactors = FALSE
+  ),
+  file = file.path(
+    output_root,
+    "AUDIT_cluster_genes_missing_from_heatmap.csv"
+  ),
+  row.names = FALSE
+)
+
+if (!setequal(heatmap_gene_ids, cluster_assignment_gene_ids)) {
+  stop(
+    "The cluster-assignment file and heatmap z-score matrix do not contain ",
+    "exactly the same genes. They may come from different heatmap runs.\n",
+    "Inspect the two AUDIT CSV files in: ", output_root
+  )
+}
+
+available_clusters <- sort(unique(cluster_df$RowCluster))
+
+if (!setequal(available_clusters, clusters_to_analyse)) {
+  stop(
+    "Expected exactly row clusters 1 and 2.\n",
+    "Clusters found: ", paste(available_clusters, collapse = ", ")
+  )
+}
+
+multi_cluster_genes <- cluster_df %>%
+  dplyr::distinct(GeneID, RowCluster) %>%
+  dplyr::count(GeneID, name = "NClusters") %>%
+  dplyr::filter(NClusters > 1)
+
+if (nrow(multi_cluster_genes) > 0) {
+  write.csv(
+    multi_cluster_genes,
+    file = file.path(
+      output_root,
+      "AUDIT_genes_assigned_to_multiple_clusters.csv"
+    ),
+    row.names = FALSE
+  )
+  
+  stop(
+    "At least one heatmap gene is assigned to more than one row cluster."
+  )
+}
+
+cluster_union <- cluster_df %>%
+  dplyr::filter(RowCluster %in% clusters_to_analyse) %>%
+  dplyr::pull(GeneID) %>%
+  unique()
+
+if (!setequal(cluster_union, heatmap_gene_ids)) {
+  stop(
+    "Clusters 1 and 2 do not together contain every heatmap gene."
+  )
+}
+
+cat("\nHEATMAP INPUT CHECK\n")
+cat("Heatmap rows:", length(heatmap_gene_ids), "\n")
+cat("Cluster-assignment genes:", length(cluster_assignment_gene_ids), "\n")
+cat("Clusters found:", paste(available_clusters, collapse = ", "), "\n")
+cat("PASS: clusters 1 and 2 exactly partition the heatmap rows.\n")
+
+# =============================================================================
+# 5. READ ANNOTATIONS AND FULL TESTED-GENE RESULTS
+# =============================================================================
+
+gene_annotations <- read.table(
+  gene_annotations_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = ""
+)
+
+colnames(gene_annotations)[1] <- "GeneID"
+
+gene_annotations <- gene_annotations %>%
+  dplyr::mutate(GeneID = as.character(GeneID)) %>%
+  dplyr::distinct(GeneID, .keep_all = TRUE)
+
+# The heatmap script uses Gene_name for row labels. Preserve exactly that
+# annotation here. When Gene_name is unavailable, print the original GeneID.
+if (!"Gene_name" %in% colnames(gene_annotations)) {
+  gene_annotations$Gene_name <- NA_character_
+}
+
+gene_name_lookup <- gene_annotations %>%
+  dplyr::transmute(
+    GeneID = as.character(GeneID),
+    GeneName = dplyr::if_else(
+      is_valid_identifier(Gene_name),
+      trimws(as.character(Gene_name)),
+      as.character(GeneID)
+    )
+  ) %>%
+  dplyr::distinct(GeneID, .keep_all = TRUE)
+
+full_de_df <- read.table(
+  full_de_results_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = ""
+)
+
+if (!"GeneID" %in% colnames(full_de_df)) {
+  stop("The full DE-results file does not contain GeneID.")
+}
+
+full_de_df <- full_de_df %>%
+  dplyr::mutate(GeneID = as.character(GeneID)) %>%
+  dplyr::distinct(GeneID, .keep_all = TRUE)
+
+# Every heatmap gene must be present in the full tested-gene table.
+heatmap_missing_from_full_results <- setdiff(
+  heatmap_gene_ids,
+  full_de_df$GeneID
+)
+
+if (length(heatmap_missing_from_full_results) > 0) {
+  write.csv(
+    data.frame(
+      GeneID = heatmap_missing_from_full_results,
+      stringsAsFactors = FALSE
+    ),
+    file = file.path(
+      output_root,
+      "AUDIT_heatmap_genes_missing_from_full_DE_results.csv"
+    ),
+    row.names = FALSE
+  )
+  
+  stop(
+    "Some heatmap genes are absent from the full DE-results file."
+  )
+}
+
+# =============================================================================
+# 6. SELECT ONE MOUSE IDENTIFIER COLUMN AND USE IT EVERYWHERE
+# =============================================================================
+
+candidate_specs <- data.frame(
+  RequestedColumn = c(
+    "ENTREZID",
+    "Target_gene",
+    "Mmu_gene_name",
+    "Mmu_Gene_name",
+    "Mmu_symbol",
+    "Mmu_Symbol",
+    "Mouse_gene_name",
+    "Mouse_Gene_name",
+    "Mouse_symbol",
+    "Mouse_Symbol",
+    "SYMBOL"
+  ),
+  KeyType = c(
+    "ENTREZID",
+    "ENSEMBL",
+    "SYMBOL",
+    "SYMBOL",
+    "SYMBOL",
+    "SYMBOL",
+    "SYMBOL",
+    "SYMBOL",
+    "SYMBOL",
+    "SYMBOL",
+    "SYMBOL"
+  ),
+  Priority = seq_len(11),
+  stringsAsFactors = FALSE
+)
+
+candidate_specs$ActualColumn <- vapply(
+  candidate_specs$RequestedColumn,
+  function(x) find_column_case_insensitive(gene_annotations, x),
+  character(1)
+)
+
+# Remove duplicate references to the same real column.
+candidate_specs <- candidate_specs %>%
+  dplyr::filter(!is.na(ActualColumn)) %>%
+  dplyr::distinct(ActualColumn, .keep_all = TRUE)
+
+heatmap_annotation_base <- cluster_df %>%
+  dplyr::left_join(
+    gene_annotations,
+    by = "GeneID"
+  )
+
+if (!is.null(manual_mouse_ortholog_col)) {
+  selected_mouse_col <- find_column_case_insensitive(
+    gene_annotations,
+    manual_mouse_ortholog_col
+  )
+  
+  if (is.na(selected_mouse_col)) {
+    stop(
+      "Manual mouse ortholog column not found: ",
+      manual_mouse_ortholog_col,
+      "\nAvailable annotation columns:\n",
+      paste(colnames(gene_annotations), collapse = ", ")
+    )
+  }
+  
+  if (is.null(manual_mouse_key_type)) {
+    recognised_row <- candidate_specs %>%
+      dplyr::filter(
+        tolower(ActualColumn) == tolower(selected_mouse_col)
+      )
+    
+    if (nrow(recognised_row) == 0) {
+      stop(
+        "A manual ortholog column was supplied, but its key type was not.\n",
+        "Also set manual_mouse_key_type, for example SYMBOL, ENSEMBL, ",
+        "or ENTREZID."
+      )
+    }
+    
+    selected_key_type <- recognised_row$KeyType[1]
+  } else {
+    selected_key_type <- manual_mouse_key_type
+  }
+  
+  candidate_selection_table <- data.frame(
+    ActualColumn = selected_mouse_col,
+    KeyType = selected_key_type,
+    HeatmapGenesWithValidInput = NA_integer_,
+    HeatmapGenesMappedToEntrez = NA_integer_,
+    UniqueMouseEntrez = NA_integer_,
+    stringsAsFactors = FALSE
+  )
+  
+} else {
+  if (nrow(candidate_specs) == 0) {
+    stop(
+      "No recognised mouse ortholog identifier columns were found.\n",
+      "Set manual_mouse_ortholog_col and manual_mouse_key_type near the ",
+      "top of the script.\nAvailable annotation columns:\n",
+      paste(colnames(gene_annotations), collapse = ", ")
+    )
+  }
+  
+  candidate_evaluations <- lapply(
+    seq_len(nrow(candidate_specs)),
+    function(i) {
+      col_here <- candidate_specs$ActualColumn[i]
+      key_here <- candidate_specs$KeyType[i]
+      
+      long_here <- expand_identifier_column(
+        heatmap_annotation_base,
+        identifier_col = col_here,
+        keep_cluster = TRUE
+      )
+      
+      map_here <- map_mouse_identifiers(
+        long_here$MouseInput,
+        from_type = key_here
+      )
+      
+      mapped_genes_here <- long_here %>%
+        dplyr::inner_join(
+          map_here,
+          by = "MouseInput"
+        )
+      
+      data.frame(
+        ActualColumn = col_here,
+        KeyType = key_here,
+        Priority = candidate_specs$Priority[i],
+        HeatmapGenesWithValidInput = dplyr::n_distinct(long_here$GeneID),
+        HeatmapGenesMappedToEntrez = dplyr::n_distinct(mapped_genes_here$GeneID),
+        UniqueMouseEntrez = dplyr::n_distinct(mapped_genes_here$ENTREZID),
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+  
+  candidate_selection_table <- dplyr::bind_rows(candidate_evaluations) %>%
+    dplyr::arrange(
+      dplyr::desc(HeatmapGenesMappedToEntrez),
+      dplyr::desc(UniqueMouseEntrez),
+      Priority
+    )
+  
+  if (
+    nrow(candidate_selection_table) == 0 ||
+    max(candidate_selection_table$HeatmapGenesMappedToEntrez) == 0
+  ) {
+    stop(
+      "None of the recognised annotation columns mapped any heatmap genes ",
+      "to mouse Entrez IDs."
+    )
+  }
+  
+  selected_mouse_col <- candidate_selection_table$ActualColumn[1]
+  selected_key_type <- candidate_selection_table$KeyType[1]
+}
+
+write.csv(
+  candidate_selection_table,
+  file = file.path(
+    output_root,
+    "mouse_identifier_column_selection.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("\nMOUSE IDENTIFIER SELECTION\n")
+cat("Selected annotation column:", selected_mouse_col, "\n")
+cat("Selected org.Mm.eg.db key type:", selected_key_type, "\n")
+
+# =============================================================================
+# 7. BUILD THE TESTED-GENE BACKGROUND UNIVERSE
+# =============================================================================
+
+universe_source <- full_de_df %>%
+  dplyr::select(GeneID) %>%
+  dplyr::left_join(
+    gene_annotations %>%
+      dplyr::select(
+        GeneID,
+        dplyr::all_of(selected_mouse_col)
+      ),
+    by = "GeneID"
+  )
+
+universe_long <- expand_identifier_column(
+  universe_source,
+  identifier_col = selected_mouse_col,
+  keep_cluster = FALSE
+)
+
+universe_id_map <- map_mouse_identifiers(
+  universe_long$MouseInput,
+  from_type = selected_key_type
+)
+
+universe_gene_map <- universe_long %>%
+  dplyr::inner_join(
+    universe_id_map,
+    by = "MouseInput"
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    MouseInput,
+    ENTREZID,
+    MouseSymbol
+  )
+
+universe_entrez <- sort(unique(universe_gene_map$ENTREZID))
+
+if (length(universe_entrez) == 0) {
+  stop("No tested genes mapped to mouse Entrez IDs.")
+}
+
+write.csv(
+  universe_gene_map,
+  file = file.path(
+    output_root,
+    "tested_gene_mouse_ortholog_universe.csv"
+  ),
+  row.names = FALSE
+)
+
+cat(
+  "Mapped tested-gene universe:",
+  length(universe_entrez),
+  "unique mouse Entrez IDs\n"
+)
+
+# =============================================================================
+# 8. MAP ONLY THE GENES THAT ARE ACTUAL HEATMAP ROWS
+# =============================================================================
+
+heatmap_cluster_source <- cluster_df %>%
+  dplyr::left_join(
+    gene_annotations %>%
+      dplyr::select(
+        GeneID,
+        dplyr::all_of(selected_mouse_col)
+      ),
+    by = "GeneID"
+  )
+
+heatmap_cluster_long <- expand_identifier_column(
+  heatmap_cluster_source,
+  identifier_col = selected_mouse_col,
+  keep_cluster = TRUE
+)
+
+heatmap_id_map <- map_mouse_identifiers(
+  heatmap_cluster_long$MouseInput,
+  from_type = selected_key_type
+)
+
+cluster_gene_map_before_universe <- heatmap_cluster_long %>%
+  dplyr::inner_join(
+    heatmap_id_map,
+    by = "MouseInput"
+  ) %>%
+  dplyr::left_join(
+    gene_name_lookup,
+    by = "GeneID"
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    GeneName,
+    RowCluster,
+    MouseInput,
+    ENTREZID,
+    MouseSymbol
+  )
+
+cluster_gene_map <- cluster_gene_map_before_universe %>%
+  dplyr::filter(ENTREZID %in% universe_entrez) %>%
+  dplyr::distinct()
+
+# =============================================================================
+# 9. STRICT FOREGROUND AUDIT
+# =============================================================================
+
+heatmap_cluster_membership <- cluster_df %>%
+  dplyr::distinct(GeneID, RowCluster) %>%
+  dplyr::left_join(
+    gene_name_lookup,
+    by = "GeneID"
+  ) %>%
+  dplyr::select(
+    GeneID,
+    GeneName,
+    RowCluster
+  )
+
+enrichment_source_membership <- cluster_gene_map %>%
+  dplyr::distinct(GeneID, RowCluster)
+
+invalid_enrichment_sources <- enrichment_source_membership %>%
+  dplyr::anti_join(
+    heatmap_cluster_membership,
+    by = c("GeneID", "RowCluster")
+  )
+
+write.csv(
+  invalid_enrichment_sources,
+  file = file.path(
+    output_root,
+    "AUDIT_invalid_enrichment_source_genes.csv"
+  ),
+  row.names = FALSE
+)
+
+if (nrow(invalid_enrichment_sources) > 0) {
+  stop(
+    "At least one enrichment source gene does not belong to its stated ",
+    "heatmap row cluster."
+  )
+}
+
+mapped_but_not_in_universe <- cluster_gene_map_before_universe %>%
+  dplyr::filter(!ENTREZID %in% universe_entrez)
+
+write.csv(
+  mapped_but_not_in_universe,
+  file = file.path(
+    output_root,
+    "AUDIT_mapped_heatmap_genes_absent_from_universe.csv"
+  ),
+  row.names = FALSE
+)
+
+if (nrow(mapped_but_not_in_universe) > 0) {
+  stop(
+    "Some mapped heatmap genes are absent from the tested-gene universe. ",
+    "This suggests inconsistent input files or mappings."
+  )
+}
+
+valid_input_status <- heatmap_cluster_long %>%
+  dplyr::distinct(GeneID, RowCluster) %>%
+  dplyr::mutate(HasValidMouseInput = TRUE)
+
+mapped_status <- cluster_gene_map_before_universe %>%
+  dplyr::distinct(GeneID, RowCluster) %>%
+  dplyr::mutate(MappedToMouseEntrez = TRUE)
+
+used_status <- cluster_gene_map %>%
+  dplyr::distinct(GeneID, RowCluster) %>%
+  dplyr::mutate(UsedForEnrichment = TRUE)
+
+heatmap_gene_flow_audit <- heatmap_cluster_membership %>%
+  dplyr::left_join(
+    valid_input_status,
+    by = c("GeneID", "RowCluster")
+  ) %>%
+  dplyr::left_join(
+    mapped_status,
+    by = c("GeneID", "RowCluster")
+  ) %>%
+  dplyr::left_join(
+    used_status,
+    by = c("GeneID", "RowCluster")
+  ) %>%
+  dplyr::mutate(
+    HasValidMouseInput = tidyr::replace_na(
+      HasValidMouseInput,
+      FALSE
+    ),
+    MappedToMouseEntrez = tidyr::replace_na(
+      MappedToMouseEntrez,
+      FALSE
+    ),
+    UsedForEnrichment = tidyr::replace_na(
+      UsedForEnrichment,
+      FALSE
+    ),
+    Status = dplyr::case_when(
+      UsedForEnrichment ~
+        "Used for GO/KEGG",
+      
+      !HasValidMouseInput ~
+        "Excluded: no valid mouse ortholog identifier",
+      
+      HasValidMouseInput & !MappedToMouseEntrez ~
+        "Excluded: mouse identifier did not map to Entrez",
+      
+      MappedToMouseEntrez & !UsedForEnrichment ~
+        "ERROR: mapped mouse gene absent from universe",
+      
+      TRUE ~
+        "Unknown"
+    )
+  ) %>%
+  dplyr::arrange(RowCluster, Status, GeneID)
+
+write.csv(
+  heatmap_gene_flow_audit,
+  file = file.path(
+    output_root,
+    "AUDIT_every_heatmap_gene_to_enrichment.csv"
+  ),
+  row.names = FALSE
+)
+
+cluster_gene_flow_summary <- heatmap_gene_flow_audit %>%
+  dplyr::count(
+    RowCluster,
+    Status,
+    name = "N_Equ03_genes"
+  ) %>%
+  dplyr::arrange(RowCluster, Status)
+
+write.csv(
+  cluster_gene_flow_summary,
+  file = file.path(
+    output_root,
+    "AUDIT_cluster_gene_flow_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+cluster_counts <- heatmap_cluster_membership %>%
+  dplyr::group_by(RowCluster) %>%
+  dplyr::summarise(
+    HeatmapGenes = dplyr::n_distinct(GeneID),
+    .groups = "drop"
+  ) %>%
+  dplyr::left_join(
+    cluster_gene_map %>%
+      dplyr::group_by(RowCluster) %>%
+      dplyr::summarise(
+        UsableEqu03Genes = dplyr::n_distinct(GeneID),
+        UniqueMouseEntrezIDs = dplyr::n_distinct(ENTREZID),
+        .groups = "drop"
+      ),
+    by = "RowCluster"
+  ) %>%
+  dplyr::mutate(
+    UsableEqu03Genes = tidyr::replace_na(UsableEqu03Genes, 0L),
+    UniqueMouseEntrezIDs = tidyr::replace_na(UniqueMouseEntrezIDs, 0L),
+    ExcludedHeatmapGenes = HeatmapGenes - UsableEqu03Genes
+  )
+
+write.csv(
+  cluster_counts,
+  file = file.path(
+    output_root,
+    "AUDIT_cluster_input_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  cluster_gene_map,
+  file = file.path(
+    output_root,
+    "ALL_clusters_exact_usable_heatmap_genes.csv"
+  ),
+  row.names = FALSE
+)
+
+# Report mouse Entrez IDs that occur in both clusters because different Equ03
+# rows can map to the same mouse ortholog. This is not automatically an error.
+cluster_1_entrez <- cluster_gene_map %>%
+  dplyr::filter(RowCluster == 1L) %>%
+  dplyr::pull(ENTREZID) %>%
+  unique()
+
+cluster_2_entrez <- cluster_gene_map %>%
+  dplyr::filter(RowCluster == 2L) %>%
+  dplyr::pull(ENTREZID) %>%
+  unique()
+
+shared_mouse_entrez <- intersect(cluster_1_entrez, cluster_2_entrez)
+
+shared_mouse_entrez_details <- cluster_gene_map %>%
+  dplyr::filter(ENTREZID %in% shared_mouse_entrez) %>%
+  dplyr::arrange(ENTREZID, RowCluster, GeneID)
+
+write.csv(
+  shared_mouse_entrez_details,
+  file = file.path(
+    output_root,
+    "AUDIT_mouse_Entrez_IDs_represented_in_both_clusters.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("\nSTRICT FOREGROUND CHECK\n")
+print(cluster_counts, row.names = FALSE)
+cat(
+  "PASS: every enrichment source gene comes from its corresponding ",
+  "heatmap row cluster.\n",
+  sep = ""
+)
+cat(
+  "Mouse Entrez IDs represented in both clusters:",
+  length(shared_mouse_entrez),
+  "\n"
+)
+
+# =============================================================================
+# 10. PLOT SETTINGS
+# =============================================================================
+
+three_cols <- ggsci::pal_npg("nrc")(3)
+
+clean_theme <- ggplot2::theme_classic() +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      size = 14,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.title.x = ggplot2::element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.title.y = ggplot2::element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.text.x = ggplot2::element_text(size = 10),
+    axis.text.y = ggplot2::element_text(size = 10),
+    legend.title = ggplot2::element_text(
+      size = 10,
+      face = "bold"
+    ),
+    legend.text = ggplot2::element_text(size = 9)
+  )
+
+# =============================================================================
+# 11. RUN GO AND KEGG SEPARATELY FOR EACH HEATMAP CLUSTER
+# =============================================================================
+
+run_cluster_enrichment <- function(
+    cluster_number,
+    cluster_gene_map,
+    heatmap_gene_flow_audit,
+    universe_entrez,
+    output_root,
+    pvalue_cutoff,
+    qvalue_cutoff,
+    top_terms_to_plot) {
+  
+  cluster_dir <- file.path(
+    output_root,
+    paste0("cluster_", cluster_number)
+  )
+  
+  if (!dir.exists(cluster_dir)) {
+    dir.create(cluster_dir, recursive = TRUE)
+  }
+  
+  # Save every original heatmap row in this cluster, including excluded rows.
+  all_heatmap_rows_here <- heatmap_gene_flow_audit %>%
+    dplyr::filter(RowCluster == cluster_number) %>%
+    dplyr::arrange(GeneName, GeneID)
+  
+  all_heatmap_gene_names_here <- all_heatmap_rows_here %>%
+    dplyr::select(
+      GeneID,
+      GeneName,
+      Status
+    ) %>%
+    dplyr::distinct()
+  
+  write.csv(
+    all_heatmap_rows_here,
+    file = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_ALL_heatmap_rows_with_mapping_status.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    all_heatmap_gene_names_here,
+    file = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_ALL_heatmap_gene_names.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  writeLines(
+    unique(all_heatmap_gene_names_here$GeneName),
+    con = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_ALL_heatmap_gene_names_one_per_line.txt"
+      )
+    )
+  )
+  
+  # This is the exact cluster-specific enrichment foreground.
+  usable_rows_here <- cluster_gene_map %>%
+    dplyr::filter(RowCluster == cluster_number) %>%
+    dplyr::distinct(
+      GeneID,
+      GeneName,
+      RowCluster,
+      MouseInput,
+      MouseSymbol,
+      ENTREZID
+    ) %>%
+    dplyr::arrange(MouseSymbol, ENTREZID, GeneName, GeneID)
+  
+  write.csv(
+    usable_rows_here,
+    file = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_EXACT_usable_heatmap_genes_for_GO_KEGG.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  genes_here <- sort(unique(usable_rows_here$ENTREZID))
+  
+  exact_foreground_entrez_table <- data.frame(
+    ENTREZID = genes_here,
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(
+    exact_foreground_entrez_table,
+    file = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_EXACT_GO_KEGG_foreground_EntrezIDs.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  writeLines(
+    genes_here,
+    con = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_EXACT_GO_KEGG_foreground_EntrezIDs_one_per_line.txt"
+      )
+    )
+  )
+  
+  exact_mouse_gene_input <- usable_rows_here %>%
+    dplyr::select(
+      MouseSymbol,
+      ENTREZID,
+      GeneID,
+      GeneName,
+      MouseInput
+    ) %>%
+    dplyr::distinct()
+  
+  write.csv(
+    exact_mouse_gene_input,
+    file = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_EXACT_GO_KEGG_input_with_gene_names.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  cat("\n============================================================\n")
+  cat("HEATMAP ROW CLUSTER", cluster_number, "\n")
+  cat(
+    "All heatmap Equ03 genes:",
+    dplyr::n_distinct(all_heatmap_rows_here$GeneID),
+    "\n"
+  )
+  cat(
+    "Usable heatmap Equ03 genes:",
+    dplyr::n_distinct(usable_rows_here$GeneID),
+    "\n"
+  )
+  cat(
+    "Unique mouse Entrez IDs submitted to GO and KEGG:",
+    length(genes_here),
+    "\n"
+  )
+  
+  cat(
+    "\nALL GENE NAMES IN HEATMAP CLUSTER ",
+    cluster_number,
+    " (including genes excluded from enrichment):\n",
+    sep = ""
+  )
+  print(
+    as.data.frame(all_heatmap_gene_names_here),
+    row.names = FALSE
+  )
+  
+  cat(
+    "\nEXACT USABLE HEATMAP GENES MAPPED FOR GO/KEGG, CLUSTER ",
+    cluster_number,
+    ":\n",
+    sep = ""
+  )
+  print(
+    as.data.frame(exact_mouse_gene_input),
+    row.names = FALSE
+  )
+  
+  cat(
+    "\nEXACT ENTREZ-ID VECTOR SUBMITTED AS gene= TO BOTH enrichGO() ",
+    "AND enrichKEGG(), CLUSTER ",
+    cluster_number,
+    ":\n",
+    sep = ""
+  )
+  print(
+    exact_foreground_entrez_table,
+    row.names = FALSE
+  )
+  
+  if (length(genes_here) == 0) {
+    warning(
+      "Cluster ", cluster_number,
+      " has no usable mapped mouse genes. Enrichment skipped."
+    )
+    
+    return(NULL)
+  }
+  
+  if (!all(genes_here %in% universe_entrez)) {
+    stop(
+      "Cluster ", cluster_number,
+      " contains foreground Entrez IDs outside the universe."
+    )
+  }
+  
+  # GO Biological Process
+  ego <- clusterProfiler::enrichGO(
+    gene = genes_here,
+    universe = universe_entrez,
+    OrgDb = org.Mm.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = pvalue_cutoff,
+    qvalueCutoff = qvalue_cutoff,
+    readable = TRUE
+  )
+  
+  ego_df <- add_rich_factor(as.data.frame(ego))
+  
+  # KEGG mouse pathways
+  ekegg <- clusterProfiler::enrichKEGG(
+    gene = genes_here,
+    universe = universe_entrez,
+    organism = "mmu",
+    keyType = "ncbi-geneid",
+    pvalueCutoff = pvalue_cutoff,
+    pAdjustMethod = "BH",
+    qvalueCutoff = qvalue_cutoff
+  )
+  
+  if (nrow(as.data.frame(ekegg)) > 0) {
+    ekegg <- clusterProfiler::setReadable(
+      ekegg,
+      OrgDb = org.Mm.eg.db,
+      keyType = "ENTREZID"
+    )
+  }
+  
+  ekegg_df <- add_rich_factor(as.data.frame(ekegg))
+  
+  write.csv(
+    ego_df,
+    file = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_GO_BP_enrichment.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    ekegg_df,
+    file = file.path(
+      cluster_dir,
+      paste0(
+        "cluster_", cluster_number,
+        "_KEGG_mouse_enrichment.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  # GO RichFactor dotplot
+  if (nrow(ego_df) > 0) {
+    top_go <- ego_df %>%
+      dplyr::arrange(dplyr::desc(RichFactor)) %>%
+      utils::head(top_terms_to_plot) %>%
+      add_rich_group()
+    
+    go_plot <- ggplot2::ggplot(
+      top_go,
+      ggplot2::aes(
+        x = RichFactor,
+        y = reorder(Description, RichFactor),
+        color = RichGroup,
+        size = Count
+      )
+    ) +
+      ggplot2::geom_point(alpha = 0.9) +
+      ggplot2::scale_color_manual(values = three_cols) +
+      ggplot2::labs(
+        title = paste0(
+          "Heatmap cluster ", cluster_number,
+          ": GO Biological Process"
+        ),
+        x = "Rich Factor",
+        y = "GO term",
+        color = "Rich Factor",
+        size = "Gene Count"
+      ) +
+      clean_theme
+    
+    ggplot2::ggsave(
+      filename = file.path(
+        cluster_dir,
+        paste0(
+          "cluster_", cluster_number,
+          "_GO_RichFactor_dotplot.pdf"
+        )
+      ),
+      plot = go_plot,
+      width = 8,
+      height = 6
+    )
+  } else {
+    cat(
+      "Cluster ", cluster_number,
+      ": no significant GO BP terms.\n",
+      sep = ""
+    )
+  }
+  
+  # KEGG RichFactor barplot
+  if (nrow(ekegg_df) > 0) {
+    top_kegg <- ekegg_df %>%
+      dplyr::arrange(dplyr::desc(RichFactor)) %>%
+      utils::head(top_terms_to_plot) %>%
+      add_rich_group()
+    
+    kegg_plot <- ggplot2::ggplot(
+      top_kegg,
+      ggplot2::aes(
+        x = RichFactor,
+        y = reorder(Description, RichFactor),
+        fill = RichGroup
+      )
+    ) +
+      ggplot2::geom_col(width = 0.75) +
+      ggplot2::scale_fill_manual(values = three_cols) +
+      ggplot2::labs(
+        title = paste0(
+          "Heatmap cluster ", cluster_number,
+          ": KEGG pathways"
+        ),
+        x = "Rich Factor",
+        y = "KEGG pathway",
+        fill = "Rich Factor"
+      ) +
+      clean_theme
+    
+    ggplot2::ggsave(
+      filename = file.path(
+        cluster_dir,
+        paste0(
+          "cluster_", cluster_number,
+          "_KEGG_RichFactor_barplot.pdf"
+        )
+      ),
+      plot = kegg_plot,
+      width = 8,
+      height = 6
+    )
+  } else {
+    cat(
+      "Cluster ", cluster_number,
+      ": no significant KEGG pathways.\n",
+      sep = ""
+    )
+  }
+  
+  list(
+    cluster = cluster_number,
+    all_heatmap_gene_names = all_heatmap_gene_names_here,
+    exact_foreground_table = usable_rows_here,
+    exact_mouse_gene_input = exact_mouse_gene_input,
+    foreground_entrez = genes_here,
+    GO = ego,
+    GO_table = ego_df,
+    KEGG = ekegg,
+    KEGG_table = ekegg_df
+  )
+}
+
+enrichment_results <- lapply(
+  clusters_to_analyse,
+  function(cluster_number) {
+    run_cluster_enrichment(
+      cluster_number = cluster_number,
+      cluster_gene_map = cluster_gene_map,
+      heatmap_gene_flow_audit = heatmap_gene_flow_audit,
+      universe_entrez = universe_entrez,
+      output_root = output_root,
+      pvalue_cutoff = pvalue_cutoff,
+      qvalue_cutoff = qvalue_cutoff,
+      top_terms_to_plot = top_terms_to_plot
+    )
+  }
+)
+
+names(enrichment_results) <- paste0(
+  "HeatmapCluster_",
+  clusters_to_analyse
+)
+
+# =============================================================================
+# 12. SAVE OBJECTS AND SESSION INFORMATION
+# =============================================================================
+
+saveRDS(
+  enrichment_results,
+  file = file.path(
+    output_root,
+    "heatmap_clusters_1_2_GO_KEGG_objects.rds"
+  )
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(
+    output_root,
+    "sessionInfo.txt"
+  )
+)
+
+# =============================================================================
+# 13. FINAL REPORT
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("DONE\n")
+cat("============================================================\n")
+cat("Heatmap genes:", length(heatmap_gene_ids), "\n")
+cat("Clusters analysed:", paste(clusters_to_analyse, collapse = ", "), "\n")
+cat("Mouse annotation column:", selected_mouse_col, "\n")
+cat("Mouse identifier key type:", selected_key_type, "\n")
+cat("Universe size:", length(universe_entrez), "mouse Entrez IDs\n")
+cat("\nCluster-specific input counts:\n")
+print(cluster_counts, row.names = FALSE)
+cat("\nOutput directory:\n", output_root, "\n", sep = "")
+cat(
+  "\nMost important audit file:\n",
+  file.path(
+    output_root,
+    "AUDIT_every_heatmap_gene_to_enrichment.csv"
+  ),
+  "\n",
+  sep = ""
+)
+cat(
+  "\nCluster gene-name and exact GO/KEGG input files:\n",
+  file.path(
+    output_root,
+    "cluster_1",
+    "cluster_1_ALL_heatmap_gene_names.csv"
+  ),
+  "\n",
+  file.path(
+    output_root,
+    "cluster_1",
+    "cluster_1_EXACT_GO_KEGG_input_with_gene_names.csv"
+  ),
+  "\n",
+  file.path(
+    output_root,
+    "cluster_1",
+    "cluster_1_EXACT_GO_KEGG_foreground_EntrezIDs.csv"
+  ),
+  "\n",
+  file.path(
+    output_root,
+    "cluster_2",
+    "cluster_2_ALL_heatmap_gene_names.csv"
+  ),
+  "\n",
+  file.path(
+    output_root,
+    "cluster_2",
+    "cluster_2_EXACT_GO_KEGG_input_with_gene_names.csv"
+  ),
+  "\n",
+  file.path(
+    output_root,
+    "cluster_2",
+    "cluster_2_EXACT_GO_KEGG_foreground_EntrezIDs.csv"
+  ),
+  "\n",
+  sep = ""
+)
