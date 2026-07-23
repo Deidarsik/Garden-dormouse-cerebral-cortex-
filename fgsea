@@ -1,0 +1,2001 @@
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(limma)
+  library(fgsea)
+  library(msigdbr)
+  library(data.table)
+  library(BiocParallel)
+  library(ggplot2)
+})
+
+# =============================================================================
+# 0. CONFIGURATION
+# =============================================================================
+
+count_file <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
+meta_file  <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt"
+ann_file   <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
+
+outdir <- "/Users/adrian/Desktop/EQU.03/stability_between_stage_variance"
+
+# --- metadata columns --------------------------------------------------------
+sample_column <- "Sample"
+stage_column  <- "Group"   # physiological stage
+sex_column    <- "Sex"     # set to NA if absent; modelled when estimable
+batch_column  <- NA        # e.g. "Batch"; set to NA to omit
+animal_column <- NA        # e.g. "Animal"; set to NA for independent samples
+
+# --- raw-count validation ----------------------------------------------------
+# edgeR expects raw, non-negative integer-like counts. Set TRUE only when the
+# input is known to contain valid non-integer count-like values and that choice
+# is scientifically justified.
+allow_noninteger_counts <- FALSE
+
+# --- mouse-symbol aggregation policy ----------------------------------------
+# "highest_mean_cpm" : keep the single source locus with the highest mean CPM as
+#                      the representative of each mouse symbol. SAFE DEFAULT.
+#                      Appropriate when duplicated rows may be distinct source
+#                      paralogues collapsing onto one mouse ortholog.
+# "sum_counts"       : sum counts across all source loci sharing a symbol.
+#                      Appropriate ONLY when the duplicated rows are fragments
+#                      or multiple entries of the SAME biological source gene.
+duplicate_symbol_method <- "highest_mean_cpm"
+
+# --- sex-linked genes --------------------------------------------------------
+# These are RETAINED in the primary analysis and adjusted for via the model.
+# Their rank positions are exported as QC.
+sex_linked_symbols <- c("Xist", "Tsix", "Ddx3y", "Uty", "Kdm5d", "Eif2s3y",
+                        "Erdr1", "Jarid1d", "Usp9y")
+run_sex_gene_exclusion_sensitivity <- FALSE
+
+# --- statistics --------------------------------------------------------------
+loess_span            <- 0.30    # span for the mean-variance adjustment
+mean_dependence_rho_warn   <- 0.10  # |Spearman rho| above this triggers a warning
+mean_dependence_trend_warn <- 0.02  # fraction of residual variance explained
+
+# --- enrichment --------------------------------------------------------------
+min_pathway_size <- 15
+max_pathway_size <- 500
+fdr_cutoff       <- 0.05
+n_perm_simple    <- 10000
+fgsea_eps        <- 1e-50   # p-value floor; -log10 therefore caps at 50
+collapse_nperm   <- 1000    # raise for more stable collapsing, at a runtime cost
+top_n_plot       <- 15
+
+# --- sensitivity switches ----------------------------------------------------
+run_sensitivity_total_variance  <- TRUE
+run_sensitivity_raw_between_var <- TRUE
+run_sensitivity_equivalence     <- TRUE   # EXPLORATORY unless prespecified
+run_sensitivity_camerapr        <- TRUE
+equivalence_bound_log2          <- 0.585  # 1.5-fold, descriptive only
+
+master_seed <- 20260101
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+set.seed(master_seed)
+
+# =============================================================================
+# 1. HELPERS
+# =============================================================================
+
+row_vars <- function(x) {
+  x <- as.matrix(x)
+  if (ncol(x) < 2) return(rep(NA_real_, nrow(x)))
+  m <- rowMeans(x)
+  rowSums((x - m)^2) / (ncol(x) - 1)
+}
+
+write_out <- function(x, filename) {
+  x <- as.data.frame(x)
+  for (nm in colnames(x)) {
+    if (is.list(x[[nm]])) {
+      x[[nm]] <- vapply(x[[nm]], function(z) paste(z, collapse = ";"), character(1))
+    }
+  }
+  write.csv(x, file.path(outdir, filename), row.names = FALSE)
+  invisible(filename)
+}
+
+report <- function(...) cat(..., "\n", sep = "")
+
+hdr <- function(txt) cat("\n", strrep("-", 74), "\n", txt, "\n", strrep("-", 74), "\n", sep = "")
+
+# GO term labels without destroying acronyms.
+go_acronyms <- c("DNA", "RNA", "MRNA", "TRNA", "RRNA", "NCRNA", "SNRNA", "SNORNA",
+                 "ATP", "GTP", "ADP", "GDP", "NAD", "NADH", "NADPH", "ER", "GOLGI",
+                 "MHC", "TGF", "WNT", "MAPK", "ERK", "JNK", "NF", "KB", "TNF",
+                 "II", "III", "IV", "VI", "VII", "PH", "UV", "CAMP", "CGMP",
+                 "PI3K", "AMPA", "NMDA", "GABA", "GPCR", "SMAD", "STAT", "MTOR",
+                 "TOR", "ROS", "ATPASE", "GTPASE", "CDNA", "SRP", "TCA", "ATPS")
+
+clean_go_name <- function(x) {
+  x <- sub("^GOBP_", "", x)
+  vapply(strsplit(x, "_", fixed = TRUE), function(w) {
+    paste(ifelse(w %in% go_acronyms, w, tools::toTitleCase(tolower(w))), collapse = " ")
+  }, character(1))
+}
+
+# Strictly decreasing positive integer priority scores encoding an ordering.
+# Ties in the statistic are broken by a SEEDED RANDOM PERMUTATION, never by
+# gene name: alphabetical ordering clusters gene families (Olfr*, Rps*, Zfp*)
+# that are also co-members of the same GO terms.
+make_priority_ranking <- function(stat, genes, low_at_top = TRUE, tie_seed) {
+  stopifnot(length(stat) == length(genes), !anyDuplicated(genes), all(is.finite(stat)))
+  set.seed(tie_seed)
+  tie_key <- sample.int(length(stat))
+  ord <- if (low_at_top) order(stat, tie_key) else order(-stat, tie_key)
+  setNames(as.numeric(length(ord):1L), genes[ord])
+}
+
+# Exact reverse of an existing ranking, ties included. Built from the realised
+# order, not by re-sorting the statistic, so the mirror is exact.
+reverse_ranking <- function(ranks) {
+  g <- rev(names(sort(ranks, decreasing = TRUE)))
+  setNames(as.numeric(length(g):1L), g)
+}
+
+# Descriptive pathway-rank summary: median position of the set's genes,
+# expressed as a percentile of the ranking. 0.5 means no shift.
+median_rank_percentile <- function(ranks, genes) {
+  n <- length(ranks)
+  pos <- rank(-ranks, ties.method = "first")[match(genes, names(ranks))]
+  pos <- pos[!is.na(pos)]
+  if (!length(pos)) return(NA_real_)
+  1 - (median(pos) - 0.5) / n
+}
+
+run_one_sided_fgsea <- function(ranks, pathways_tested, label, seed) {
+  set.seed(seed)
+  res <- fgseaMultilevel(
+    pathways    = pathways_tested,
+    stats       = ranks,
+    minSize     = min_pathway_size,
+    maxSize     = max_pathway_size,
+    eps         = fgsea_eps,
+    scoreType   = "pos",   # one-sided, top-of-list only
+    gseaParam   = 0,       # unweighted: gene ORDER only
+    nPermSimple = n_perm_simple,
+    BPPARAM     = SerialParam()
+  )
+  res <- as.data.frame(res)
+  res$leadingEdge_size <- lengths(res$leadingEdge)
+  res$leadingEdge <- vapply(res$leadingEdge, function(z) paste(z, collapse = ";"),
+                            character(1))
+  res$analysis <- label
+  names(res)[names(res) == "padj"] <- "padj_within_run"
+  res$median_rank_percentile <- vapply(
+    res$pathway, function(p) median_rank_percentile(ranks, pathways_tested[[p]]),
+    numeric(1)
+  )
+  res[order(res$pval), ]
+}
+
+# collapsePathways is a REDUNDANCY-REDUCTION procedure, not an inferential test.
+# It requires a data.table carrying `pathway` and `ES`, sorted by p-value, and
+# its internal machinery reads a column literally named `padj`. Terms are
+# SELECTED here by padj_primary_global (the joint primary FDR); the `padj`
+# column handed to collapsePathways is populated with that same joint value so
+# that selection and collapsing remain consistent. The within-run padj is kept
+# elsewhere only as a secondary diagnostic.
+collapse_significant <- function(res, ranks, pathways_tested, seed) {
+  sig <- res[!is.na(res$padj_primary_global) & res$padj_primary_global < fdr_cutoff, ]
+  sig <- sig[order(sig$pval), ]
+  if (nrow(sig) == 0) return(character(0))
+  dt <- data.table::as.data.table(data.frame(
+    pathway = sig$pathway,
+    pval    = sig$pval,
+    padj    = sig$padj_primary_global,   # joint primary FDR, by design
+    ES      = sig$ES,
+    NES     = sig$NES,
+    size    = sig$size,
+    stringsAsFactors = FALSE
+  ))
+  set.seed(seed)
+  out <- tryCatch(
+    collapsePathways(fgseaRes = dt, pathways = pathways_tested, stats = ranks,
+                     pval.threshold = 0.05, nperm = collapse_nperm, gseaParam = 0),
+    error = function(e) {
+      warning("collapsePathways() failed (", conditionMessage(e),
+              "); reporting the uncollapsed significant set.")
+      list(mainPathways = sig$pathway)
+    }
+  )
+  out$mainPathways
+}
+
+# cameraPR sensitivity run. `priority_scores` must be the exact realised
+# ranking vector used by fgsea, aligned to `gene_names`; HIGH scores correspond
+# to the end of the ranking being tested. The inter-gene correlation is a
+# specified sensitivity parameter, not an estimate from these data.
+run_camerapr <- function(priority_scores, gene_names, pathway_indices,
+                         inter_gene_cor = 0.01) {
+  if (is.null(names(priority_scores))) {
+    stop("cameraPR priority scores must be a named vector.")
+  }
+  missing_genes <- setdiff(gene_names, names(priority_scores))
+  if (length(missing_genes)) {
+    stop("cameraPR ranking is missing gene(s): ",
+         paste(head(missing_genes, 20), collapse = ", "))
+  }
+  s <- priority_scores[gene_names]
+  if (any(!is.finite(s))) stop("cameraPR ranking contains non-finite scores.")
+  
+  cam <- limma::cameraPR(
+    statistic = s,
+    index = pathway_indices,
+    use.ranks = TRUE,
+    inter.gene.cor = inter_gene_cor,
+    sort = FALSE
+  )
+  cam <- as.data.frame(cam)
+  cam$pathway <- rownames(cam)
+  rownames(cam) <- NULL
+  cam$p_one_sided <- ifelse(
+    cam$Direction == "Up",
+    cam$PValue / 2,
+    1 - cam$PValue / 2
+  )
+  cam$inter_gene_cor_specified <- inter_gene_cor
+  cam[order(cam$p_one_sided),
+      c("pathway", "NGenes", "Direction", "PValue", "p_one_sided",
+        "inter_gene_cor_specified")]
+}
+
+# =============================================================================
+# 2. LOAD DATA AND SAMPLE-LEVEL QC
+# =============================================================================
+
+hdr("1. Input data")
+
+counts_df <- read.delim(
+  count_file,
+  header = TRUE,
+  row.names = 1,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+rownames(counts_df) <- trimws(rownames(counts_df))
+colnames(counts_df) <- trimws(colnames(counts_df))
+if (nrow(counts_df) == 0) stop("The count matrix contains zero genes.")
+if (ncol(counts_df) == 0) stop("The count matrix contains zero samples.")
+if (any(!nzchar(rownames(counts_df)))) {
+  stop("The count matrix contains empty source-gene identifiers after trimming.")
+}
+if (any(!nzchar(colnames(counts_df)))) {
+  stop("The count matrix contains empty sample identifiers after trimming.")
+}
+if (anyDuplicated(rownames(counts_df))) {
+  stop("The count matrix contains duplicated source-gene row names after trimming.")
+}
+if (anyDuplicated(colnames(counts_df))) {
+  stop("The count matrix contains duplicated sample column names after trimming.")
+}
+bad_cols <- names(counts_df)[!vapply(counts_df, is.numeric, logical(1))]
+if (length(bad_cols)) {
+  stop(
+    "Non-numeric column(s) in the count matrix: ",
+    paste(bad_cols, collapse = ", "),
+    ". Remove annotation columns before running."
+  )
+}
+counts_raw <- as.matrix(counts_df)
+rm(counts_df)
+
+if (anyNA(counts_raw)) stop("The count matrix contains missing values.")
+if (any(!is.finite(counts_raw))) stop("The count matrix contains non-finite values.")
+if (any(counts_raw < 0)) stop("The count matrix contains negative values.")
+if (any(colSums(counts_raw) <= 0)) {
+  stop("At least one sample has a zero total library size.")
+}
+if (!allow_noninteger_counts &&
+    !all(abs(counts_raw - round(counts_raw)) < 1e-8)) {
+  stop(
+    "The count matrix contains non-integer values. edgeR expects raw ",
+    "integer-like counts. Verify the input or set ",
+    "allow_noninteger_counts <- TRUE only when scientifically justified."
+  )
+}
+
+meta <- read.delim(
+  meta_file,
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+if (nrow(meta) == 0) stop("The metadata table contains zero samples.")
+if (!sample_column %in% colnames(meta)) {
+  stop("Metadata lacks the column '", sample_column, "'.")
+}
+if (!stage_column %in% colnames(meta)) {
+  stop("Metadata lacks the column '", stage_column, "'.")
+}
+
+# Trim all configured metadata fields before factor construction.
+columns_to_trim <- unique(na.omit(c(
+  sample_column, stage_column, sex_column, batch_column, animal_column
+)))
+columns_to_trim <- intersect(columns_to_trim, colnames(meta))
+for (nm in columns_to_trim) {
+  meta[[nm]] <- trimws(as.character(meta[[nm]]))
+}
+if (anyNA(meta[[sample_column]]) || any(!nzchar(meta[[sample_column]]))) {
+  stop("Metadata contains missing or empty sample identifiers after trimming.")
+}
+if (anyNA(meta[[stage_column]]) || any(!nzchar(meta[[stage_column]]))) {
+  stop("Metadata contains missing or empty stage values after trimming.")
+}
+if (anyDuplicated(meta[[sample_column]])) {
+  stop("Duplicated sample identifiers in metadata.")
+}
+
+missing_samples <- setdiff(meta[[sample_column]], colnames(counts_raw))
+if (length(missing_samples)) {
+  stop("Metadata samples absent from the count matrix: ",
+       paste(missing_samples, collapse = ", "))
+}
+extra_samples <- setdiff(colnames(counts_raw), meta[[sample_column]])
+if (length(extra_samples)) {
+  message("Count-matrix columns not present in metadata (dropped): ",
+          paste(extra_samples, collapse = ", "))
+}
+
+counts_raw <- counts_raw[, meta[[sample_column]], drop = FALSE]
+rownames(meta) <- meta[[sample_column]]
+
+meta$Stage <- factor(make.names(as.character(meta[[stage_column]])))
+stage_levels <- levels(meta$Stage)
+if (length(stage_levels) < 2) stop("At least two stages are required.")
+
+has_sex <- !is.na(sex_column) && sex_column %in% colnames(meta)
+if (has_sex) {
+  if (anyNA(meta[[sex_column]]) || any(!nzchar(meta[[sex_column]]))) {
+    stop("The configured sex column contains missing or empty values.")
+  }
+  meta$SexF <- factor(make.names(meta[[sex_column]]))
+  if (nlevels(meta$SexF) < 2) {
+    message("Only one sex level present; sex will not be modelled.")
+    has_sex <- FALSE
+  }
+}
+has_batch <- !is.na(batch_column) && batch_column %in% colnames(meta)
+if (has_batch) {
+  if (anyNA(meta[[batch_column]]) || any(!nzchar(meta[[batch_column]]))) {
+    stop("The configured batch column contains missing or empty values.")
+  }
+  meta$BatchF <- factor(make.names(meta[[batch_column]]))
+  if (nlevels(meta$BatchF) < 2) {
+    message("Only one batch level present; batch will not be modelled.")
+    has_batch <- FALSE
+  }
+}
+has_animal <- !is.na(animal_column) && animal_column %in% colnames(meta)
+if (has_animal && (anyNA(meta[[animal_column]]) || any(!nzchar(meta[[animal_column]])))) {
+  stop("The configured animal column contains missing or empty values.")
+}
+if (has_animal && length(unique(meta[[animal_column]])) == nrow(meta)) {
+  message("Every sample has a unique animal identifier; ",
+          "the independent-sample workflow will be used.")
+  has_animal <- FALSE
+}
+
+qc_samples <- data.frame(
+  Sample = meta[[sample_column]],
+  Stage  = as.character(meta$Stage),
+  Sex    = if (has_sex) as.character(meta$SexF) else NA_character_,
+  Batch  = if (has_batch) as.character(meta$BatchF) else NA_character_,
+  Animal = if (has_animal) as.character(meta[[animal_column]]) else NA_character_,
+  library_size = colSums(counts_raw),
+  stringsAsFactors = FALSE
+)
+write_out(qc_samples, "qc_sample_stage_sex_table.csv")
+
+report("Samples: ", nrow(meta))
+report("Sample size per stage:")
+print(table(Stage = meta$Stage))
+if (has_sex) {
+  report("Sex distribution per stage:")
+  print(table(Stage = meta$Stage, Sex = meta$SexF))
+} else {
+  report("Sex distribution per stage: sex not available or not estimable.")
+}
+
+n_per_stage <- table(meta$Stage)
+if (any(n_per_stage < 2)) {
+  warning("At least one stage has n = 1. Between-stage means for that stage rest ",
+          "on a single sample; interpret the primary statistic with caution.")
+}
+
+# --- explicit stage / sex confounding check ---------------------------------
+if (has_sex) {
+  tab <- table(meta$Stage, meta$SexF)
+  sex_per_stage <- rowSums(tab > 0)
+  if (all(sex_per_stage == 1)) {
+    stop("Stage and sex are completely confounded: every stage contains a single ",
+         "sex. Sex cannot be modelled and must not be silently ignored. ",
+         "Either restrict the analysis to one sex, or state the confounding ",
+         "explicitly and rerun with sex_column <- NA as a documented decision.")
+  }
+  if (any(sex_per_stage == 1)) {
+    message("Note: ", sum(sex_per_stage == 1), " stage(s) contain a single sex. ",
+            "Sex remains estimable overall but is partially confounded with stage.")
+  }
+}
+
+# =============================================================================
+# 3. ORTHOLOG MAPPING QC AND MOUSE-SYMBOL AGGREGATION
+# =============================================================================
+
+hdr("2. Ortholog mapping and mouse-symbol aggregation")
+
+ann <- read.delim(ann_file, header = TRUE, check.names = FALSE,
+                  stringsAsFactors = FALSE)
+colnames(ann)[1] <- "GeneID"
+if (!"Gene_name" %in% colnames(ann)) stop("Annotation file must contain 'Gene_name'.")
+
+ann <- ann[, c("GeneID", "Gene_name")]
+ann$GeneID <- trimws(as.character(ann$GeneID))
+ann$Gene_name <- trimws(as.character(ann$Gene_name))
+ann <- ann[
+  !is.na(ann$GeneID) & nzchar(ann$GeneID) &
+    !is.na(ann$Gene_name) & nzchar(ann$Gene_name),
+]
+ann <- unique(ann)
+
+# Everything below is defined ONLY on loci that actually occur in the count
+# matrix, so the categories are non-overlapping and can never be negative.
+loci_all <- rownames(counts_raw)
+ann_in_matrix <- ann[ann$GeneID %in% loci_all, ]
+
+symbols_per_locus <- tapply(ann_in_matrix$Gene_name, ann_in_matrix$GeneID,
+                            function(z) length(unique(z)))
+ambiguous_loci <- names(symbols_per_locus)[symbols_per_locus > 1]
+
+n_loci_total      <- length(loci_all)
+n_loci_with_map   <- length(unique(ann_in_matrix$GeneID))
+n_loci_unmapped   <- n_loci_total - n_loci_with_map
+n_loci_ambiguous  <- length(ambiguous_loci)
+n_loci_unique_map <- n_loci_with_map - n_loci_ambiguous
+
+stopifnot(n_loci_unmapped >= 0, n_loci_ambiguous >= 0, n_loci_unique_map >= 0,
+          n_loci_unmapped + n_loci_ambiguous + n_loci_unique_map == n_loci_total)
+
+# Unambiguously mapped loci only.
+map_ok <- ann_in_matrix[!ann_in_matrix$GeneID %in% ambiguous_loci, ]
+map_ok <- map_ok[!duplicated(map_ok$GeneID), ]
+
+lib_size_all <- colSums(counts_raw)
+cpm_all <- edgeR::cpm(counts_raw, lib.size = lib_size_all)
+mean_cpm_locus <- rowMeans(cpm_all)
+rm(cpm_all)
+
+map_ok$mean_cpm_locus <- mean_cpm_locus[map_ok$GeneID]
+loci_per_symbol <- table(map_ok$Gene_name)
+map_ok$n_loci_for_symbol <- as.integer(loci_per_symbol[map_ok$Gene_name])
+
+n_symbols_total     <- length(loci_per_symbol)
+n_symbols_multi     <- sum(loci_per_symbol > 1)
+n_loci_in_multi     <- sum(map_ok$n_loci_for_symbol > 1)
+
+# --- apply the aggregation policy -------------------------------------------
+if (!duplicate_symbol_method %in% c("highest_mean_cpm", "sum_counts")) {
+  stop("duplicate_symbol_method must be 'highest_mean_cpm' or 'sum_counts'.")
+}
+
+if (duplicate_symbol_method == "sum_counts") {
+  warning("duplicate_symbol_method = 'sum_counts': counts from all source loci ",
+          "sharing a mouse symbol will be summed. This is appropriate ONLY when ",
+          "the duplicated rows are fragments or multiple entries of the SAME ",
+          "biological source gene. It is NOT appropriate for genuinely distinct ",
+          "source paralogues that happen to map to one mouse ortholog.")
+  counts_sym <- rowsum(counts_raw[map_ok$GeneID, , drop = FALSE],
+                       group = map_ok$Gene_name, reorder = TRUE)
+  map_ok$selected_representative <- TRUE
+  n_loci_dropped_nonrep <- 0L
+} else {
+  ord <- order(map_ok$Gene_name, -map_ok$mean_cpm_locus, map_ok$GeneID)
+  map_ok <- map_ok[ord, ]
+  keep_rep <- !duplicated(map_ok$Gene_name)
+  map_ok$selected_representative <- keep_rep
+  rep_loci <- map_ok$GeneID[keep_rep]
+  counts_sym <- counts_raw[rep_loci, , drop = FALSE]
+  rownames(counts_sym) <- map_ok$Gene_name[keep_rep]
+  counts_sym <- counts_sym[order(rownames(counts_sym)), , drop = FALSE]
+  n_loci_dropped_nonrep <- sum(!keep_rep)
+}
+
+qc_dup_map <- data.frame(
+  GeneID                 = map_ok$GeneID,
+  Gene_name              = map_ok$Gene_name,
+  n_loci_for_symbol      = map_ok$n_loci_for_symbol,
+  mean_cpm_locus         = round(map_ok$mean_cpm_locus, 4),
+  ambiguous_locus        = FALSE,
+  selected_representative = map_ok$selected_representative,
+  aggregation_policy     = duplicate_symbol_method,
+  stringsAsFactors = FALSE
+)
+if (n_loci_ambiguous > 0) {
+  amb_rows <- ann_in_matrix[ann_in_matrix$GeneID %in% ambiguous_loci, ]
+  qc_dup_map <- rbind(qc_dup_map, data.frame(
+    GeneID = amb_rows$GeneID,
+    Gene_name = amb_rows$Gene_name,
+    n_loci_for_symbol = NA_integer_,
+    mean_cpm_locus = round(mean_cpm_locus[amb_rows$GeneID], 4),
+    ambiguous_locus = TRUE,
+    selected_representative = FALSE,
+    aggregation_policy = duplicate_symbol_method,
+    stringsAsFactors = FALSE
+  ))
+}
+write_out(qc_dup_map, "qc_duplicate_mouse_symbol_mapping.csv")
+
+qc_map_summary <- data.frame(
+  n_loci_in_count_matrix          = n_loci_total,
+  n_loci_unmapped                 = n_loci_unmapped,
+  n_loci_ambiguous_multi_symbol   = n_loci_ambiguous,
+  n_loci_unique_symbol            = n_loci_unique_map,
+  n_unique_mouse_symbols          = n_symbols_total,
+  n_symbols_with_multiple_loci    = n_symbols_multi,
+  n_loci_in_multi_locus_symbols   = n_loci_in_multi,
+  n_loci_dropped_as_nonrepresentative = n_loci_dropped_nonrep,
+  aggregation_policy              = duplicate_symbol_method,
+  stringsAsFactors = FALSE
+)
+write_out(qc_map_summary, "qc_ortholog_mapping_summary.csv")
+
+report("Source loci in the count matrix: ", n_loci_total)
+report("Loci mapped to a unique mouse symbol: ", n_loci_unique_map)
+report("Loci with ambiguous mapping (>1 mouse symbol, dropped): ", n_loci_ambiguous)
+report("Loci with no mouse mapping (dropped): ", n_loci_unmapped)
+report("Mouse symbols receiving more than one source locus: ", n_symbols_multi)
+report("Aggregation policy: ", duplicate_symbol_method)
+report("Mouse symbols entering expression filtering: ", nrow(counts_sym))
+
+# =============================================================================
+# 4. DESIGN, FILTERING, NORMALISATION, VOOM
+# =============================================================================
+
+hdr("3. Design, filtering, normalisation")
+
+design_terms <- "~ 0 + Stage"
+if (has_sex)   design_terms <- paste(design_terms, "+ SexF")
+if (has_batch) design_terms <- paste(design_terms, "+ BatchF")
+design <- model.matrix(as.formula(design_terms), data = meta)
+colnames(design) <- make.names(colnames(design))
+rownames(design) <- meta[[sample_column]]
+
+design_rank <- qr(design)$rank
+if (design_rank < ncol(design)) {
+  ne <- limma::nonEstimable(design)
+  stop("The design matrix is rank deficient (rank ", design_rank, " < ",
+       ncol(design), " coefficients). Non-estimable coefficient(s): ",
+       if (is.null(ne)) "unavailable" else paste(ne, collapse = ", "),
+       ". This usually means stage is confounded with sex or batch. ",
+       "Fix the design explicitly; do not continue silently.")
+}
+ne_check <- limma::nonEstimable(design)
+if (!is.null(ne_check)) {
+  stop("Non-estimable coefficient(s) detected: ", paste(ne_check, collapse = ", "))
+}
+
+resid_df <- nrow(design) - design_rank
+if (resid_df < 1) {
+  stop("No residual degrees of freedom (", resid_df, "). Remove covariates.")
+}
+if (resid_df < 3) {
+  warning("Only ", resid_df, " residual degrees of freedom. Empirical Bayes ",
+          "moderation will be carrying most of the estimation.")
+}
+
+write_out(data.frame(Sample = rownames(design), design, check.names = FALSE),
+          "qc_design_matrix.csv")
+
+report("Design formula: ", design_terms)
+report("Design matrix rank: ", design_rank, " (columns: ", ncol(design), ")")
+report("Residual degrees of freedom: ", resid_df)
+
+dge <- DGEList(counts = counts_sym, group = meta$Stage)
+keep <- filterByExpr(dge, design = design)
+report("Genes after expression filtering (filterByExpr): ", sum(keep),
+       " of ", nrow(dge))
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+if (has_animal) {
+  block <- meta[[animal_column]]
+  report("Repeated measures detected; running the iterative voom / ",
+         "duplicateCorrelation workflow.")
+  v0  <- voom(dge, design, plot = FALSE)
+  dc0 <- duplicateCorrelation(v0, design, block = block)
+  report("  duplicateCorrelation, pass 1: ", round(dc0$consensus, 4))
+  v   <- voom(dge, design, block = block, correlation = dc0$consensus,
+              plot = FALSE, save.plot = TRUE)
+  dc  <- duplicateCorrelation(v, design, block = block)
+  report("  duplicateCorrelation, pass 2: ", round(dc$consensus, 4))
+  fit <- lmFit(v, design, block = block, correlation = dc$consensus)
+  dupcor_used <- dc$consensus
+} else {
+  v <- voom(dge, design, plot = FALSE, save.plot = TRUE)
+  fit <- lmFit(v, design)
+  dupcor_used <- NA_real_
+}
+
+# Drawn from the stored voom diagnostic so that it reflects the fit that was
+# actually used, including the duplicateCorrelation branch.
+pdf(file.path(outdir, "qc_voom_mean_variance_trend.pdf"), width = 6, height = 5)
+plot(v$voom.xy$x, v$voom.xy$y, pch = 16, cex = 0.25,
+     xlab = v$voom.xy$xlab, ylab = v$voom.xy$ylab,
+     main = "voom mean-variance trend")
+lines(v$voom.line$x, v$voom.line$y, col = "red", lwd = 2)
+dev.off()
+
+logcpm <- v$E
+gene_symbols <- rownames(logcpm)
+
+# =============================================================================
+# 5. COVARIATE-ADJUSTED STAGE MEANS AND THE PRIMARY STATISTIC
+# =============================================================================
+
+hdr("4. Stage means and the primary statistic")
+
+stage_coef_names <- paste0("Stage", stage_levels)
+if (!all(stage_coef_names %in% colnames(design))) {
+  stop("Stage coefficients not found in the design matrix. Check stage level names.")
+}
+stage_cols <- match(stage_coef_names, colnames(design))
+cov_cols   <- setdiff(seq_len(ncol(design)), stage_cols)
+
+# Adjusted marginal (least-squares) stage means.
+#
+# With `~ 0 + Stage + SexF`, the raw Stage coefficients are the fitted means at
+# the REFERENCE level of sex, not marginal means averaged over the covariate
+# distribution. We therefore build an explicit contrast matrix that evaluates
+# each stage at the observed mean of every covariate column, which is the
+# standard adjusted-marginal-mean construction.
+#
+# Note that the covariate term added is IDENTICAL for every stage, so it is a
+# constant shift common to all stage means. The BETWEEN-STAGE VARIANCE is
+# therefore mathematically invariant to this choice; the adjustment matters for
+# the reported absolute levels and for interpretability, not for the primary
+# statistic. This invariance is verified numerically below.
+C_emm <- matrix(0, nrow = length(stage_levels), ncol = ncol(design),
+                dimnames = list(stage_levels, colnames(design)))
+C_emm[cbind(seq_along(stage_levels), stage_cols)] <- 1
+if (length(cov_cols)) {
+  C_emm[, cov_cols] <- matrix(colMeans(design[, cov_cols, drop = FALSE]),
+                              nrow = length(stage_levels),
+                              ncol = length(cov_cols), byrow = TRUE)
+}
+stage_emm <- fit$coefficients %*% t(C_emm)
+colnames(stage_emm) <- stage_levels
+
+between_stage_var <- row_vars(stage_emm)
+invariance_check <- max(abs(between_stage_var - row_vars(fit$coefficients[, stage_cols, drop = FALSE])))
+report("Adjusted-marginal-mean check: maximum |between-stage variance from ",
+       "adjusted means minus that from raw stage coefficients| = ",
+       format(invariance_check, digits = 3, scientific = TRUE),
+       " (expected to be ~0 by construction)")
+
+mean_logCPM <- rowMeans(logcpm)
+total_var   <- row_vars(logcpm)
+
+# --- mean adjustment ---------------------------------------------------------
+# log2(variance + offset) regressed on mean logCPM by loess; the residual is the
+# primary statistic. The offset is derived from the data (half the smallest
+# strictly positive variance, with a hard floor) so that exactly-zero variances
+# are handled without inventing a scale.
+make_offset <- function(x) {
+  pos <- x[is.finite(x) & x > 0]
+  if (!length(pos)) return(1e-10)
+  max(1e-10, min(pos) / 2)
+}
+
+adjust_for_mean <- function(stat, mean_expr, span = loess_span) {
+  if (length(stat) != length(mean_expr)) {
+    stop("Mean-adjustment inputs have different lengths.")
+  }
+  if (length(stat) < 20) {
+    stop("Too few genes for a reliable mean-variance loess adjustment.")
+  }
+  if (any(!is.finite(stat)) || any(stat < 0)) {
+    stop("Variance statistic contains negative or non-finite values.")
+  }
+  if (any(!is.finite(mean_expr))) {
+    stop("Mean-expression vector contains non-finite values.")
+  }
+  if (length(unique(mean_expr)) < 10) {
+    stop("Too few unique mean-expression values for loess adjustment.")
+  }
+  if (!is.finite(span) || span <= 0 || span > 1) {
+    stop("loess span must be finite and in the interval (0, 1].")
+  }
+  
+  off <- make_offset(stat)
+  y <- log2(stat + off)
+  if (any(!is.finite(y))) {
+    stop("Log-transformed variance contains non-finite values.")
+  }
+  
+  lf <- tryCatch(
+    limma::loessFit(y = y, x = mean_expr, span = span),
+    error = function(e) {
+      stop("Mean-variance loess fitting failed: ", conditionMessage(e))
+    }
+  )
+  if (length(lf$fitted) != length(stat) ||
+      length(lf$residuals) != length(stat)) {
+    stop("Mean-variance loess returned vectors of an unexpected length.")
+  }
+  if (any(!is.finite(lf$fitted)) || any(!is.finite(lf$residuals))) {
+    stop("Mean-variance loess returned non-finite fitted values or residuals.")
+  }
+  
+  list(
+    offset = off,
+    log_stat = y,
+    fitted = lf$fitted,
+    residual = lf$residuals
+  )
+}
+
+adj_between <- adjust_for_mean(between_stage_var, mean_logCPM)
+adj_total   <- adjust_for_mean(total_var, mean_logCPM)
+
+between_stage_var_adj <- adj_between$residual
+total_var_adj         <- adj_total$residual
+
+# --- does mean dependence remain? -------------------------------------------
+mean_dependence_check <- function(stat, mean_expr, label) {
+  ok <- is.finite(stat) & is.finite(mean_expr)
+  stat_ok <- stat[ok]
+  mean_ok <- mean_expr[ok]
+  
+  rho <- NA_real_
+  trend_frac <- NA_real_
+  max_abs_decile <- NA_real_
+  decile_range <- NA_real_
+  
+  if (length(stat_ok) >= 3 && length(unique(stat_ok)) > 1 &&
+      length(unique(mean_ok)) > 1) {
+    rho <- suppressWarnings(
+      cor(stat_ok, mean_ok, method = "spearman", use = "complete.obs")
+    )
+    
+    lf <- tryCatch(
+      limma::loessFit(y = stat_ok, x = mean_ok, span = loess_span),
+      error = function(e) NULL
+    )
+    stat_var <- var(stat_ok, na.rm = TRUE)
+    if (!is.null(lf) && is.finite(stat_var) && stat_var > 0 &&
+        all(is.finite(lf$fitted))) {
+      fitted_var <- var(lf$fitted, na.rm = TRUE)
+      if (is.finite(fitted_var)) trend_frac <- fitted_var / stat_var
+    }
+    
+    brk <- unique(
+      as.numeric(quantile(mean_ok, seq(0, 1, 0.1), na.rm = TRUE))
+    )
+    if (length(brk) >= 2) {
+      dec <- cut(mean_ok, breaks = brk, include.lowest = TRUE,
+                 labels = FALSE)
+      dec_med <- tapply(stat_ok, dec, median, na.rm = TRUE)
+      dec_med <- dec_med[is.finite(dec_med)]
+      if (length(dec_med)) {
+        max_abs_decile <- max(abs(dec_med), na.rm = TRUE)
+        decile_range <- diff(range(dec_med, na.rm = TRUE))
+      }
+    }
+  }
+  
+  if (!is.finite(rho)) rho <- NA_real_
+  if (!is.finite(trend_frac)) trend_frac <- NA_real_
+  if (!is.finite(max_abs_decile)) max_abs_decile <- NA_real_
+  if (!is.finite(decile_range)) decile_range <- NA_real_
+  
+  data.frame(
+    statistic = label,
+    spearman_rho_vs_mean_logCPM = round(rho, 4),
+    loess_trend_variance_fraction = round(trend_frac, 5),
+    max_abs_decile_median = round(max_abs_decile, 4),
+    decile_median_range = round(decile_range, 4),
+    stringsAsFactors = FALSE
+  )
+}
+
+md_tab <- rbind(
+  mean_dependence_check(adj_between$log_stat, mean_logCPM,
+                        "log2 between-stage variance (raw)"),
+  mean_dependence_check(between_stage_var_adj, mean_logCPM,
+                        "between-stage variance (mean-adjusted, PRIMARY)"),
+  mean_dependence_check(adj_total$log_stat, mean_logCPM,
+                        "log2 total variance (raw)"),
+  mean_dependence_check(total_var_adj, mean_logCPM,
+                        "total variance (mean-adjusted, sensitivity)")
+)
+write_out(md_tab, "qc_mean_dependence_check.csv")
+report("Mean-dependence diagnostics:")
+print(md_tab, row.names = FALSE)
+
+primary_md <- md_tab[md_tab$statistic == "between-stage variance (mean-adjusted, PRIMARY)", ]
+remaining_mean_dependence <-
+  (is.finite(primary_md$spearman_rho_vs_mean_logCPM) &&
+     abs(primary_md$spearman_rho_vs_mean_logCPM) > mean_dependence_rho_warn) ||
+  (is.finite(primary_md$loess_trend_variance_fraction) &&
+     primary_md$loess_trend_variance_fraction > mean_dependence_trend_warn)
+
+if (remaining_mean_dependence) {
+  warning("Substantial mean dependence REMAINS in the primary statistic ",
+          "(Spearman rho = ", primary_md$spearman_rho_vs_mean_logCPM,
+          ", loess trend variance fraction = ",
+          primary_md$loess_trend_variance_fraction, "). Adjust loess_span, or ",
+          "treat expression level as a confounder when interpreting the results.")
+} else {
+  report("Residual mean dependence in the primary statistic is negligible.")
+}
+
+# --- diagnostic figures ------------------------------------------------------
+diag_df <- data.frame(
+  mean_logCPM = mean_logCPM,
+  log2_between_var = adj_between$log_stat,
+  fitted = adj_between$fitted,
+  adjusted = between_stage_var_adj
+)
+diag_line <- diag_df[order(diag_df$mean_logCPM), ]
+
+p_before <- ggplot(diag_df, aes(mean_logCPM, log2_between_var)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_line(
+    data = diag_line,
+    aes(x = mean_logCPM, y = fitted),
+    inherit.aes = FALSE,
+    colour = "firebrick",
+    linewidth = 1
+  ) +
+  theme_classic(base_size = 12) +
+  labs(title = "Mean logCPM versus raw between-stage variance",
+       subtitle = paste0("loess span = ", loess_span,
+                         "; offset = ", signif(adj_between$offset, 3)),
+       x = "Mean logCPM",
+       y = expression(log[2]*"(between-stage variance + offset)"))
+
+p_after <- ggplot(diag_df, aes(mean_logCPM, adjusted)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "loess", span = loess_span, se = FALSE, colour = "firebrick") +
+  theme_classic(base_size = 12) +
+  labs(title = "Mean logCPM versus adjusted between-stage variance (primary statistic)",
+       subtitle = paste0("Spearman rho = ", primary_md$spearman_rho_vs_mean_logCPM,
+                         "; loess trend variance fraction = ",
+                         primary_md$loess_trend_variance_fraction),
+       x = "Mean logCPM", y = "Loess residual (adjusted between-stage variance)")
+
+ggsave(file.path(outdir, "qc_mean_between_variance_before_adjustment.pdf"),
+       p_before, width = 6.5, height = 5)
+ggsave(file.path(outdir, "qc_mean_between_variance_after_adjustment.pdf"),
+       p_after, width = 6.5, height = 5)
+
+# =============================================================================
+# 6. EXPLORATORY CONFIDENCE BOUNDS (sensitivity only)
+# =============================================================================
+
+max_contrast <- max_contrast_ub <- max_contrast_lb <- rep(NA_real_, length(gene_symbols))
+stage_F <- stage_F_p <- rep(NA_real_, length(gene_symbols))
+
+if (run_sensitivity_equivalence) {
+  pair_idx <- combn(length(stage_levels), 2)
+  cm_pairs <- makeContrasts(
+    contrasts = paste0(stage_coef_names[pair_idx[1, ]], "-",
+                       stage_coef_names[pair_idx[2, ]]),
+    levels = design
+  )
+  colnames(cm_pairs) <- paste0(stage_levels[pair_idx[1, ]], "_vs_",
+                               stage_levels[pair_idx[2, ]])
+  fit_pairs <- eBayes(
+    contrasts.fit(fit, cm_pairs),
+    trend = FALSE,
+    robust = TRUE
+  )
+  
+  # Keep every contrast object explicitly two-dimensional. This also handles
+  # the two-stage case, where there is only one pairwise contrast.
+  lfc <- as.matrix(fit_pairs$coefficients)
+  stdev_unscaled <- as.matrix(fit_pairs$stdev.unscaled)
+  
+  if (!identical(dim(lfc), dim(stdev_unscaled))) {
+    stop(
+      "Pairwise-contrast coefficient and standard-error matrices have ",
+      "incompatible dimensions."
+    )
+  }
+  
+  s2_post <- as.numeric(fit_pairs$s2.post)
+  df_total <- as.numeric(fit_pairs$df.total)
+  
+  if (length(s2_post) != nrow(lfc) || length(df_total) != nrow(lfc)) {
+    stop(
+      "Unexpected empirical-Bayes variance or degrees-of-freedom length in ",
+      "the exploratory confidence-bound analysis."
+    )
+  }
+  
+  # Gene-specific standard errors and 95% confidence half-widths.
+  se <- sweep(
+    stdev_unscaled,
+    MARGIN = 1,
+    STATS = sqrt(s2_post),
+    FUN = "*"
+  )
+  
+  tcrit <- qt(
+    0.975,
+    df = df_total
+  )
+  
+  ci_half_width <- sweep(
+    se,
+    MARGIN = 1,
+    STATS = tcrit,
+    FUN = "*"
+  )
+  
+  abs_lfc <- abs(lfc)
+  ci_ub <- abs_lfc + ci_half_width
+  ci_lb <- abs_lfc - ci_half_width
+  
+  # Truncate lower confidence limits for |logFC| at zero while preserving the
+  # matrix dimensions. Do not use pmax(0, matrix), because pmax() preserves the
+  # attributes of its first argument and would drop the matrix dimensions.
+  ci_lb[ci_lb < 0] <- 0
+  
+  max_contrast <- apply(
+    abs_lfc,
+    1,
+    max,
+    na.rm = TRUE
+  )
+  
+  max_contrast_ub <- apply(
+    ci_ub,
+    1,
+    max,
+    na.rm = TRUE
+  )
+  
+  max_contrast_lb <- apply(
+    ci_lb,
+    1,
+    max,
+    na.rm = TRUE
+  )
+  
+  cm_anova <- makeContrasts(
+    contrasts = paste0(stage_coef_names[-1], "-", stage_coef_names[1]),
+    levels = design
+  )
+  fit_anova <- eBayes(contrasts.fit(fit, cm_anova), trend = FALSE, robust = TRUE)
+  stage_F   <- fit_anova$F
+  stage_F_p <- fit_anova$F.p.value
+}
+
+# =============================================================================
+# 7. PER-GENE STATISTICS TABLE AND THE TESTED UNIVERSE
+# =============================================================================
+
+gene_stats <- data.frame(
+  Gene_name              = gene_symbols,
+  mean_logCPM            = mean_logCPM,
+  total_var_raw          = total_var,
+  total_var_adjusted     = total_var_adj,
+  between_stage_var_raw  = between_stage_var,
+  between_stage_var_adjusted = between_stage_var_adj,   # PRIMARY STATISTIC
+  max_contrast_log2      = max_contrast,
+  max_contrast_ub        = max_contrast_ub,
+  max_contrast_lb        = max_contrast_lb,
+  stage_F                = stage_F,
+  stage_F_pvalue         = stage_F_p,
+  stringsAsFactors = FALSE
+)
+stage_emm_out <- as.data.frame(stage_emm)
+colnames(stage_emm_out) <- paste0("stage_mean_", colnames(stage_emm_out))
+gene_stats <- cbind(gene_stats, stage_emm_out)
+if (run_sensitivity_equivalence) {
+  gene_stats$stage_F_qvalue <- p.adjust(stage_F_p, method = "BH")
+  gene_stats$compatible_with_stability_exploratory <-
+    gene_stats$max_contrast_ub < equivalence_bound_log2
+}
+gene_stats$is_sex_linked <- gene_stats$Gene_name %in% sex_linked_symbols
+
+# The tested universe: symbols that pass expression filtering, have a usable
+# model result, and have a finite primary statistic.
+usable <- is.finite(gene_stats$between_stage_var_adjusted) &
+  is.finite(gene_stats$mean_logCPM) &
+  !is.na(gene_stats$between_stage_var_raw)
+if (any(!usable)) {
+  message("Dropping ", sum(!usable), " gene(s) without a usable primary statistic.")
+}
+gene_stats <- gene_stats[usable, ]
+
+stopifnot(!anyDuplicated(gene_stats$Gene_name))
+universe <- gene_stats$Gene_name
+write_out(gene_stats, "per_gene_primary_stability_statistics.csv")
+report("Genes in the enrichment universe: ", length(universe))
+
+# =============================================================================
+# 8. GO BIOLOGICAL PROCESS GENE SETS
+# =============================================================================
+
+hdr("5. GO:BP gene sets")
+
+msig_formals <- names(formals(msigdbr::msigdbr))
+collection_formals <- names(formals(msigdbr::msigdbr_collections))
+
+# Native mouse MSigDB uses mouse-specific collection identifiers (for example,
+# M5 for ontology), rather than the corresponding human identifiers such as C5.
+# Discover the installed mouse GO:BP collection instead of hard-coding a name.
+if (!"db_species" %in% msig_formals) {
+  stop(
+    "The installed msigdbr version does not expose the db_species argument, ",
+    "so native mouse MSigDB use cannot be verified. Update msigdbr and rerun."
+  )
+}
+
+if (!"db_species" %in% collection_formals) {
+  stop(
+    "The installed msigdbr::msigdbr_collections() does not support ",
+    "db_species = 'MM'. Update msigdbr and rerun."
+  )
+}
+
+mouse_collections <- tryCatch(
+  msigdbr::msigdbr_collections(db_species = "MM"),
+  error = function(e) {
+    stop(
+      "Could not list native mouse MSigDB collections: ",
+      conditionMessage(e)
+    )
+  }
+)
+
+required_collection_columns <- c(
+  "gs_collection",
+  "gs_subcollection"
+)
+
+if (!all(required_collection_columns %in% colnames(mouse_collections))) {
+  stop(
+    "msigdbr_collections(db_species = 'MM') did not return the expected ",
+    "columns: ",
+    paste(required_collection_columns, collapse = ", ")
+  )
+}
+
+collection_name <- if (
+  "gs_collection_name" %in% colnames(mouse_collections)
+) {
+  as.character(mouse_collections$gs_collection_name)
+} else {
+  rep("", nrow(mouse_collections))
+}
+
+mouse_subcollections <- as.character(
+  mouse_collections$gs_subcollection
+)
+
+# Match GO Biological Process by its descriptive name when available, or by
+# known subcollection labels used by different msigdbr releases.
+is_go_bp <- grepl(
+  "GO Biological Process",
+  collection_name,
+  ignore.case = TRUE
+) |
+  toupper(mouse_subcollections) %in% c(
+    "GO:BP",
+    "BP"
+  )
+
+go_bp_candidates <- mouse_collections[
+  is_go_bp,
+  ,
+  drop = FALSE
+]
+
+if (nrow(go_bp_candidates) == 0) {
+  available_mouse_collections <- paste(
+    paste0(
+      mouse_collections$gs_collection,
+      "/",
+      mouse_collections$gs_subcollection
+    ),
+    collapse = ", "
+  )
+  
+  stop(
+    "No native mouse GO Biological Process collection was found in the ",
+    "installed msigdbr database. Available mouse collections are: ",
+    available_mouse_collections
+  )
+}
+
+# Prefer the candidate explicitly described as GO Biological Process.
+candidate_priority <- ifelse(
+  grepl(
+    "GO Biological Process",
+    if (
+      "gs_collection_name" %in% colnames(go_bp_candidates)
+    ) {
+      as.character(go_bp_candidates$gs_collection_name)
+    } else {
+      rep("", nrow(go_bp_candidates))
+    },
+    ignore.case = TRUE
+  ),
+  0L,
+  1L
+)
+
+go_bp_candidates <- go_bp_candidates[
+  order(candidate_priority),
+  ,
+  drop = FALSE
+]
+
+mouse_go_collection <- as.character(
+  go_bp_candidates$gs_collection[1]
+)
+
+mouse_go_subcollection_reported <- as.character(
+  go_bp_candidates$gs_subcollection[1]
+)
+
+# Some msigdbr releases report "GO:BP" in msigdbr_collections(), while some
+# interfaces accept "BP". Try only native-mouse variants of the discovered
+# subcollection; never fall back to the human database.
+subcollection_candidates <- unique(
+  c(
+    mouse_go_subcollection_reported,
+    sub("^GO:", "", mouse_go_subcollection_reported),
+    "GO:BP",
+    "BP"
+  )
+)
+
+subcollection_candidates <- subcollection_candidates[
+  !is.na(subcollection_candidates) &
+    nzchar(subcollection_candidates)
+]
+
+msig <- NULL
+retrieval_errors <- character()
+msig_subcollection_used <- NA_character_
+
+for (subcollection_try in subcollection_candidates) {
+  
+  msig_args <- list(
+    db_species = "MM",
+    species = "Mus musculus"
+  )
+  
+  if (
+    all(
+      c(
+        "collection",
+        "subcollection"
+      ) %in% msig_formals
+    )
+  ) {
+    msig_args$collection <- mouse_go_collection
+    msig_args$subcollection <- subcollection_try
+  } else if (
+    all(
+      c(
+        "category",
+        "subcategory"
+      ) %in% msig_formals
+    )
+  ) {
+    msig_args$category <- mouse_go_collection
+    msig_args$subcategory <- subcollection_try
+  } else {
+    stop(
+      "The installed msigdbr version has no supported collection arguments."
+    )
+  }
+  
+  attempt <- tryCatch(
+    do.call(
+      msigdbr::msigdbr,
+      msig_args
+    ),
+    error = function(e) e
+  )
+  
+  if (
+    !inherits(
+      attempt,
+      "error"
+    ) &&
+    is.data.frame(attempt) &&
+    nrow(attempt) > 0
+  ) {
+    msig <- attempt
+    msig_subcollection_used <- subcollection_try
+    break
+  }
+  
+  retrieval_errors <- c(
+    retrieval_errors,
+    paste0(
+      mouse_go_collection,
+      "/",
+      subcollection_try,
+      ": ",
+      if (
+        inherits(
+          attempt,
+          "error"
+        )
+      ) {
+        conditionMessage(attempt)
+      } else {
+        "returned no rows"
+      }
+    )
+  )
+}
+
+if (is.null(msig)) {
+  stop(
+    "Native mouse GO:BP retrieval failed for every discovered identifier. ",
+    "Attempts: ",
+    paste(
+      retrieval_errors,
+      collapse = " | "
+    )
+  )
+}
+
+msig_collection_used <- mouse_go_collection
+
+# Verify that the returned data really came from the native mouse database.
+msigdb_target_species <- if (
+  "db_target_species" %in% colnames(msig)
+) {
+  paste(
+    unique(
+      as.character(msig$db_target_species)
+    ),
+    collapse = ";"
+  )
+} else {
+  "not reported by installed msigdbr"
+}
+
+if (
+  "db_target_species" %in% colnames(msig)
+) {
+  returned_target <- unique(
+    toupper(
+      as.character(msig$db_target_species)
+    )
+  )
+  
+  returned_target <- returned_target[
+    !is.na(returned_target) &
+      nzchar(returned_target)
+  ]
+  
+  if (
+    length(returned_target) > 0 &&
+    any(
+      !returned_target %in% c(
+        "MM",
+        "MUS MUSCULUS",
+        "MOUSE"
+      )
+    )
+  ) {
+    stop(
+      "msigdbr did not return the native mouse database. Returned ",
+      "db_target_species value(s): ",
+      paste(
+        returned_target,
+        collapse = ", "
+      )
+    )
+  }
+}
+
+# Verify the returned collection whenever the metadata columns are available.
+if (
+  "gs_collection" %in% colnames(msig) &&
+  any(
+    as.character(msig$gs_collection) != msig_collection_used
+  )
+) {
+  stop(
+    "The retrieved gene sets contain an unexpected collection identifier."
+  )
+}
+
+if (
+  "gs_subcollection" %in% colnames(msig)
+) {
+  returned_subcollections <- unique(
+    as.character(msig$gs_subcollection)
+  )
+  
+  if (
+    !any(
+      toupper(returned_subcollections) %in% c(
+        "GO:BP",
+        "BP"
+      )
+    )
+  ) {
+    stop(
+      "The retrieved native mouse collection is not GO Biological Process. ",
+      "Returned subcollection value(s): ",
+      paste(
+        returned_subcollections,
+        collapse = ", "
+      )
+    )
+  }
+}
+
+msigdb_version_used <- if (
+  "db_version" %in% colnames(msig)
+) {
+  paste(
+    unique(
+      as.character(msig$db_version)
+    ),
+    collapse = ";"
+  )
+} else {
+  "not reported by installed msigdbr"
+}
+
+report(
+  "Native mouse MSigDB collection selected: ",
+  msig_collection_used,
+  "/",
+  msig_subcollection_used
+)
+
+report(
+  "Native mouse MSigDB version: ",
+  msigdb_version_used
+)
+
+if (!all(c("gs_name", "gene_symbol") %in% colnames(msig))) {
+  stop("msigdbr output lacks 'gs_name' / 'gene_symbol'.")
+}
+
+pathways_all <- lapply(split(msig$gene_symbol, msig$gs_name), unique)
+pathways_in_universe <- lapply(pathways_all, intersect, universe)
+size_original <- lengths(pathways_all)
+size_universe <- lengths(pathways_in_universe)
+tested_flag <- size_universe >= min_pathway_size & size_universe <= max_pathway_size
+pathways_tested <- pathways_in_universe[tested_flag]
+
+qc_paths <- data.frame(
+  pathway = names(pathways_all),
+  size_original = as.integer(size_original),
+  size_in_tested_universe = as.integer(size_universe),
+  proportion_represented = round(size_universe / pmax(size_original, 1), 4),
+  tested = tested_flag,
+  stringsAsFactors = FALSE
+)
+qc_paths <- qc_paths[order(-qc_paths$tested, qc_paths$pathway), ]
+write_out(qc_paths, "qc_pathway_coverage.csv")
+
+report("GO:BP terms retrieved: ", length(pathways_all))
+report("GO:BP terms testable (size ", min_pathway_size, "-", max_pathway_size,
+       " within the universe): ", length(pathways_tested))
+if (length(pathways_tested) == 0) stop("No testable GO:BP terms. Check symbol formatting.")
+
+pathway_indices <- limma::ids2indices(pathways_tested, universe, remove.empty = FALSE)
+
+# =============================================================================
+# 9. PRIMARY RANKINGS
+# =============================================================================
+
+hdr("6. Primary rankings and fgsea")
+
+primary_stat <- gene_stats$between_stage_var_adjusted
+tie_seed_primary <- master_seed + 1L
+
+ranks_stable <- make_priority_ranking(primary_stat, universe,
+                                      low_at_top = TRUE, tie_seed = tie_seed_primary)
+ranks_variable <- reverse_ranking(ranks_stable)
+
+stopifnot(
+  identical(sort(names(ranks_stable)), sort(names(ranks_variable))),
+  identical(names(ranks_stable), rev(names(ranks_variable))),
+  !anyDuplicated(names(ranks_stable)),
+  all(ranks_stable > 0), all(ranks_variable > 0),
+  !anyDuplicated(as.numeric(ranks_stable))
+)
+
+n_exact_ties <- sum(duplicated(primary_stat))
+report("Exact ties in the primary statistic: ", n_exact_ties,
+       " (resolved by a seeded random permutation, seed ", tie_seed_primary, ")")
+
+rank_table <- function(ranks) {
+  idx <- match(names(ranks), gene_stats$Gene_name)
+  data.frame(
+    Gene_name = names(ranks),
+    rank_position = seq_along(ranks),
+    priority_score = as.numeric(ranks),
+    between_stage_var_adjusted = gene_stats$between_stage_var_adjusted[idx],
+    between_stage_var_raw = gene_stats$between_stage_var_raw[idx],
+    mean_logCPM = gene_stats$mean_logCPM[idx],
+    is_sex_linked = gene_stats$is_sex_linked[idx],
+    stringsAsFactors = FALSE
+  )
+}
+write_out(rank_table(ranks_stable), "ranking_primary_stable_first.csv")
+write_out(rank_table(ranks_variable), "ranking_primary_variable_first.csv")
+
+# Sex-linked gene QC: positions in the primary ranking. These genes are RETAINED
+# in the analysis and adjusted for in the model; this table exists so that any
+# influence they have is visible.
+sl_tab <- rank_table(ranks_stable)
+sl_tab <- sl_tab[sl_tab$is_sex_linked, ]
+if (nrow(sl_tab)) {
+  sl_tab$percentile_in_stable_ranking <-
+    round(sl_tab$rank_position / length(ranks_stable), 4)
+}
+write_out(sl_tab, "qc_sex_linked_gene_ranks.csv")
+
+# =============================================================================
+# 10. PRIMARY fgsea AND JOINT FDR
+# =============================================================================
+
+fg_stable <- run_one_sided_fgsea(
+  ranks_stable, pathways_tested,
+  "Primary: low-to-high adjusted between-stage variance (stable end)",
+  seed = master_seed + 101
+)
+fg_variable <- run_one_sided_fgsea(
+  ranks_variable, pathways_tested,
+  "Primary: high-to-low adjusted between-stage variance (variable end)",
+  seed = master_seed + 102
+)
+fg_stable$direction   <- "stable_end"
+fg_variable$direction <- "variable_end"
+
+# ONE Benjamini-Hochberg correction across the two primary result tables.
+# Exploratory sensitivity analyses are never included in this family.
+primary_combined <- rbind(fg_stable, fg_variable)
+primary_combined$padj_primary_global <- p.adjust(primary_combined$pval, method = "BH")
+primary_combined <- primary_combined[order(primary_combined$padj_primary_global,
+                                           primary_combined$pval), ]
+
+fg_stable$padj_primary_global <- primary_combined$padj_primary_global[
+  match(paste(fg_stable$pathway, "stable_end"),
+        paste(primary_combined$pathway, primary_combined$direction))]
+fg_variable$padj_primary_global <- primary_combined$padj_primary_global[
+  match(paste(fg_variable$pathway, "variable_end"),
+        paste(primary_combined$pathway, primary_combined$direction))]
+
+write_out(fg_stable, "fgsea_primary_stable_all.csv")
+write_out(fg_variable, "fgsea_primary_variable_all.csv")
+write_out(primary_combined, "fgsea_primary_combined_global_FDR.csv")
+
+n_sig_stable   <- sum(fg_stable$padj_primary_global < fdr_cutoff, na.rm = TRUE)
+n_sig_variable <- sum(fg_variable$padj_primary_global < fdr_cutoff, na.rm = TRUE)
+
+# =============================================================================
+# 11. REDUNDANCY COLLAPSING
+# =============================================================================
+
+main_stable <- collapse_significant(fg_stable, ranks_stable, pathways_tested,
+                                    seed = master_seed + 201)
+main_variable <- collapse_significant(fg_variable, ranks_variable, pathways_tested,
+                                      seed = master_seed + 202)
+
+collapsed_stable <- fg_stable[fg_stable$pathway %in% main_stable &
+                                fg_stable$padj_primary_global < fdr_cutoff, ]
+collapsed_variable <- fg_variable[fg_variable$pathway %in% main_variable &
+                                    fg_variable$padj_primary_global < fdr_cutoff, ]
+collapsed_stable <- collapsed_stable[order(collapsed_stable$padj_primary_global,
+                                           collapsed_stable$pval), ]
+collapsed_variable <- collapsed_variable[order(collapsed_variable$padj_primary_global,
+                                               collapsed_variable$pval), ]
+
+write_out(collapsed_stable, "fgsea_primary_stable_collapsed.csv")
+write_out(collapsed_variable, "fgsea_primary_variable_collapsed.csv")
+
+report("Significant terms at the stable end (joint FDR < ", fdr_cutoff, "): ",
+       n_sig_stable, " before collapsing, ", nrow(collapsed_stable), " after")
+report("Significant terms at the variable end (joint FDR < ", fdr_cutoff, "): ",
+       n_sig_variable, " before collapsing, ", nrow(collapsed_variable), " after")
+
+both_ends <- intersect(collapsed_stable$pathway, collapsed_variable$pathway)
+if (length(both_ends)) {
+  warning(length(both_ends), " term(s) reach significance at BOTH ends of the ",
+          "same ranking and are bimodal; they must not be described as having ",
+          "relatively low or relatively high between-stage variance: ",
+          paste(head(both_ends, 10), collapse = ", "))
+}
+
+# =============================================================================
+# 12. SENSITIVITY ANALYSES (separate FDR families, never merged with primary)
+# =============================================================================
+
+hdr("7. Sensitivity analyses")
+
+run_mirrored_sensitivity <- function(stat, label_low, label_high, tie_seed,
+                                     seed_a, seed_b, family_name) {
+  r_low  <- make_priority_ranking(stat, universe, low_at_top = TRUE, tie_seed = tie_seed)
+  r_high <- reverse_ranking(r_low)
+  a <- run_one_sided_fgsea(r_low, pathways_tested, label_low, seed_a)
+  b <- run_one_sided_fgsea(r_high, pathways_tested, label_high, seed_b)
+  a$direction <- "stable_end"; b$direction <- "variable_end"
+  out <- rbind(a, b)
+  out$sensitivity_family <- family_name
+  out$padj_sensitivity_family <- p.adjust(out$pval, method = "BH")
+  out[order(out$padj_sensitivity_family, out$pval), ]
+}
+
+if (run_sensitivity_total_variance) {
+  sens_total <- run_mirrored_sensitivity(
+    gene_stats$total_var_adjusted,
+    "Sensitivity S1: low mean-adjusted TOTAL logCPM variance",
+    "Sensitivity S1: high mean-adjusted TOTAL logCPM variance",
+    tie_seed = master_seed + 11, seed_a = master_seed + 111, seed_b = master_seed + 112,
+    family_name = "S1_total_variance_mean_adjusted"
+  )
+  write_out(sens_total, "sensitivity_total_variance_results.csv")
+  report("S1 mean-adjusted total variance: ",
+         sum(sens_total$padj_sensitivity_family < fdr_cutoff, na.rm = TRUE),
+         " significant terms in its own FDR family")
+}
+
+if (run_sensitivity_raw_between_var) {
+  sens_raw <- run_mirrored_sensitivity(
+    gene_stats$between_stage_var_raw,
+    "Sensitivity S2: low RAW between-stage variance (no mean adjustment)",
+    "Sensitivity S2: high RAW between-stage variance (no mean adjustment)",
+    tie_seed = master_seed + 12, seed_a = master_seed + 121, seed_b = master_seed + 122,
+    family_name = "S2_between_variance_raw"
+  )
+  write_out(sens_raw, "sensitivity_raw_between_variance_results.csv")
+  report("S2 raw between-stage variance: ",
+         sum(sens_raw$padj_sensitivity_family < fdr_cutoff, na.rm = TRUE),
+         " significant terms in its own FDR family")
+}
+
+# S3: exploratory confidence-bound rankings, built INDEPENDENTLY of each other.
+if (run_sensitivity_equivalence) {
+  r_eq_stable <- make_priority_ranking(gene_stats$max_contrast_ub, universe,
+                                       low_at_top = TRUE, tie_seed = master_seed + 13)
+  r_eq_variable <- make_priority_ranking(gene_stats$max_contrast_lb, universe,
+                                         low_at_top = FALSE, tie_seed = master_seed + 14)
+  eq_a <- run_one_sided_fgsea(
+    r_eq_stable, pathways_tested,
+    "Sensitivity S3 (EXPLORATORY): low upper confidence bound on the largest stage contrast",
+    seed = master_seed + 131)
+  eq_b <- run_one_sided_fgsea(
+    r_eq_variable, pathways_tested,
+    "Sensitivity S3 (EXPLORATORY): high lower confidence bound on the largest stage contrast",
+    seed = master_seed + 132)
+  eq_a$direction <- "compatible_with_stability"
+  eq_b$direction <- "evidence_of_stage_response"
+  sens_eq <- rbind(eq_a, eq_b)
+  sens_eq$sensitivity_family <- "S3_confidence_bounds_EXPLORATORY"
+  sens_eq$padj_sensitivity_family <- p.adjust(sens_eq$pval, method = "BH")
+  sens_eq$note <- paste(
+    "EXPLORATORY unless prespecified. The two rankings are constructed",
+    "independently and are deliberately NOT mirrors: the reverse of an",
+    "upper-bound ranking is not a ranking of confidently stage-responsive genes."
+  )
+  write_out(sens_eq[order(sens_eq$padj_sensitivity_family, sens_eq$pval), ],
+            "sensitivity_confidence_bound_results.csv")
+  report("S3 exploratory confidence bounds: ",
+         sum(sens_eq$padj_sensitivity_family < fdr_cutoff, na.rm = TRUE),
+         " significant terms in its own FDR family")
+}
+
+# S4: optional exclusion of configured sex-linked symbols. This sensitivity is
+# performed on a separate universe and never changes the primary analysis.
+if (run_sex_gene_exclusion_sensitivity) {
+  sex_excluded_stats <- gene_stats[!gene_stats$is_sex_linked, ]
+  universe_sex_excluded <- sex_excluded_stats$Gene_name
+  
+  pathways_sex_excluded <- lapply(
+    pathways_all,
+    intersect,
+    universe_sex_excluded
+  )
+  sizes_sex_excluded <- lengths(pathways_sex_excluded)
+  pathways_sex_excluded <- pathways_sex_excluded[
+    sizes_sex_excluded >= min_pathway_size &
+      sizes_sex_excluded <= max_pathway_size
+  ]
+  if (!length(pathways_sex_excluded)) {
+    stop("No testable GO:BP terms remain after sex-linked-gene exclusion.")
+  }
+  
+  stat_sex_excluded <- sex_excluded_stats$between_stage_var_adjusted
+  ranks_sex_excluded_stable <- make_priority_ranking(
+    stat_sex_excluded,
+    universe_sex_excluded,
+    low_at_top = TRUE,
+    tie_seed = master_seed + 401
+  )
+  ranks_sex_excluded_variable <- reverse_ranking(
+    ranks_sex_excluded_stable
+  )
+  
+  sex_sens_stable <- run_one_sided_fgsea(
+    ranks_sex_excluded_stable,
+    pathways_sex_excluded,
+    "Sensitivity S4: sex-linked symbols excluded, stable end",
+    seed = master_seed + 411
+  )
+  sex_sens_variable <- run_one_sided_fgsea(
+    ranks_sex_excluded_variable,
+    pathways_sex_excluded,
+    "Sensitivity S4: sex-linked symbols excluded, variable end",
+    seed = master_seed + 412
+  )
+  sex_sens_stable$direction <- "stable_end"
+  sex_sens_variable$direction <- "variable_end"
+  
+  sex_sens_combined <- rbind(sex_sens_stable, sex_sens_variable)
+  sex_sens_combined$padj_sex_excluded_joint <- p.adjust(
+    sex_sens_combined$pval,
+    method = "BH"
+  )
+  sex_sens_combined <- sex_sens_combined[
+    order(sex_sens_combined$padj_sex_excluded_joint,
+          sex_sens_combined$pval),
+  ]
+  
+  sex_sens_stable$padj_sex_excluded_joint <-
+    sex_sens_combined$padj_sex_excluded_joint[
+      match(
+        paste(sex_sens_stable$pathway, "stable_end"),
+        paste(sex_sens_combined$pathway, sex_sens_combined$direction)
+      )
+    ]
+  sex_sens_variable$padj_sex_excluded_joint <-
+    sex_sens_combined$padj_sex_excluded_joint[
+      match(
+        paste(sex_sens_variable$pathway, "variable_end"),
+        paste(sex_sens_combined$pathway, sex_sens_combined$direction)
+      )
+    ]
+  
+  write_out(
+    sex_sens_stable,
+    "sensitivity_sex_linked_excluded_stable.csv"
+  )
+  write_out(
+    sex_sens_variable,
+    "sensitivity_sex_linked_excluded_variable.csv"
+  )
+  write_out(
+    sex_sens_combined,
+    "sensitivity_sex_linked_excluded_combined_FDR.csv"
+  )
+  report(
+    "S4 sex-linked-gene exclusion sensitivity: ",
+    sum(sex_sens_stable$padj_sex_excluded_joint < fdr_cutoff,
+        na.rm = TRUE),
+    " stable-end and ",
+    sum(sex_sens_variable$padj_sex_excluded_joint < fdr_cutoff,
+        na.rm = TRUE),
+    " variable-end terms"
+  )
+}
+
+# S5: cameraPR. A competitive preranked gene-set sensitivity analysis using a
+# SPECIFIED inter-gene correlation of 0.01. This value is assumed, not estimated
+# per pathway. cameraPR P values are exported separately, are never combined
+# with fgsea P values, and are not a requirement for the primary conclusions.
+if (run_sensitivity_camerapr) {
+  cam_stable <- run_camerapr(
+    ranks_stable[universe],
+    universe,
+    pathway_indices,
+    inter_gene_cor = 0.01
+  )
+  cam_variable <- run_camerapr(
+    ranks_variable[universe],
+    universe,
+    pathway_indices,
+    inter_gene_cor = 0.01
+  )
+  cam_stable$analysis <-
+    "cameraPR sensitivity: relatively low adjusted between-stage variance"
+  cam_variable$analysis <-
+    "cameraPR sensitivity: relatively high adjusted between-stage variance"
+  cam_stable$direction <- "stable_end"
+  cam_variable$direction <- "variable_end"
+  
+  camera_combined <- rbind(cam_stable, cam_variable)
+  camera_combined$padj_camerapr_joint <- p.adjust(
+    camera_combined$p_one_sided,
+    method = "BH"
+  )
+  camera_combined <- camera_combined[
+    order(camera_combined$padj_camerapr_joint,
+          camera_combined$p_one_sided),
+  ]
+  
+  cam_stable$padj_camerapr_joint <- camera_combined$padj_camerapr_joint[
+    match(
+      paste(cam_stable$pathway, "stable_end"),
+      paste(camera_combined$pathway, camera_combined$direction)
+    )
+  ]
+  cam_variable$padj_camerapr_joint <- camera_combined$padj_camerapr_joint[
+    match(
+      paste(cam_variable$pathway, "variable_end"),
+      paste(camera_combined$pathway, camera_combined$direction)
+    )
+  ]
+  
+  write_out(cam_stable, "cameraPR_primary_stable.csv")
+  write_out(cam_variable, "cameraPR_primary_variable.csv")
+  write_out(camera_combined, "cameraPR_primary_combined_joint_FDR.csv")
+  report(
+    "cameraPR sensitivity (specified inter-gene correlation 0.01; joint BH): ",
+    sum(cam_stable$padj_camerapr_joint < fdr_cutoff, na.rm = TRUE),
+    " stable-end and ",
+    sum(cam_variable$padj_camerapr_joint < fdr_cutoff, na.rm = TRUE),
+    " variable-end terms"
+  )
+}
+
+# =============================================================================
+# 13. FIGURES
+# =============================================================================
+
+hdr("8. Figures")
+
+fdr_axis <- function(p) pmin(-log10(pmax(p, fgsea_eps)), -log10(fgsea_eps))
+
+empty_panel <- function(msg) {
+  ggplot() + annotate("text", x = 0, y = 0, label = msg, size = 4) +
+    theme_void(base_size = 12)
+}
+
+prep_plot_df <- function(df, n_show) {
+  if (!nrow(df)) return(df)
+  df <- df[order(df$padj_primary_global, df$pval), ]
+  df <- head(df, n_show)
+  df$label <- clean_go_name(df$pathway)
+  df$label <- make.unique(df$label)
+  df$neglog10_fdr <- fdr_axis(df$padj_primary_global)
+  df$label <- factor(df$label, levels = rev(df$label))
+  df
+}
+
+single_panel <- function(df, title_text) {
+  if (!nrow(df)) return(empty_panel("No terms reached the joint primary FDR threshold."))
+  ggplot(df, aes(x = neglog10_fdr, y = label)) +
+    geom_segment(aes(x = 0, xend = neglog10_fdr, y = label, yend = label),
+                 colour = "grey75") +
+    geom_point(aes(size = size), colour = "grey20") +
+    geom_vline(xintercept = -log10(fdr_cutoff), linetype = "dashed") +
+    scale_size_continuous(name = "Genes in term\n(within universe)") +
+    theme_classic(base_size = 11) +
+    theme(plot.title = element_text(size = 11)) +
+    labs(title = title_text,
+         subtitle = paste0("Benjamini-Hochberg adjusted P calculated JOINTLY over ",
+                           "the stable and variable primary analyses; dashed line = FDR ",
+                           fdr_cutoff, ". Values floored at 1e-", -log10(fgsea_eps), "."),
+         x = expression(-log[10]*"(joint primary adjusted P)"),
+         y = NULL)
+}
+
+df_stable_plot   <- prep_plot_df(collapsed_stable, top_n_plot)
+df_variable_plot <- prep_plot_df(collapsed_variable, top_n_plot)
+
+p_stable <- single_panel(
+  df_stable_plot,
+  "GO terms enriched among genes with relatively low between-stage variance")
+p_variable <- single_panel(
+  df_variable_plot,
+  "GO terms enriched among genes with relatively high between-stage variance")
+
+ggsave(file.path(outdir, "figure_primary_stable_neglog10FDR.pdf"),
+       p_stable, width = 9, height = 5.5)
+ggsave(file.path(outdir, "figure_primary_variable_neglog10FDR.pdf"),
+       p_variable, width = 9, height = 5.5)
+
+# Combined two-panel figure (facetted, so no extra package dependency).
+comb <- rbind(
+  if (nrow(df_stable_plot)) transform(
+    df_stable_plot[, c("pathway", "size", "neglog10_fdr")],
+    panel = "Relatively low between-stage variance") else NULL,
+  if (nrow(df_variable_plot)) transform(
+    df_variable_plot[, c("pathway", "size", "neglog10_fdr")],
+    panel = "Relatively high between-stage variance") else NULL
+)
+
+if (!is.null(comb) && nrow(comb)) {
+  comb$panel <- factor(comb$panel, levels = c("Relatively low between-stage variance",
+                                              "Relatively high between-stage variance"))
+  comb$plot_key <- paste(clean_go_name(comb$pathway), comb$panel, sep = "___")
+  comb <- comb[order(comb$panel, comb$neglog10_fdr), ]
+  comb$plot_key <- factor(comb$plot_key, levels = unique(comb$plot_key))
+  p_comb <- ggplot(comb, aes(x = neglog10_fdr, y = plot_key)) +
+    geom_segment(aes(x = 0, xend = neglog10_fdr, y = plot_key, yend = plot_key),
+                 colour = "grey75") +
+    geom_point(aes(size = size), colour = "grey20") +
+    geom_vline(xintercept = -log10(fdr_cutoff), linetype = "dashed") +
+    facet_wrap(~panel, ncol = 1, scales = "free_y") +
+    scale_y_discrete(labels = function(x) sub("___.*$", "", x)) +
+    scale_size_continuous(name = "Genes in term") +
+    theme_classic(base_size = 10) +
+    labs(title = "GO biological process terms at the two ends of the adjusted between-stage variance ranking",
+         subtitle = paste0("Two one-sided fgsea analyses on a ranking and its exact reverse; ",
+                           "Benjamini-Hochberg adjusted P calculated jointly over both."),
+         x = expression(-log[10]*"(joint primary adjusted P)"), y = NULL)
+} else {
+  p_comb <- empty_panel("No terms reached the joint primary FDR threshold.")
+}
+ggsave(file.path(outdir, "figure_primary_combined.pdf"), p_comb, width = 9.5, height = 10)
+
+# =============================================================================
+# 14. PROVENANCE, SESSION INFO, FILE CHECK
+# =============================================================================
+
+hdr("9. Provenance")
+
+prov <- c(
+  paste("Run date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
+  paste("Master seed:", master_seed),
+  paste("Primary tie-break seed:", tie_seed_primary),
+  "",
+  "PRIMARY STATISTIC: mean-adjusted between-stage variance",
+  "  = loess residual of log2(variance of covariate-adjusted stage means + offset)",
+  "    regressed on mean logCPM",
+  paste("  loess span:", loess_span),
+  paste("  variance offset:", signif(adj_between$offset, 6)),
+  paste("  exact ties in the primary statistic:", n_exact_ties),
+  "",
+  paste("Design formula:", design_terms),
+  paste("Design rank:", design_rank, "of", ncol(design), "columns"),
+  paste("Residual degrees of freedom:", resid_df),
+  paste("duplicateCorrelation consensus:",
+        if (is.na(dupcor_used)) "not used (independent samples)" else round(dupcor_used, 4)),
+  paste("Stages:", paste(stage_levels, collapse = ", ")),
+  paste("Sex modelled:", has_sex, "| Batch modelled:", has_batch,
+        "| Repeated measures:", has_animal),
+  "",
+  paste("Mouse-symbol aggregation policy:", duplicate_symbol_method),
+  paste("Non-integer counts allowed:", allow_noninteger_counts),
+  paste("Source loci in count matrix:", n_loci_total),
+  paste("Loci with unique mouse symbol:", n_loci_unique_map),
+  paste("Ambiguous loci dropped:", n_loci_ambiguous),
+  paste("Unmapped loci dropped:", n_loci_unmapped),
+  paste("Genes after filterByExpr:", sum(keep)),
+  paste("Genes in the enrichment universe:", length(universe)),
+  paste("Testable GO:BP terms:", length(pathways_tested)),
+  paste("MSigDB database species: MM (native mouse)"),
+  paste("MSigDB target species:", msigdb_target_species),
+  paste("MSigDB version:", msigdb_version_used),
+  paste("MSigDB collection:", msig_collection_used),
+  paste("MSigDB subcollection:", msig_subcollection_used),
+  "",
+  paste("fgsea: scoreType = pos, gseaParam = 0, eps =", fgsea_eps,
+        ", nPermSimple =", n_perm_simple, ", BPPARAM = SerialParam()"),
+  paste("collapsePathways nperm:", collapse_nperm),
+  paste("FDR: single BH across the two primary result tables;",
+        "sensitivity analyses corrected separately"),
+  paste("Separate sex-linked-gene exclusion sensitivity run:",
+        run_sex_gene_exclusion_sensitivity),
+  "",
+  paste("R:", R.version.string),
+  paste("fgsea:", as.character(packageVersion("fgsea"))),
+  paste("msigdbr:", as.character(packageVersion("msigdbr"))),
+  paste("limma:", as.character(packageVersion("limma"))),
+  paste("edgeR:", as.character(packageVersion("edgeR"))),
+  paste("ggplot2:", as.character(packageVersion("ggplot2"))),
+  "",
+  "INTERPRETATION: enrichment is competitive and relative to the tested",
+  "transcriptome. NES is positive by construction with scoreType = 'pos' and",
+  "its sign carries no biological meaning. Low between-stage variance is not",
+  "evidence that a biological process is invariant, and is not upregulation or",
+  "downregulation."
+)
+writeLines(prov, file.path(outdir, "run_provenance.txt"))
+capture.output(sessionInfo(), file = file.path(outdir, "sessionInfo.txt"))
+
+expected_files <- c(
+  "qc_sample_stage_sex_table.csv", "qc_design_matrix.csv",
+  "qc_ortholog_mapping_summary.csv", "qc_duplicate_mouse_symbol_mapping.csv",
+  "qc_pathway_coverage.csv", "qc_sex_linked_gene_ranks.csv",
+  "qc_mean_dependence_check.csv",
+  "per_gene_primary_stability_statistics.csv",
+  "ranking_primary_stable_first.csv", "ranking_primary_variable_first.csv",
+  "fgsea_primary_stable_all.csv", "fgsea_primary_variable_all.csv",
+  "fgsea_primary_combined_global_FDR.csv",
+  "fgsea_primary_stable_collapsed.csv", "fgsea_primary_variable_collapsed.csv",
+  "figure_primary_stable_neglog10FDR.pdf",
+  "figure_primary_variable_neglog10FDR.pdf", "figure_primary_combined.pdf",
+  "qc_mean_between_variance_before_adjustment.pdf",
+  "qc_mean_between_variance_after_adjustment.pdf",
+  "qc_voom_mean_variance_trend.pdf",
+  "run_provenance.txt", "sessionInfo.txt"
+)
+if (run_sensitivity_total_variance)
+  expected_files <- c(expected_files, "sensitivity_total_variance_results.csv")
+if (run_sensitivity_raw_between_var)
+  expected_files <- c(expected_files, "sensitivity_raw_between_variance_results.csv")
+if (run_sensitivity_equivalence)
+  expected_files <- c(expected_files, "sensitivity_confidence_bound_results.csv")
+if (run_sex_gene_exclusion_sensitivity)
+  expected_files <- c(
+    expected_files,
+    "sensitivity_sex_linked_excluded_stable.csv",
+    "sensitivity_sex_linked_excluded_variable.csv",
+    "sensitivity_sex_linked_excluded_combined_FDR.csv"
+  )
+if (run_sensitivity_camerapr)
+  expected_files <- c(
+    expected_files,
+    "cameraPR_primary_stable.csv",
+    "cameraPR_primary_variable.csv",
+    "cameraPR_primary_combined_joint_FDR.csv"
+  )
+
+# --- final internal-consistency checks ---------------------------------------
+if (!identical(sort(names(ranks_stable)), sort(names(ranks_variable)))) {
+  stop("Primary stable and variable rankings do not contain identical genes.")
+}
+if (!identical(names(ranks_stable), rev(names(ranks_variable)))) {
+  stop("The primary variable ranking is not the exact reverse of the stable ranking.")
+}
+if (any(ranks_stable <= 0) || any(ranks_variable <= 0) ||
+    anyDuplicated(as.numeric(ranks_stable)) ||
+    anyDuplicated(as.numeric(ranks_variable))) {
+  stop("Primary priority scores must be unique and strictly positive.")
+}
+if (anyNA(primary_combined$pval) || any(!is.finite(primary_combined$pval))) {
+  stop("Primary fgsea results contain missing or non-finite P values.")
+}
+if (!all(primary_combined$pathway %in% names(pathways_tested))) {
+  stop("A primary fgsea result refers to a pathway outside pathways_tested.")
+}
+expected_primary_sizes <- lengths(pathways_tested[primary_combined$pathway])
+if (!all(primary_combined$size == expected_primary_sizes)) {
+  stop("At least one primary fgsea pathway size does not match the tested universe.")
+}
+if (any(!is.finite(primary_combined$padj_primary_global)) ||
+    any(primary_combined$padj_primary_global < 0) ||
+    any(primary_combined$padj_primary_global > 1)) {
+  stop("Joint primary adjusted P values must be finite and between 0 and 1.")
+}
+if (!all(collapsed_stable$pathway %in%
+         fg_stable$pathway[fg_stable$padj_primary_global < fdr_cutoff])) {
+  stop("Collapsed stable pathways are not a subset of significant stable pathways.")
+}
+if (!all(collapsed_variable$pathway %in%
+         fg_variable$pathway[fg_variable$padj_primary_global < fdr_cutoff])) {
+  stop("Collapsed variable pathways are not a subset of significant variable pathways.")
+}
+
+missing_files <- expected_files[!file.exists(file.path(outdir, expected_files))]
+if (length(missing_files)) {
+  warning("Expected output file(s) not written: ",
+          paste(missing_files, collapse = ", "))
+} else {
+  report("All ", length(expected_files), " expected output files were written.")
+}
+
+hdr("Summary")
+report("Samples: ", nrow(meta), " across ", length(stage_levels), " stages")
+report("Genes in the enrichment universe: ", length(universe))
+report("Testable GO:BP terms: ", length(pathways_tested))
+report("Stable end: ", n_sig_stable, " significant, ", nrow(collapsed_stable), " after collapsing")
+report("Variable end: ", n_sig_variable, " significant, ", nrow(collapsed_variable), " after collapsing")
+report("Output directory: ", outdir)
+cat("\nDone.\n")
