@@ -1,397 +1,1824 @@
-#############################
-# gene_stats.R  (deduplicated per gene)
+##############################
+# gene_stats_filtered_robust_QL_with_sex_adjustment.R
+#
+# Main analysis:
+#   - filterByExpr()
+#   - TMM normalization
+#   - robust edgeR quasi-likelihood model
+#   - FDR < 0.01
+#
+# Two analyses are run separately:
+#   1. Filtered robust unadjusted model: ~ 0 + Group
+#   2. Filtered robust sex-adjusted model: ~ 0 + Group + Sex
+#
+# The volcano-plot appearance is kept the same as in the original script:
+#   - same JAMA palette
+#   - same titles and subtitles
+#   - same axis labels and shared scales
+#   - same multi-panel arrangement
+#   - same PDF dimensions
+#
+# IMPORTANT:
+# The exact points and DEG counts will change because low-expression
+# filtering is now applied, and the sex-adjusted model is a different model.
 #############################
 
-# ---- Paths ----
+
+#############################
+# Step 0: Paths and settings
+#############################
+
 expression_matrix_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
 metadata_path          <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt"
 gene_annotations_path  <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
-output_dir_path        <- "/Users/adrian/Desktop/EQU.03/"
-volcano_pdf_path       <- "/Users/adrian/Desktop/EQU.03/volcano_plots_combined_with_edgeR.pdf"
 
-# ---- Libraries ----
-library(edgeR)
-library(ggplot2)
-library(dplyr)
-library(ggrepel)      # (not used for volcanoes but fine to keep)
-library(biomaRt)
-library(ggsci)
-library(gridExtra)
-library(ggtext)
-library(grid)
+# Change this only if the metadata column has a different name.
+sex_column <- "Sex"
 
-#############################
-# Step 1: Load expression matrix
-#############################
-expression_matrix <- read.table(
-  expression_matrix_path,
-  header    = TRUE,
-  row.names = 1,
-  sep       = "\t",
-  check.names = FALSE
+group_levels <- c("SE", "TE", "TL", "AE", "AL")
+fdr_cutoff  <- 0.01
+
+# Use one formatted cutoff label for every threshold-dependent output name.
+fdr_label <- format(
+  fdr_cutoff,
+  scientific = FALSE,
+  trim = TRUE
 )
 
+# Results are written to new folders so the old manuscript files are not overwritten.
+output_root_path <- file.path(
+  "/Users/adrian/Desktop/EQU.03",
+  paste0(
+    "gene_stats_filtered_robust_QL_FDR_",
+    fdr_label
+  )
+)
+
+unadjusted_output_dir <- file.path(
+  output_root_path,
+  "01_filtered_robust_unadjusted"
+)
+
+sex_adjusted_output_dir <- file.path(
+  output_root_path,
+  "02_filtered_robust_sex_adjusted"
+)
+
+comparison_output_dir <- file.path(
+  output_root_path,
+  "03_robust_unadjusted_vs_sex_adjusted"
+)
+
+unadjusted_volcano_pdf_path <- file.path(
+  unadjusted_output_dir,
+  paste0(
+    "volcano_plots_combined_with_edgeR_FDR_lt_",
+    fdr_label,
+    ".pdf"
+  )
+)
+
+sex_adjusted_volcano_pdf_path <- file.path(
+  sex_adjusted_output_dir,
+  paste0(
+    "volcano_plots_combined_with_edgeR_FDR_lt_",
+    fdr_label,
+    ".pdf"
+  )
+)
+
+
 #############################
-# Step 2: Load sample metadata
+# Step 1: Libraries
 #############################
+
+required_packages <- c(
+  "edgeR",
+  "limma",
+  "ggplot2",
+  "dplyr",
+  "ggrepel",
+  "biomaRt",
+  "ggsci",
+  "gridExtra",
+  "ggtext",
+  "grid"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    quietly = TRUE,
+    FUN.VALUE = logical(1)
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required packages: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(limma)
+  library(ggplot2)
+  library(dplyr)
+  library(ggrepel)
+  library(biomaRt)
+  library(ggsci)
+  library(gridExtra)
+  library(ggtext)
+  library(grid)
+})
+
+
+#############################
+# Step 2: Create output folders
+#############################
+
+dir.create(
+  unadjusted_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  sex_adjusted_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  comparison_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+#############################
+# Step 3: Load expression matrix
+#############################
+
+expression_matrix <- read.table(
+  expression_matrix_path,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+expression_matrix <- as.matrix(expression_matrix)
+
+suppressWarnings(
+  storage.mode(expression_matrix) <- "numeric"
+)
+
+if (nrow(expression_matrix) == 0) {
+  stop("The expression matrix contains no genes.")
+}
+
+if (ncol(expression_matrix) == 0) {
+  stop("The expression matrix contains no samples.")
+}
+
+if (anyNA(expression_matrix)) {
+  stop(
+    "The expression matrix contains missing or non-numeric values."
+  )
+}
+
+if (any(!is.finite(expression_matrix))) {
+  stop(
+    "The expression matrix contains non-finite values."
+  )
+}
+
+if (any(expression_matrix < 0)) {
+  stop(
+    "The expression matrix contains negative values."
+  )
+}
+
+if (!all(abs(expression_matrix - round(expression_matrix)) < 1e-8)) {
+  stop(
+    "The expression matrix is not integer-like. ",
+    "edgeR requires raw read counts, not CPM, FPM, TPM, FPKM or log values."
+  )
+}
+
+if (anyDuplicated(rownames(expression_matrix))) {
+  duplicated_gene_ids <- unique(
+    rownames(expression_matrix)[duplicated(rownames(expression_matrix))]
+  )
+  
+  stop(
+    "Duplicated GeneIDs were found in the count matrix. Examples: ",
+    paste(head(duplicated_gene_ids, 20), collapse = ", ")
+  )
+}
+
+
+#############################
+# Step 4: Load and validate metadata
+#############################
+
 metadata <- read.table(
   metadata_path,
   header = TRUE,
-  sep    = "\t"
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
 )
-rownames(metadata) <- metadata$Sample
 
-# align columns
-expression_matrix <- expression_matrix[, rownames(metadata)]
+required_metadata_columns <- c(
+  "Sample",
+  "Group",
+  sex_column
+)
 
-#############################
-# Step 3: Group factor
-#############################
-metadata$Group <- factor(metadata$Group, levels = c("SE", "TE", "TL", "AE", "AL"))
-if (any(is.na(metadata$Group))) {
-  stop("Error: Some samples have invalid or missing group labels in the metadata.")
+missing_metadata_columns <- setdiff(
+  required_metadata_columns,
+  colnames(metadata)
+)
+
+if (length(missing_metadata_columns) > 0) {
+  stop(
+    "The metadata is missing these required columns: ",
+    paste(missing_metadata_columns, collapse = ", "),
+    ". If the sex column has another name, change sex_column at the top."
+  )
 }
 
-#############################
-# Step 4: DGEList + norm
-#############################
-dge <- DGEList(counts = expression_matrix, group = metadata$Group)
-dge <- calcNormFactors(dge)
-
-#############################
-# Step 5: Design + dispersion
-#############################
-design <- model.matrix(~ 0 + Group, data = metadata)  # no intercept
-colnames(design) <- levels(metadata$Group)
-
-dge  <- estimateDisp(dge, design)
-fit  <- glmQLFit(dge, design)
-
-#############################
-# Step 6: Contrasts
-#############################
-contrasts <- makeContrasts(
-  SE_vs_TE = SE - TE,
-  TE_vs_TL = TE - TL,
-  TL_vs_AE = TL - AE,
-  AE_vs_AL = AE - AL,
-  AL_vs_TE = AL - TE,
-  AL_vs_SE = AL - SE,
-  levels = design
+metadata$Sample <- trimws(
+  as.character(metadata$Sample)
 )
 
+metadata$Group <- trimws(
+  as.character(metadata$Group)
+)
+
+metadata$Sex <- trimws(
+  as.character(metadata[[sex_column]])
+)
+
+if (any(is.na(metadata$Sample) | metadata$Sample == "")) {
+  stop("The metadata contains missing or empty Sample values.")
+}
+
+if (anyDuplicated(metadata$Sample)) {
+  duplicated_samples <- unique(
+    metadata$Sample[duplicated(metadata$Sample)]
+  )
+  
+  stop(
+    "Duplicated samples were found in the metadata: ",
+    paste(duplicated_samples, collapse = ", ")
+  )
+}
+
+if (any(is.na(metadata$Group) | metadata$Group == "")) {
+  stop("The metadata contains missing or empty Group values.")
+}
+
+if (any(is.na(metadata$Sex) | metadata$Sex == "")) {
+  stop(
+    "The metadata contains missing or empty Sex values. ",
+    "The sex-adjusted model requires a sex value for every sample."
+  )
+}
+
+unexpected_groups <- setdiff(
+  unique(metadata$Group),
+  group_levels
+)
+
+if (length(unexpected_groups) > 0) {
+  stop(
+    "Unexpected Group values were found: ",
+    paste(unexpected_groups, collapse = ", "),
+    ". Expected: ",
+    paste(group_levels, collapse = ", ")
+  )
+}
+
+missing_groups <- setdiff(
+  group_levels,
+  unique(metadata$Group)
+)
+
+if (length(missing_groups) > 0) {
+  stop(
+    "The following expected groups are missing: ",
+    paste(missing_groups, collapse = ", ")
+  )
+}
+
+metadata$Group <- factor(
+  metadata$Group,
+  levels = group_levels
+)
+
+metadata$Sex <- droplevels(
+  factor(metadata$Sex)
+)
+
+if (nlevels(metadata$Sex) < 2) {
+  stop(
+    "The Sex column contains fewer than two levels, ",
+    "so a sex-adjusted model cannot be fitted."
+  )
+}
+
+rownames(metadata) <- metadata$Sample
+
+
 #############################
-# Step 7: DE per contrast, keeping one row per gene
+# Step 5: Align counts and metadata
+#############################
+
+missing_count_samples <- setdiff(
+  metadata$Sample,
+  colnames(expression_matrix)
+)
+
+if (length(missing_count_samples) > 0) {
+  stop(
+    "These metadata samples are absent from the expression matrix: ",
+    paste(missing_count_samples, collapse = ", ")
+  )
+}
+
+extra_count_samples <- setdiff(
+  colnames(expression_matrix),
+  metadata$Sample
+)
+
+if (length(extra_count_samples) > 0) {
+  message(
+    "The following count-matrix columns are not in the metadata ",
+    "and will be excluded: ",
+    paste(extra_count_samples, collapse = ", ")
+  )
+}
+
+expression_matrix <- expression_matrix[
+  ,
+  metadata$Sample,
+  drop = FALSE
+]
+
+if (!identical(colnames(expression_matrix), rownames(metadata))) {
+  stop(
+    "The expression-matrix columns and metadata rows are not aligned."
+  )
+}
+
+if (any(colSums(expression_matrix) == 0)) {
+  zero_count_samples <- colnames(expression_matrix)[
+    colSums(expression_matrix) == 0
+  ]
+  
+  stop(
+    "These samples contain zero total reads: ",
+    paste(zero_count_samples, collapse = ", ")
+  )
+}
+
+cat("\nSample composition by Group and Sex:\n")
+print(
+  table(
+    Group = metadata$Group,
+    Sex = metadata$Sex
+  )
+)
+
+
+#############################
+# Step 6: Load and prepare annotations
 #############################
 
 gene_annotations <- read.table(
   gene_annotations_path,
   header = TRUE,
-  sep    = "\t",
-  stringsAsFactors = FALSE
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
 )
+
+if (ncol(gene_annotations) == 0) {
+  stop("The annotation file contains no columns.")
+}
+
 colnames(gene_annotations)[1] <- "GeneID"
 
-if (!dir.exists(output_dir_path)) {
-  dir.create(output_dir_path, recursive = TRUE)
-}
-output_dir <- output_dir_path
-
-results_list <- list()
-
-for (contrast_name in colnames(contrasts)) {
-
-  # 1) edgeR test
-  res <- glmQLFTest(fit, contrast = contrasts[, contrast_name])
-
-  # 2) raw table exactly like the Venn script
-  raw_tab <- topTags(res, n = Inf)$table
-  raw_tab$GeneID <- rownames(raw_tab)
-
-  # 3) enforce one row per gene (just in case)
-  raw_tab <- raw_tab %>%
-    dplyr::distinct(GeneID, .keep_all = TRUE)
-
-  # 4) classify significance (this object will drive volcano + counts)
-  raw_tab <- raw_tab %>%
-    mutate(Significance = case_when(
-      FDR < 0.01 & logFC > 0 ~ "Upregulated",
-      FDR < 0.01 & logFC < 0 ~ "Downregulated",
-      TRUE                   ~ "Not Significant"
-    ))
-
-  # 5) make an *annotated* version ONLY for writing to file
-  annotated_tab <- raw_tab %>%
-    left_join(gene_annotations, by = "GeneID")
-
-  write.table(
-    annotated_tab,
-    file      = file.path(output_dir, paste0(contrast_name, "_differential_expression.txt")),
-    sep       = "\t",
-    quote     = FALSE,
-    row.names = FALSE
-  )
-
-  # 6) gene list (one per line)
-  write.table(
-    raw_tab$GeneID,
-    file      = file.path(output_dir, paste0(contrast_name, "_gene_list.txt")),
-    quote     = FALSE,
-    row.names = FALSE,
-    col.names = FALSE
-  )
-
-  # 7) store the *raw* table (per-gene) for downstream plots & stats
-  results_list[[contrast_name]] <- raw_tab
-}
-
-
-#############################
-# Step 8: Volcano plots (shared legend, per-gene counts)
-#############################
-
-my_colors <- pal_jama("default")(3)
-color_values <- c(
-  "Upregulated"     = my_colors[3],
-  "Downregulated"   = my_colors[2],
-  "Not Significant" = my_colors[1]
+gene_annotations$GeneID <- trimws(
+  as.character(gene_annotations$GeneID)
 )
 
-global_x_min <- min(sapply(results_list, function(df) min(df$logFC, na.rm = TRUE)))
-global_x_max <- max(sapply(results_list, function(df) max(df$logFC, na.rm = TRUE)))
-global_y_max <- max(sapply(results_list, function(df) max(-log10(df$FDR), na.rm = TRUE)))
+gene_annotations <- gene_annotations[
+  !is.na(gene_annotations$GeneID) &
+    gene_annotations$GeneID != "",
+  ,
+  drop = FALSE
+]
 
-plots_list <- list()
-
-for (contrast_name in names(results_list)) {
-  results <- results_list[[contrast_name]]
-
-  up_count   <- sum(results$Significance == "Upregulated")
-  down_count <- sum(results$Significance == "Downregulated")
-
-  plot_title <- gsub("_vs_", "-", contrast_name)
-
-  subtitle_text <- paste0(
-    "<span style='color:", color_values["Downregulated"], "'>Down: ", down_count, "</span>",
-    "  ",
-    "<span style='color:", color_values["Upregulated"], "'>Up: ", up_count, "</span>"
+# Keep one annotation row per count-matrix gene.
+# This prevents annotation joins from duplicating DE rows.
+gene_annotations <- gene_annotations %>%
+  dplyr::distinct(
+    GeneID,
+    .keep_all = TRUE
   )
 
-  p <- ggplot(results, aes(x = logFC, y = -log10(FDR), color = Significance)) +
-    geom_point(alpha = 0.8, size = 2) +
-    scale_color_manual(values = color_values) +
-    labs(
-      title    = plot_title,
-      subtitle = subtitle_text,
-      x        = "Log Fold Change (log2)",
-      y        = "-Log10(FDR)",
-      color    = "Significance"
-    ) +
-    scale_x_continuous(limits = c(global_x_min, global_x_max), expand = c(0, 0)) +
-    scale_y_continuous(limits = c(0, 6.5), expand = c(0, 0)) +
-    theme_classic() +
-    theme(
-      plot.title      = element_text(size = 16, face = "bold", hjust = 0.5),
-      plot.subtitle   = element_markdown(size = 14, face = "bold", hjust = 0.5),
-      axis.title      = element_text(size = 14, face = "bold"),
-      axis.text       = element_text(size = 12),
-      axis.line       = element_line(size = 1.2),
-      legend.title    = element_text(size = 12, face = "bold"),
-      legend.text     = element_text(size = 10)
-    )
-
-  plots_list[[contrast_name]] <- p
+if (!"Target_gene" %in% colnames(gene_annotations)) {
+  stop(
+    "The annotation file does not contain a Target_gene column. ",
+    "Available columns are: ",
+    paste(colnames(gene_annotations), collapse = ", ")
+  )
 }
 
-g_legend <- function(a.gplot) {
-  tmp <- ggplot_gtable(ggplot_build(a.gplot))
-  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
-  tmp$grobs[[leg]]
-}
 
-legend_grob <- g_legend(plots_list[[1]])
-plots_list  <- lapply(plots_list, function(x) x + theme(legend.position = "none"))
+#############################
+# Step 7: Create DGEList and filter low-expression genes
+#############################
 
-pdf(volcano_pdf_path, width = 14, height = 10)
-grid.arrange(
-  arrangeGrob(grobs = plots_list, nrow = 2, ncol = 3),
-  legend_grob,
-  ncol    = 2,
-  widths  = c(10, 2)
+dge_base <- DGEList(
+  counts = expression_matrix,
+  group = metadata$Group
 )
-dev.off()
-cat("Volcano plots saved in '", volcano_pdf_path, "'.\n", sep = "")
 
-#############################
-# Step 9: Collect Target_gene IDs of significant genes (per gene, per contrast)
-#############################
+genes_before_filtering <- nrow(dge_base)
 
-all_target_ids <- c()
+# Filtering is based on the biological Group variable, not Sex.
+keep <- filterByExpr(
+  dge_base,
+  group = metadata$Group
+)
 
-for (contrast_name in names(results_list)) {
-  sig <- results_list[[contrast_name]] %>%
-    filter(FDR < 0.01) %>%
-    dplyr::distinct(GeneID, .keep_all = TRUE) %>%        # safety: unique genes
-    dplyr::select(GeneID, Target_gene)
+dge_filtered <- dge_base[
+  keep,
+  ,
+  keep.lib.sizes = FALSE
+]
 
-  all_target_ids <- c(all_target_ids, sig$Target_gene)
+# TMM normalization, as in the original script.
+dge_filtered <- normLibSizes(
+  dge_filtered
+)
 
-  sig_ids <- sig$GeneID
-  write.table(
-    sig_ids,
-    file      = file.path(output_dir, paste0(contrast_name, "_significant_genes.txt")),
-    quote     = FALSE,
-    row.names = FALSE,
-    col.names = FALSE
-  )
-}
+genes_after_filtering <- nrow(dge_filtered)
+genes_removed         <- genes_before_filtering - genes_after_filtering
 
-all_target_ids <- unique(all_target_ids)
-all_target_ids <- all_target_ids[!is.na(all_target_ids) & all_target_ids != ""]
+cat("\nLow-expression filtering summary:\n")
+cat("Genes before filtering:", genes_before_filtering, "\n")
+cat("Genes retained:", genes_after_filtering, "\n")
+cat("Genes removed:", genes_removed, "\n")
 
-gs_ids    <- all_target_ids[grepl("^ENSSTOG", all_target_ids)]
-other_ids <- all_target_ids[!grepl("^ENSSTOG", all_target_ids)]
-
-ensembl_main <- useMart("ensembl", host = "https://www.ensembl.org")
-
-safe_query_biomart <- function(dataset_name, gene_ids) {
-  tryCatch({
-    dataset_mart <- useMart("ensembl", dataset = dataset_name)
-    getBM(
-      attributes = c("ensembl_gene_id", "gene_biotype"),
-      filters    = "ensembl_gene_id",
-      values     = gene_ids,
-      mart       = dataset_mart
+filtering_summary <- data.frame(
+  Measure = c(
+    "Genes_before_filtering",
+    "Genes_retained",
+    "Genes_removed",
+    "FDR_cutoff",
+    "estimateDisp_robust",
+    "glmQLFit_robust",
+    "edgeR_version",
+    "ggplot2_version"
+  ),
+  Value = as.character(
+    c(
+      genes_before_filtering,
+      genes_after_filtering,
+      genes_removed,
+      fdr_cutoff,
+      TRUE,
+      TRUE,
+      as.character(packageVersion("edgeR")),
+      as.character(packageVersion("ggplot2"))
     )
-  }, error = function(e) {
-    message(paste("Could not query dataset:", dataset_name, "- Error:", e$message))
-    data.frame(ensembl_gene_id = character(), gene_biotype = character())
-  })
-}
+  ),
+  stringsAsFactors = FALSE
+)
 
-# ground squirrel
-gs_info <- data.frame()
-if (length(gs_ids) > 0) {
-  message("Attempting to query ground squirrel genes from Ensembl...")
-  gs_dataset <- "itridecemlineatus_gene_ensembl"
-  gs_info <- safe_query_biomart(gs_dataset, gs_ids)
-
-  if (nrow(gs_info) == 0) {
-    datasets <- listDatasets(ensembl_main)
-    possible_gs <- datasets[grep("tridecemlineatus|squirrel|ictidomys",
-                                 datasets$description, ignore.case = TRUE), ]
-    if (nrow(possible_gs) > 0) {
-      alt_dataset <- possible_gs$dataset[1]
-      message(paste("Trying alternative dataset:", alt_dataset))
-      gs_info <- safe_query_biomart(alt_dataset, gs_ids)
-    }
-  }
-  if (nrow(gs_info) > 0) {
-    names(gs_info)[1] <- "Target_gene"
-    message(paste("Retrieved info for", nrow(gs_info), "ground squirrel genes"))
-  }
-}
-
-# others (mouse)
-other_info <- data.frame()
-if (length(other_ids) > 0) {
-  message("Attempting to query other genes from Ensembl using mouse dataset...")
-  mouse_dataset <- "mmusculus_gene_ensembl"
-  other_info <- safe_query_biomart(mouse_dataset, other_ids)
-
-  if (nrow(other_info) == 0) {
-    datasets <- listDatasets(ensembl_main)
-    possible_mouse <- datasets[grep("mouse|musculus",
-                                    datasets$description, ignore.case = TRUE), ]
-    if (nrow(possible_mouse) > 0) {
-      alt_dataset <- possible_mouse$dataset[1]
-      message(paste("Trying alternative dataset:", alt_dataset))
-      other_info <- safe_query_biomart(alt_dataset, other_ids)
-    }
-  }
-  if (nrow(other_info) > 0) {
-    names(other_info)[1] <- "Target_gene"
-    message(paste("Retrieved info for", nrow(other_info), "other genes"))
-  }
-}
-
-gene_info <- rbind(gs_info, other_info)
-if (nrow(gene_info) == 0) {
-  warning("No gene information returned from Ensembl. Creating minimal NA table.")
-  gene_info <- data.frame(
-    Target_gene  = all_target_ids,
-    gene_biotype = rep(NA, length(all_target_ids))
-  )
-}
-
-#############################
-# Step 10: Per-contrast summary of biotypes (per gene)
-#############################
-summary_list <- list()
-
-for (contrast_name in names(results_list)) {
-  message(paste("Processing contrast:", contrast_name))
-
-  significant_results <- results_list[[contrast_name]] %>%
-    filter(FDR < 0.01) %>%
-    dplyr::distinct(GeneID, .keep_all = TRUE)
-
-  if (nrow(significant_results) == 0) {
-    message(paste("No significant genes found for contrast:", contrast_name))
-    summary_list[[contrast_name]] <- data.frame(
-      Contrast          = contrast_name,
-      Total             = 0,
-      ProteinCoding     = 0,
-      ProteinCodingPct  = 0,
-      NonProteinCoding  = 0,
-      NonProteinCodingPct = 0,
-      Unannotated       = 0,
-      UnannotatedPct    = 0,
-      stringsAsFactors  = FALSE
-    )
-    next
-  }
-
-  significant_results <- merge(
-    significant_results,
-    gene_info,
-    by.x = "Target_gene",
-    by.y = "Target_gene",
-    all.x = TRUE
-  )
-
-  significant_results <- significant_results %>%
-    mutate(Category = case_when(
-      is.na(gene_biotype)             ~ "Unannotated",
-      gene_biotype == "protein_coding"~ "Protein coding",
-      TRUE                            ~ "Non protein coding"
-    ))
-
-  total_genes        <- nrow(significant_results)
-  protein_coding_cnt <- sum(significant_results$Category == "Protein coding")
-  non_protein_cnt    <- sum(significant_results$Category == "Non protein coding")
-  unannotated_cnt    <- sum(significant_results$Category == "Unannotated")
-
-  summary_list[[contrast_name]] <- data.frame(
-    Contrast            = contrast_name,
-    Total               = total_genes,
-    ProteinCoding       = protein_coding_cnt,
-    ProteinCodingPct    = round(100 * protein_coding_cnt / total_genes, 2),
-    NonProteinCoding    = non_protein_cnt,
-    NonProteinCodingPct = round(100 * non_protein_cnt / total_genes, 2),
-    Unannotated         = unannotated_cnt,
-    UnannotatedPct      = round(100 * unannotated_cnt / total_genes, 2),
-    stringsAsFactors    = FALSE
-  )
-}
-
-summary_df <- do.call(rbind, summary_list)
 write.table(
-  summary_df,
-  file      = file.path(output_dir, "significant_gene_annotation_summary.txt"),
-  sep       = "\t",
-  quote     = FALSE,
+  filtering_summary,
+  file = file.path(
+    output_root_path,
+    "filtering_summary.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
   row.names = FALSE
 )
-cat("\nSignificant gene annotation summary saved in '",
-    file.path(output_dir, "significant_gene_annotation_summary.txt"), "'.\n", sep = "")
+
+write.table(
+  as.data.frame(
+    table(
+      Group = metadata$Group,
+      Sex = metadata$Sex
+    )
+  ),
+  file = file.path(
+    output_root_path,
+    "sample_composition_by_group_and_sex.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+
+#############################
+# Step 8: Create unadjusted and sex-adjusted designs
+#############################
+
+# Filtered unadjusted model
+design_unadjusted <- model.matrix(
+  ~ 0 + Group,
+  data = metadata
+)
+
+colnames(design_unadjusted) <- sub(
+  "^Group",
+  "",
+  colnames(design_unadjusted)
+)
+
+# Filtered sex-adjusted model
+design_sex_adjusted <- model.matrix(
+  ~ 0 + Group + Sex,
+  data = metadata
+)
+
+colnames(design_sex_adjusted) <- sub(
+  "^Group",
+  "",
+  colnames(design_sex_adjusted)
+)
+
+check_design <- function(
+    design,
+    design_name
+) {
+  missing_group_columns <- setdiff(
+    group_levels,
+    colnames(design)
+  )
+  
+  if (length(missing_group_columns) > 0) {
+    stop(
+      design_name,
+      " is missing these group coefficients: ",
+      paste(missing_group_columns, collapse = ", ")
+    )
+  }
+  
+  if (qr(design)$rank < ncol(design)) {
+    stop(
+      design_name,
+      " is not full rank. ",
+      "Group and Sex may be completely confounded in the metadata."
+    )
+  }
+  
+  invisible(TRUE)
+}
+
+check_design(
+  design_unadjusted,
+  "Unadjusted design"
+)
+
+check_design(
+  design_sex_adjusted,
+  "Sex-adjusted design"
+)
+
+write.table(
+  design_unadjusted,
+  file = file.path(
+    unadjusted_output_dir,
+    "design_matrix.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+write.table(
+  design_sex_adjusted,
+  file = file.path(
+    sex_adjusted_output_dir,
+    "design_matrix.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+
+#############################
+# Step 9: Function to define the same contrasts
+#############################
+
+make_contrast_matrix <- function(design) {
+  makeContrasts(
+    SE_vs_TE = SE - TE,
+    TE_vs_TL = TE - TL,
+    TL_vs_AE = TL - AE,
+    AE_vs_AL = AE - AL,
+    AL_vs_TE = AL - TE,
+    AL_vs_SE = AL - SE,
+    levels = design
+  )
+}
+
+
+#############################
+# Step 10: Function to run one complete edgeR model
+#############################
+
+run_edger_model <- function(
+    dge_input,
+    design,
+    analysis_name,
+    output_dir,
+    gene_annotations,
+    fdr_cutoff
+) {
+  
+  cat("\n")
+  cat("============================================================\n")
+  cat("Starting analysis:", analysis_name, "\n")
+  cat("============================================================\n")
+  
+  full_table_dir <- file.path(
+    output_dir,
+    "full_tables"
+  )
+  
+  significant_table_dir <- file.path(
+    output_dir,
+    "significant_DEG_tables"
+  )
+  
+  all_gene_list_dir <- file.path(
+    output_dir,
+    "all_tested_gene_lists"
+  )
+  
+  significant_gene_list_dir <- file.path(
+    output_dir,
+    "significant_gene_lists"
+  )
+  
+  dir.create(
+    full_table_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  dir.create(
+    significant_table_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  dir.create(
+    all_gene_list_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  dir.create(
+    significant_gene_list_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  contrast_matrix <- make_contrast_matrix(
+    design
+  )
+  
+  write.table(
+    contrast_matrix,
+    file = file.path(
+      output_dir,
+      "contrast_matrix.txt"
+    ),
+    sep = "\t",
+    quote = FALSE,
+    row.names = TRUE,
+    col.names = NA
+  )
+  
+  # Robust negative-binomial dispersion estimation. The robust setting here
+  # identifies genes that are outliers from the mean NB dispersion trend.
+  dge_model <- estimateDisp(
+    dge_input,
+    design,
+    robust = TRUE
+  )
+  
+  # Robust quasi-likelihood fitting. This is the key robust QL step: it uses
+  # robust empirical-Bayes moderation of the genewise QL dispersions.
+  fit <- glmQLFit(
+    dge_model,
+    design,
+    robust = TRUE
+  )
+  
+  results_list <- list()
+  deg_summary_rows <- list()
+  
+  for (contrast_name in colnames(contrast_matrix)) {
+    
+    cat(
+      "Testing ",
+      analysis_name,
+      " contrast: ",
+      contrast_name,
+      "\n",
+      sep = ""
+    )
+    
+    res <- glmQLFTest(
+      fit,
+      contrast = contrast_matrix[, contrast_name]
+    )
+    
+    raw_tab <- topTags(
+      res,
+      n = Inf
+    )$table
+    
+    raw_tab$GeneID <- rownames(raw_tab)
+    rownames(raw_tab) <- NULL
+    
+    raw_tab <- raw_tab %>%
+      dplyr::distinct(
+        GeneID,
+        .keep_all = TRUE
+      ) %>%
+      dplyr::mutate(
+        negLog10FDR = -log10(
+          pmax(
+            FDR,
+            .Machine$double.xmin
+          )
+        ),
+        Significance = factor(
+          dplyr::case_when(
+            FDR < fdr_cutoff & logFC > 0 ~ "Upregulated",
+            FDR < fdr_cutoff & logFC < 0 ~ "Downregulated",
+            TRUE                         ~ "Not significant"
+          ),
+          levels = c(
+            "Downregulated",
+            "Not significant",
+            "Upregulated"
+          )
+        )
+      )
+    
+    # Annotation is added before storing results_list so Target_gene is
+    # available for the later biotype analysis.
+    annotated_tab <- raw_tab %>%
+      dplyr::left_join(
+        gene_annotations,
+        by = "GeneID"
+      )
+    
+    if (nrow(annotated_tab) != nrow(raw_tab)) {
+      stop(
+        "Annotation joining changed the number of rows for contrast ",
+        contrast_name,
+        ". Check duplicated GeneIDs in the annotation file."
+      )
+    }
+    
+    significant_tab <- annotated_tab %>%
+      dplyr::filter(
+        FDR < fdr_cutoff
+      )
+    
+    all_gene_ids <- unique(
+      annotated_tab$GeneID[
+        !is.na(annotated_tab$GeneID) &
+          annotated_tab$GeneID != ""
+      ]
+    )
+    
+    significant_gene_ids <- unique(
+      significant_tab$GeneID[
+        !is.na(significant_tab$GeneID) &
+          significant_tab$GeneID != ""
+      ]
+    )
+    
+    write.table(
+      annotated_tab,
+      file = file.path(
+        full_table_dir,
+        paste0(
+          contrast_name,
+          "_differential_expression.txt"
+        )
+      ),
+      sep = "\t",
+      quote = FALSE,
+      row.names = FALSE,
+      na = ""
+    )
+    
+    write.table(
+      significant_tab,
+      file = file.path(
+        significant_table_dir,
+        paste0(
+          contrast_name,
+          "_significant_DEGs_FDR_lt_",
+          fdr_label,
+          ".txt"
+        )
+      ),
+      sep = "\t",
+      quote = FALSE,
+      row.names = FALSE,
+      na = ""
+    )
+    
+    write.table(
+      all_gene_ids,
+      file = file.path(
+        all_gene_list_dir,
+        paste0(
+          contrast_name,
+          "_all_tested_genes.txt"
+        )
+      ),
+      quote = FALSE,
+      row.names = FALSE,
+      col.names = FALSE
+    )
+    
+    write.table(
+      significant_gene_ids,
+      file = file.path(
+        significant_gene_list_dir,
+        paste0(
+          contrast_name,
+          "_significant_genes_FDR_lt_",
+          fdr_label,
+          ".txt"
+        )
+      ),
+      quote = FALSE,
+      row.names = FALSE,
+      col.names = FALSE
+    )
+    
+    up_count <- sum(
+      raw_tab$Significance == "Upregulated",
+      na.rm = TRUE
+    )
+    
+    down_count <- sum(
+      raw_tab$Significance == "Downregulated",
+      na.rm = TRUE
+    )
+    
+    deg_summary_rows[[contrast_name]] <- data.frame(
+      Analysis = analysis_name,
+      Contrast = contrast_name,
+      Upregulated = up_count,
+      Downregulated = down_count,
+      Total_DEGs = up_count + down_count,
+      Genes_tested = nrow(raw_tab),
+      FDR_cutoff = fdr_cutoff,
+      stringsAsFactors = FALSE
+    )
+    
+    # Store the annotated per-gene result table.
+    results_list[[contrast_name]] <- annotated_tab
+  }
+  
+  deg_summary <- dplyr::bind_rows(
+    deg_summary_rows
+  )
+  
+  write.table(
+    deg_summary,
+    file = file.path(
+      output_dir,
+      paste0(
+        "DEG_summary_FDR_lt_",
+        fdr_label,
+        ".txt"
+      )
+    ),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+  
+  cat("\nDEG summary for", analysis_name, ":\n")
+  print(deg_summary)
+  
+  return(
+    list(
+      analysis_name = analysis_name,
+      dge = dge_model,
+      fit = fit,
+      design = design,
+      contrasts = contrast_matrix,
+      results_list = results_list,
+      deg_summary = deg_summary
+    )
+  )
+}
+
+
+#############################
+# Step 11: Volcano-plot function
+#
+# The visual code below retains the original figure style.
+#############################
+
+make_volcano_pdf <- function(
+    results_list,
+    volcano_pdf_path,
+    fdr_cutoff
+) {
+  
+  my_colors <- pal_jama("default")(3)
+  
+  color_values <- c(
+    "Downregulated" = my_colors[2],
+    "Not significant" = my_colors[1],
+    "Upregulated" = my_colors[3]
+  )
+  
+  global_x_min <- min(
+    vapply(
+      results_list,
+      function(df) {
+        min(df$logFC, na.rm = TRUE)
+      },
+      FUN.VALUE = numeric(1)
+    )
+  )
+  
+  global_x_max <- max(
+    vapply(
+      results_list,
+      function(df) {
+        max(df$logFC, na.rm = TRUE)
+      },
+      FUN.VALUE = numeric(1)
+    )
+  )
+  
+  global_x_range <- global_x_max - global_x_min
+  
+  global_x_padding <- if (
+    is.finite(global_x_range) &&
+    global_x_range > 0
+  ) {
+    0.03 * global_x_range
+  } else {
+    0.5
+  }
+  
+  global_y_max <- max(
+    vapply(
+      results_list,
+      function(df) {
+        finite_y <- df$negLog10FDR[
+          is.finite(df$negLog10FDR)
+        ]
+        
+        if (length(finite_y) == 0) {
+          return(0)
+        }
+        
+        max(finite_y)
+      },
+      FUN.VALUE = numeric(1)
+    )
+  )
+  
+  global_y_upper <- if (
+    is.finite(global_y_max) &&
+    global_y_max > 0
+  ) {
+    1.05 * global_y_max
+  } else {
+    1
+  }
+  
+  plots_list <- list()
+  
+  for (contrast_name in names(results_list)) {
+    
+    results <- results_list[[contrast_name]]
+    
+    up_count <- sum(
+      results$Significance == "Upregulated",
+      na.rm = TRUE
+    )
+    
+    down_count <- sum(
+      results$Significance == "Downregulated",
+      na.rm = TRUE
+    )
+    
+    plot_title <- gsub(
+      "_vs_",
+      "-",
+      contrast_name
+    )
+    
+    subtitle_text <- paste0(
+      "<span style='color:",
+      color_values["Downregulated"],
+      "'>Down: ",
+      down_count,
+      "</span>",
+      "  ",
+      "<span style='color:",
+      color_values["Upregulated"],
+      "'>Up: ",
+      up_count,
+      "</span>"
+    )
+    
+    p <- ggplot(
+      results,
+      aes(
+        x = logFC,
+        y = negLog10FDR,
+        color = Significance
+      )
+    ) +
+      geom_point(
+        alpha = 0.8,
+        size = 2
+      ) +
+      scale_color_manual(
+        values = color_values,
+        drop = FALSE
+      ) +
+      guides(
+        color = guide_legend(
+          override.aes = list(
+            size = 6,
+            alpha = 1
+          )
+        )
+      ) +
+      labs(
+        title = plot_title,
+        subtitle = subtitle_text,
+        x = "Log Fold Change (log2)",
+        y = "-Log10(FDR)",
+        color = paste0(
+          "Significance (FDR < ",
+          fdr_cutoff,
+          ")"
+        )
+      ) +
+      scale_x_continuous(
+        limits = c(
+          global_x_min - global_x_padding,
+          global_x_max + global_x_padding
+        ),
+        expand = c(0, 0)
+      ) +
+      scale_y_continuous(
+        limits = c(
+          0,
+          global_y_upper
+        ),
+        expand = c(0, 0)
+      ) +
+      theme_classic() +
+      theme(
+        plot.title = element_text(
+          size = 16,
+          face = "bold",
+          hjust = 0.5
+        ),
+        plot.subtitle = element_markdown(
+          size = 14,
+          face = "bold",
+          hjust = 0.5
+        ),
+        axis.title = element_text(
+          size = 14,
+          face = "bold"
+        ),
+        axis.text = element_text(
+          size = 12
+        ),
+        axis.line = element_line(
+          linewidth = 1.2
+        ),
+        legend.title = element_text(
+          size = 16,
+          face = "bold"
+        ),
+        legend.text = element_text(
+          size = 14,
+          margin = margin(
+            t = 5,
+            b = 5
+          )
+        ),
+        legend.key.size = grid::unit(
+          1.2,
+          "cm"
+        ),
+        legend.spacing.y = grid::unit(
+          0.35,
+          "cm"
+        ),
+        legend.key = element_blank()
+      )
+    
+    plots_list[[contrast_name]] <- p
+  }
+  
+  g_legend <- function(a_gplot) {
+    
+    tmp <- ggplot_gtable(
+      ggplot_build(a_gplot)
+    )
+    
+    grob_names <- vapply(
+      tmp$grobs,
+      function(x) {
+        x$name
+      },
+      FUN.VALUE = character(1)
+    )
+    
+    legend_positions <- grep(
+      "^guide-box",
+      grob_names
+    )
+    
+    if (length(legend_positions) == 0) {
+      return(
+        grid::nullGrob()
+      )
+    }
+    
+    grob_has_content <- function(grob) {
+      
+      if (
+        is.null(grob) ||
+        inherits(
+          grob,
+          c(
+            "zeroGrob",
+            "nullGrob"
+          )
+        )
+      ) {
+        return(FALSE)
+      }
+      
+      if (
+        inherits(grob, "gtable") ||
+        !is.null(grob$grobs)
+      ) {
+        
+        if (length(grob$grobs) == 0) {
+          return(FALSE)
+        }
+        
+        return(
+          any(
+            vapply(
+              grob$grobs,
+              grob_has_content,
+              FUN.VALUE = logical(1)
+            )
+          )
+        )
+      }
+      
+      TRUE
+    }
+    
+    populated_positions <- legend_positions[
+      vapply(
+        tmp$grobs[legend_positions],
+        grob_has_content,
+        FUN.VALUE = logical(1)
+      )
+    ]
+    
+    if (length(populated_positions) == 0) {
+      return(
+        grid::nullGrob()
+      )
+    }
+    
+    tmp$grobs[[populated_positions[1]]]
+  }
+  
+  legend_grob <- g_legend(
+    plots_list[[1]]
+  )
+  
+  plots_without_legends <- lapply(
+    plots_list,
+    function(x) {
+      x + theme(
+        legend.position = "none"
+      )
+    }
+  )
+  
+  pdf(
+    volcano_pdf_path,
+    width = 14,
+    height = 10
+  )
+  
+  number_of_plots <- length(
+    plots_without_legends
+  )
+  
+  panel_ncol <- ceiling(
+    sqrt(number_of_plots)
+  )
+  
+  panel_nrow <- ceiling(
+    number_of_plots / panel_ncol
+  )
+  
+  grid.arrange(
+    arrangeGrob(
+      grobs = plots_without_legends,
+      nrow = panel_nrow,
+      ncol = panel_ncol
+    ),
+    legend_grob,
+    ncol = 2,
+    widths = c(9, 3)
+  )
+  
+  dev.off()
+  
+  cat(
+    "Volcano plots saved in '",
+    volcano_pdf_path,
+    "'.\n",
+    sep = ""
+  )
+}
+
+
+#############################
+# Step 12: Run filtered unadjusted analysis
+#############################
+
+unadjusted_analysis <- run_edger_model(
+  dge_input = dge_filtered,
+  design = design_unadjusted,
+  analysis_name = "Filtered_robust_unadjusted",
+  output_dir = unadjusted_output_dir,
+  gene_annotations = gene_annotations,
+  fdr_cutoff = fdr_cutoff
+)
+
+make_volcano_pdf(
+  results_list = unadjusted_analysis$results_list,
+  volcano_pdf_path = unadjusted_volcano_pdf_path,
+  fdr_cutoff = fdr_cutoff
+)
+
+
+#############################
+# Step 13: Run filtered sex-adjusted analysis separately
+#############################
+
+sex_adjusted_analysis <- run_edger_model(
+  dge_input = dge_filtered,
+  design = design_sex_adjusted,
+  analysis_name = "Filtered_robust_sex_adjusted",
+  output_dir = sex_adjusted_output_dir,
+  gene_annotations = gene_annotations,
+  fdr_cutoff = fdr_cutoff
+)
+
+make_volcano_pdf(
+  results_list = sex_adjusted_analysis$results_list,
+  volcano_pdf_path = sex_adjusted_volcano_pdf_path,
+  fdr_cutoff = fdr_cutoff
+)
+
+
+#############################
+# Step 14: Collect significant Target_gene IDs from both analyses
+#############################
+
+collect_significant_target_ids <- function(
+    results_list,
+    fdr_cutoff
+) {
+  
+  target_ids <- unlist(
+    lapply(
+      results_list,
+      function(result_table) {
+        
+        result_table %>%
+          dplyr::filter(
+            FDR < fdr_cutoff
+          ) %>%
+          dplyr::pull(
+            Target_gene
+          )
+      }
+    ),
+    use.names = FALSE
+  )
+  
+  unique(
+    target_ids[
+      !is.na(target_ids) &
+        target_ids != ""
+    ]
+  )
+}
+
+unadjusted_target_ids <- collect_significant_target_ids(
+  unadjusted_analysis$results_list,
+  fdr_cutoff
+)
+
+sex_adjusted_target_ids <- collect_significant_target_ids(
+  sex_adjusted_analysis$results_list,
+  fdr_cutoff
+)
+
+all_target_ids <- unique(
+  c(
+    unadjusted_target_ids,
+    sex_adjusted_target_ids
+  )
+)
+
+gs_ids <- all_target_ids[
+  grepl(
+    "^ENSSTOG",
+    all_target_ids
+  )
+]
+
+other_ids <- all_target_ids[
+  !grepl(
+    "^ENSSTOG",
+    all_target_ids
+  )
+]
+
+
+#############################
+# Step 15: Query Ensembl gene biotypes
+#############################
+
+safe_query_biomart <- function(
+    dataset_name,
+    gene_ids
+) {
+  
+  if (length(gene_ids) == 0) {
+    return(
+      data.frame(
+        Target_gene = character(0),
+        queried_gene_biotype = character(0),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+  
+  tryCatch(
+    {
+      
+      dataset_mart <- useMart(
+        biomart = "ensembl",
+        dataset = dataset_name,
+        host = "https://www.ensembl.org"
+      )
+      
+      queried_info <- getBM(
+        attributes = c(
+          "ensembl_gene_id",
+          "gene_biotype"
+        ),
+        filters = "ensembl_gene_id",
+        values = gene_ids,
+        mart = dataset_mart
+      )
+      
+      colnames(queried_info) <- c(
+        "Target_gene",
+        "queried_gene_biotype"
+      )
+      
+      queried_info %>%
+        dplyr::distinct(
+          Target_gene,
+          .keep_all = TRUE
+        )
+      
+    },
+    error = function(e) {
+      
+      message(
+        "Could not query dataset ",
+        dataset_name,
+        ": ",
+        conditionMessage(e)
+      )
+      
+      data.frame(
+        Target_gene = character(0),
+        queried_gene_biotype = character(0),
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+}
+
+gs_info <- safe_query_biomart(
+  dataset_name = "itridecemlineatus_gene_ensembl",
+  gene_ids = gs_ids
+)
+
+other_info <- safe_query_biomart(
+  dataset_name = "mmusculus_gene_ensembl",
+  gene_ids = other_ids
+)
+
+gene_info <- dplyr::bind_rows(
+  gs_info,
+  other_info
+) %>%
+  dplyr::distinct(
+    Target_gene,
+    .keep_all = TRUE
+  )
+
+if (nrow(gene_info) == 0) {
+  warning(
+    "No gene-biotype information was returned by Ensembl. ",
+    "All significant genes will be classified as unannotated."
+  )
+  
+  gene_info <- data.frame(
+    Target_gene = all_target_ids,
+    queried_gene_biotype = NA_character_,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+#############################
+# Step 16: Biotype-summary function
+#############################
+
+make_biotype_summary <- function(
+    results_list,
+    gene_info,
+    analysis_name,
+    output_dir,
+    fdr_cutoff
+) {
+  
+  summary_list <- list()
+  
+  for (contrast_name in names(results_list)) {
+    
+    message(
+      "Processing biotypes for ",
+      analysis_name,
+      ": ",
+      contrast_name
+    )
+    
+    significant_results <- results_list[[contrast_name]] %>%
+      dplyr::filter(
+        FDR < fdr_cutoff
+      ) %>%
+      dplyr::distinct(
+        GeneID,
+        .keep_all = TRUE
+      )
+    
+    if (nrow(significant_results) == 0) {
+      
+      summary_list[[contrast_name]] <- data.frame(
+        Analysis = analysis_name,
+        Contrast = contrast_name,
+        Total = 0,
+        ProteinCoding = 0,
+        ProteinCodingPct = 0,
+        NonProteinCoding = 0,
+        NonProteinCodingPct = 0,
+        Unannotated = 0,
+        UnannotatedPct = 0,
+        stringsAsFactors = FALSE
+      )
+      
+      next
+    }
+    
+    significant_results <- significant_results %>%
+      dplyr::left_join(
+        gene_info,
+        by = "Target_gene"
+      ) %>%
+      dplyr::mutate(
+        Category = dplyr::case_when(
+          is.na(queried_gene_biotype) ~ "Unannotated",
+          queried_gene_biotype == "protein_coding" ~ "Protein coding",
+          TRUE ~ "Non protein coding"
+        )
+      )
+    
+    total_genes <- nrow(
+      significant_results
+    )
+    
+    protein_coding_count <- sum(
+      significant_results$Category == "Protein coding"
+    )
+    
+    non_protein_coding_count <- sum(
+      significant_results$Category == "Non protein coding"
+    )
+    
+    unannotated_count <- sum(
+      significant_results$Category == "Unannotated"
+    )
+    
+    summary_list[[contrast_name]] <- data.frame(
+      Analysis = analysis_name,
+      Contrast = contrast_name,
+      Total = total_genes,
+      ProteinCoding = protein_coding_count,
+      ProteinCodingPct = round(
+        100 * protein_coding_count / total_genes,
+        2
+      ),
+      NonProteinCoding = non_protein_coding_count,
+      NonProteinCodingPct = round(
+        100 * non_protein_coding_count / total_genes,
+        2
+      ),
+      Unannotated = unannotated_count,
+      UnannotatedPct = round(
+        100 * unannotated_count / total_genes,
+        2
+      ),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  summary_df <- dplyr::bind_rows(
+    summary_list
+  )
+  
+  write.table(
+    summary_df,
+    file = file.path(
+      output_dir,
+      paste0(
+        "significant_gene_annotation_summary_FDR_lt_",
+        fdr_label,
+        ".txt"
+      )
+    ),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+  
+  return(
+    summary_df
+  )
+}
+
+
+#############################
+# Step 17: Create separate biotype summaries
+#############################
+
+unadjusted_biotype_summary <- make_biotype_summary(
+  results_list = unadjusted_analysis$results_list,
+  gene_info = gene_info,
+  analysis_name = "Filtered_robust_unadjusted",
+  output_dir = unadjusted_output_dir,
+  fdr_cutoff = fdr_cutoff
+)
+
+sex_adjusted_biotype_summary <- make_biotype_summary(
+  results_list = sex_adjusted_analysis$results_list,
+  gene_info = gene_info,
+  analysis_name = "Filtered_robust_sex_adjusted",
+  output_dir = sex_adjusted_output_dir,
+  fdr_cutoff = fdr_cutoff
+)
+
+
+#############################
+# Step 18: Compare filtered unadjusted and sex-adjusted DEG sets
+#############################
+
+comparison_summary_list <- list()
+
+common_contrasts <- intersect(
+  names(unadjusted_analysis$results_list),
+  names(sex_adjusted_analysis$results_list)
+)
+
+for (contrast_name in common_contrasts) {
+  
+  unadjusted_table <- unadjusted_analysis$results_list[[contrast_name]]
+  sex_adjusted_table <- sex_adjusted_analysis$results_list[[contrast_name]]
+  
+  unadjusted_significant_ids <- unique(
+    unadjusted_table$GeneID[
+      unadjusted_table$FDR < fdr_cutoff
+    ]
+  )
+  
+  sex_adjusted_significant_ids <- unique(
+    sex_adjusted_table$GeneID[
+      sex_adjusted_table$FDR < fdr_cutoff
+    ]
+  )
+  
+  significant_in_both <- intersect(
+    unadjusted_significant_ids,
+    sex_adjusted_significant_ids
+  )
+  
+  lost_after_sex_adjustment <- setdiff(
+    unadjusted_significant_ids,
+    sex_adjusted_significant_ids
+  )
+  
+  gained_after_sex_adjustment <- setdiff(
+    sex_adjusted_significant_ids,
+    unadjusted_significant_ids
+  )
+  
+  comparison_summary_list[[contrast_name]] <- data.frame(
+    Contrast = contrast_name,
+    Filtered_robust_unadjusted_DEGs = length(
+      unadjusted_significant_ids
+    ),
+    Filtered_robust_sex_adjusted_DEGs = length(
+      sex_adjusted_significant_ids
+    ),
+    Significant_in_both = length(
+      significant_in_both
+    ),
+    Lost_after_sex_adjustment = length(
+      lost_after_sex_adjustment
+    ),
+    Gained_after_sex_adjustment = length(
+      gained_after_sex_adjustment
+    ),
+    stringsAsFactors = FALSE
+  )
+  
+  write.table(
+    significant_in_both,
+    file = file.path(
+      comparison_output_dir,
+      paste0(
+        contrast_name,
+        "_significant_in_both_FDR_lt_",
+        fdr_label,
+        ".txt"
+      )
+    ),
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+  
+  write.table(
+    lost_after_sex_adjustment,
+    file = file.path(
+      comparison_output_dir,
+      paste0(
+        contrast_name,
+        "_lost_after_sex_adjustment_FDR_lt_",
+        fdr_label,
+        ".txt"
+      )
+    ),
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+  
+  write.table(
+    gained_after_sex_adjustment,
+    file = file.path(
+      comparison_output_dir,
+      paste0(
+        contrast_name,
+        "_gained_after_sex_adjustment_FDR_lt_",
+        fdr_label,
+        ".txt"
+      )
+    ),
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+}
+
+comparison_summary <- dplyr::bind_rows(
+  comparison_summary_list
+)
+
+write.table(
+  comparison_summary,
+  file = file.path(
+    comparison_output_dir,
+    paste0(
+      "unadjusted_vs_sex_adjusted_DEG_summary_FDR_lt_",
+      fdr_label,
+      ".txt"
+    )
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+cat("\n")
+cat("============================================================\n")
+cat("FILTERED ROBUST UNADJUSTED VERSUS SEX-ADJUSTED SUMMARY\n")
+cat("============================================================\n")
+print(comparison_summary)
+
+
+#############################
+# Step 19: Save session information
+#############################
+
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    output_root_path,
+    "R_sessionInfo.txt"
+  )
+)
+
+
+#############################
+# Step 20: Final message
+#############################
+
+cat("\n")
+cat("============================================================\n")
+cat("ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+
+cat("Genes before filtering:", genes_before_filtering, "\n")
+cat("Genes retained:", genes_after_filtering, "\n")
+cat("FDR cutoff:", fdr_cutoff, "\n\n")
+
+cat("Filtered robust unadjusted results:\n")
+cat(unadjusted_output_dir, "\n\n")
+
+cat("Filtered robust sex-adjusted results:\n")
+cat(sex_adjusted_output_dir, "\n\n")
+
+cat("Comparison results:\n")
+cat(comparison_output_dir, "\n")
