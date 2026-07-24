@@ -1,0 +1,1456 @@
+#!/usr/bin/env Rscript
+
+# =============================================================================
+# STANDALONE TE-TL / TL-AE REVERSAL ANALYSIS
+#
+# Uses the saved full DEG tables from the filtered robust edgeR analyses.
+#
+# Calculates:
+#   1. Retention of sex-adjusted DEGs in the unadjusted analysis
+#   2. Unadjusted and sex-adjusted reversal-gene counts
+#   3. Directional subdivision of reversal genes
+#   4. Direction-specific one-sided Fisher exact tests
+#   5. Overlap between unadjusted and sex-adjusted reversal sets
+#   6. Recovery of lost genes at sex-adjusted FDR < 0.05
+#   7. Preservation of logFC directions after sex adjustment
+#
+# Contrast definitions:
+#   TE_vs_TL = TE - TL
+#   TL_vs_AE = TL - AE
+#
+# Biological interpretation:
+#   TE_vs_TL logFC < 0:
+#       expression is higher in TL than TE
+#       = increased from early to late torpor
+#
+#   TL_vs_AE logFC > 0:
+#       expression is higher in TL than AE
+#       = decreased at arousal onset
+# =============================================================================
+
+
+# =============================================================================
+# 1. PATHS AND SETTINGS
+# =============================================================================
+
+output_root_path <- file.path(
+  "/Users/adrian/Desktop/EQU.03",
+  "gene_stats_filtered_robust_QL_FDR_0.01"
+)
+
+unadjusted_full_table_dir <- file.path(
+  output_root_path,
+  "01_filtered_robust_unadjusted",
+  "full_tables"
+)
+
+sex_adjusted_full_table_dir <- file.path(
+  output_root_path,
+  "02_filtered_robust_sex_adjusted",
+  "full_tables"
+)
+
+reversal_output_dir <- file.path(
+  output_root_path,
+  "04_Table_2_reversal_analysis",
+  "TE_TL_vs_TL_AE_Fisher_and_sensitivity"
+)
+
+dir.create(
+  reversal_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+primary_fdr_cutoff <- 0.01
+sensitivity_fdr_cutoff <- 0.05
+
+contrast_names <- c(
+  "TE_vs_TL",
+  "TL_vs_AE"
+)
+
+
+# =============================================================================
+# 2. HELPER FUNCTIONS
+# =============================================================================
+
+write_tab_file <- function(
+    x,
+    file_path,
+    row_names = FALSE
+) {
+  write.table(
+    x,
+    file = file_path,
+    sep = "\t",
+    quote = FALSE,
+    row.names = row_names,
+    col.names = TRUE,
+    na = ""
+  )
+}
+
+
+write_gene_list <- function(
+    gene_ids,
+    file_path
+) {
+  write.table(
+    data.frame(
+      GeneID = sort(unique(gene_ids)),
+      stringsAsFactors = FALSE
+    ),
+    file = file_path,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = TRUE
+  )
+}
+
+
+read_deg_table <- function(
+    directory,
+    contrast_name
+) {
+  file_path <- file.path(
+    directory,
+    paste0(
+      contrast_name,
+      "_differential_expression.txt"
+    )
+  )
+  
+  if (!file.exists(file_path)) {
+    stop(
+      "Required DEG table was not found:\n",
+      file_path
+    )
+  }
+  
+  result <- read.table(
+    file_path,
+    header = TRUE,
+    sep = "\t",
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    quote = "",
+    comment.char = ""
+  )
+  
+  required_columns <- c(
+    "GeneID",
+    "logFC",
+    "FDR"
+  )
+  
+  missing_columns <- setdiff(
+    required_columns,
+    colnames(result)
+  )
+  
+  if (length(missing_columns) > 0) {
+    stop(
+      "The file ",
+      basename(file_path),
+      " is missing the following columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+  
+  result$GeneID <- trimws(
+    as.character(result$GeneID)
+  )
+  
+  result$logFC <- as.numeric(
+    result$logFC
+  )
+  
+  result$FDR <- as.numeric(
+    result$FDR
+  )
+  
+  result <- result[
+    !is.na(result$GeneID) &
+      result$GeneID != "",
+    ,
+    drop = FALSE
+  ]
+  
+  if (anyDuplicated(result$GeneID)) {
+    duplicated_ids <- unique(
+      result$GeneID[
+        duplicated(result$GeneID)
+      ]
+    )
+    
+    stop(
+      "Duplicated GeneIDs were found in ",
+      basename(file_path),
+      ". Examples: ",
+      paste(
+        head(duplicated_ids, 20),
+        collapse = ", "
+      )
+    )
+  }
+  
+  result
+}
+
+
+check_same_universe <- function(
+    table_1,
+    table_2,
+    label_1,
+    label_2
+) {
+  if (!setequal(table_1$GeneID, table_2$GeneID)) {
+    stop(
+      "The tested-gene universes differ between ",
+      label_1,
+      " and ",
+      label_2,
+      "."
+    )
+  }
+  
+  invisible(TRUE)
+}
+
+
+get_significant_ids <- function(
+    result_table,
+    fdr_threshold
+) {
+  unique(
+    result_table$GeneID[
+      !is.na(result_table$FDR) &
+        result_table$FDR < fdr_threshold
+    ]
+  )
+}
+
+
+get_directional_reversal_sets <- function(
+    results_list,
+    fdr_threshold
+) {
+  te_tl <- results_list[["TE_vs_TL"]]
+  tl_ae <- results_list[["TL_vs_AE"]]
+  
+  check_same_universe(
+    te_tl,
+    tl_ae,
+    "TE_vs_TL",
+    "TL_vs_AE"
+  )
+  
+  common_gene_ids <- intersect(
+    te_tl$GeneID,
+    tl_ae$GeneID
+  )
+  
+  te_tl <- te_tl[
+    match(
+      common_gene_ids,
+      te_tl$GeneID
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  tl_ae <- tl_ae[
+    match(
+      common_gene_ids,
+      tl_ae$GeneID
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  significant_te_tl <- get_significant_ids(
+    te_tl,
+    fdr_threshold
+  )
+  
+  significant_tl_ae <- get_significant_ids(
+    tl_ae,
+    fdr_threshold
+  )
+  
+  shared_significant <- intersect(
+    significant_te_tl,
+    significant_tl_ae
+  )
+  
+  te_tl_negative <- te_tl$GeneID[
+    !is.na(te_tl$FDR) &
+      te_tl$FDR < fdr_threshold &
+      !is.na(te_tl$logFC) &
+      te_tl$logFC < 0
+  ]
+  
+  te_tl_positive <- te_tl$GeneID[
+    !is.na(te_tl$FDR) &
+      te_tl$FDR < fdr_threshold &
+      !is.na(te_tl$logFC) &
+      te_tl$logFC > 0
+  ]
+  
+  tl_ae_negative <- tl_ae$GeneID[
+    !is.na(tl_ae$FDR) &
+      tl_ae$FDR < fdr_threshold &
+      !is.na(tl_ae$logFC) &
+      tl_ae$logFC < 0
+  ]
+  
+  tl_ae_positive <- tl_ae$GeneID[
+    !is.na(tl_ae$FDR) &
+      tl_ae$FDR < fdr_threshold &
+      !is.na(tl_ae$logFC) &
+      tl_ae$logFC > 0
+  ]
+  
+  # Main biological reversal:
+  # higher in TL than TE, followed by higher in TL than AE.
+  #
+  # Chronologically:
+  # increased from TE to TL, then decreased from TL to AE.
+  torpor_up_arousal_down <- intersect(
+    te_tl_negative,
+    tl_ae_positive
+  )
+  
+  # Inverse biological reversal:
+  # lower in TL than TE, followed by lower in TL than AE.
+  #
+  # Chronologically:
+  # decreased from TE to TL, then increased from TL to AE.
+  torpor_down_arousal_up <- intersect(
+    te_tl_positive,
+    tl_ae_negative
+  )
+  
+  all_reversal_genes <- union(
+    torpor_up_arousal_down,
+    torpor_down_arousal_up
+  )
+  
+  shared_same_sign <- setdiff(
+    shared_significant,
+    all_reversal_genes
+  )
+  
+  list(
+    Background_gene_ids = common_gene_ids,
+    Background_N = length(common_gene_ids),
+    
+    Significant_TE_TL = significant_te_tl,
+    Significant_TL_AE = significant_tl_ae,
+    Shared_significant = shared_significant,
+    
+    TE_TL_negative = te_tl_negative,
+    TE_TL_positive = te_tl_positive,
+    TL_AE_negative = tl_ae_negative,
+    TL_AE_positive = tl_ae_positive,
+    
+    Torpor_up_arousal_down =
+      torpor_up_arousal_down,
+    
+    Torpor_down_arousal_up =
+      torpor_down_arousal_up,
+    
+    All_reversal_genes =
+      all_reversal_genes,
+    
+    Shared_same_sign =
+      shared_same_sign
+  )
+}
+
+
+fisher_overlap_test <- function(
+    gene_set_1,
+    gene_set_2,
+    background_n
+) {
+  gene_set_1 <- unique(
+    gene_set_1
+  )
+  
+  gene_set_2 <- unique(
+    gene_set_2
+  )
+  
+  observed_overlap <- length(
+    intersect(
+      gene_set_1,
+      gene_set_2
+    )
+  )
+  
+  set_1_only <- length(gene_set_1) -
+    observed_overlap
+  
+  set_2_only <- length(gene_set_2) -
+    observed_overlap
+  
+  neither <- background_n -
+    observed_overlap -
+    set_1_only -
+    set_2_only
+  
+  contingency_table <- matrix(
+    c(
+      observed_overlap,
+      set_1_only,
+      set_2_only,
+      neither
+    ),
+    nrow = 2,
+    byrow = TRUE,
+    dimnames = list(
+      c(
+        "In_set_1",
+        "Not_in_set_1"
+      ),
+      c(
+        "In_set_2",
+        "Not_in_set_2"
+      )
+    )
+  )
+  
+  if (any(contingency_table < 0)) {
+    stop(
+      "The Fisher contingency table contains a negative cell."
+    )
+  }
+  
+  fisher_result <- fisher.test(
+    contingency_table,
+    alternative = "greater"
+  )
+  
+  expected_overlap <- (
+    length(gene_set_1) *
+      length(gene_set_2)
+  ) / background_n
+  
+  list(
+    Set_1_size = length(gene_set_1),
+    Set_2_size = length(gene_set_2),
+    Observed_overlap = observed_overlap,
+    Expected_overlap = expected_overlap,
+    Odds_ratio = unname(
+      fisher_result$estimate
+    ),
+    P_value = fisher_result$p.value,
+    Contingency_table = contingency_table
+  )
+}
+
+
+run_directional_fisher <- function(
+    results_list,
+    analysis_name,
+    fdr_threshold
+) {
+  reversal_sets <- get_directional_reversal_sets(
+    results_list = results_list,
+    fdr_threshold = fdr_threshold
+  )
+  
+  main_test <- fisher_overlap_test(
+    gene_set_1 =
+      reversal_sets$TE_TL_negative,
+    
+    gene_set_2 =
+      reversal_sets$TL_AE_positive,
+    
+    background_n =
+      reversal_sets$Background_N
+  )
+  
+  inverse_test <- fisher_overlap_test(
+    gene_set_1 =
+      reversal_sets$TE_TL_positive,
+    
+    gene_set_2 =
+      reversal_sets$TL_AE_negative,
+    
+    background_n =
+      reversal_sets$Background_N
+  )
+  
+  raw_p_values <- c(
+    main_test$P_value,
+    inverse_test$P_value
+  )
+  
+  within_analysis_q_values <- p.adjust(
+    raw_p_values,
+    method = "BH"
+  )
+  
+  summary_table <- data.frame(
+    Analysis = analysis_name,
+    
+    FDR_threshold =
+      fdr_threshold,
+    
+    Background_genes =
+      reversal_sets$Background_N,
+    
+    Direction = c(
+      paste0(
+        "Increased_TE_to_TL_then_",
+        "decreased_TL_to_AE"
+      ),
+      paste0(
+        "Decreased_TE_to_TL_then_",
+        "increased_TL_to_AE"
+      )
+    ),
+    
+    TE_TL_directional_set_size = c(
+      main_test$Set_1_size,
+      inverse_test$Set_1_size
+    ),
+    
+    TL_AE_directional_set_size = c(
+      main_test$Set_2_size,
+      inverse_test$Set_2_size
+    ),
+    
+    Observed_overlap = c(
+      main_test$Observed_overlap,
+      inverse_test$Observed_overlap
+    ),
+    
+    Expected_overlap = c(
+      main_test$Expected_overlap,
+      inverse_test$Expected_overlap
+    ),
+    
+    Odds_ratio = c(
+      main_test$Odds_ratio,
+      inverse_test$Odds_ratio
+    ),
+    
+    Fisher_P_value =
+      raw_p_values,
+    
+    BH_Q_value_within_analysis_2_tests =
+      within_analysis_q_values,
+    
+    stringsAsFactors = FALSE
+  )
+  
+  list(
+    sets = reversal_sets,
+    main_test = main_test,
+    inverse_test = inverse_test,
+    summary = summary_table
+  )
+}
+
+
+# =============================================================================
+# 3. LOAD SAVED FULL DEG TABLES
+# =============================================================================
+
+unadjusted_results <- list(
+  TE_vs_TL = read_deg_table(
+    unadjusted_full_table_dir,
+    "TE_vs_TL"
+  ),
+  
+  TL_vs_AE = read_deg_table(
+    unadjusted_full_table_dir,
+    "TL_vs_AE"
+  )
+)
+
+sex_adjusted_results <- list(
+  TE_vs_TL = read_deg_table(
+    sex_adjusted_full_table_dir,
+    "TE_vs_TL"
+  ),
+  
+  TL_vs_AE = read_deg_table(
+    sex_adjusted_full_table_dir,
+    "TL_vs_AE"
+  )
+)
+
+check_same_universe(
+  unadjusted_results$TE_vs_TL,
+  unadjusted_results$TL_vs_AE,
+  "unadjusted TE_vs_TL",
+  "unadjusted TL_vs_AE"
+)
+
+check_same_universe(
+  sex_adjusted_results$TE_vs_TL,
+  sex_adjusted_results$TL_vs_AE,
+  "sex-adjusted TE_vs_TL",
+  "sex-adjusted TL_vs_AE"
+)
+
+check_same_universe(
+  unadjusted_results$TE_vs_TL,
+  sex_adjusted_results$TE_vs_TL,
+  "unadjusted model",
+  "sex-adjusted model"
+)
+
+background_n <- nrow(
+  unadjusted_results$TE_vs_TL
+)
+
+cat("\n")
+cat("============================================================\n")
+cat("SAVED DEG TABLES LOADED\n")
+cat("============================================================\n")
+
+cat(
+  "Tested-gene background:",
+  background_n,
+  "\n"
+)
+
+cat(
+  "Expected from the new filtered pipeline: 17768\n"
+)
+
+if (background_n != 17768) {
+  warning(
+    "The tested background is ",
+    background_n,
+    ", not 17768. Verify that the correct saved full tables were loaded."
+  )
+}
+
+
+# =============================================================================
+# 4. DEG RETENTION AFTER SEX ADJUSTMENT
+# =============================================================================
+
+retention_rows <- lapply(
+  contrast_names,
+  function(contrast_name) {
+    unadjusted_ids <- get_significant_ids(
+      unadjusted_results[[contrast_name]],
+      primary_fdr_cutoff
+    )
+    
+    sex_adjusted_ids <- get_significant_ids(
+      sex_adjusted_results[[contrast_name]],
+      primary_fdr_cutoff
+    )
+    
+    shared_ids <- intersect(
+      unadjusted_ids,
+      sex_adjusted_ids
+    )
+    
+    data.frame(
+      Contrast = contrast_name,
+      
+      Unadjusted_DEGs =
+        length(unadjusted_ids),
+      
+      Sex_adjusted_DEGs =
+        length(sex_adjusted_ids),
+      
+      Significant_in_both =
+        length(shared_ids),
+      
+      Sex_adjusted_DEGs_also_unadjusted_percent =
+        if (length(sex_adjusted_ids) > 0) {
+          100 *
+            length(shared_ids) /
+            length(sex_adjusted_ids)
+        } else {
+          NA_real_
+        },
+      
+      stringsAsFactors = FALSE
+    )
+  }
+)
+
+retention_summary <- do.call(
+  rbind,
+  retention_rows
+)
+
+retention_summary$Sex_adjusted_DEGs_also_unadjusted_percent <-
+  round(
+    retention_summary$
+      Sex_adjusted_DEGs_also_unadjusted_percent,
+    1
+  )
+
+cat("\n")
+cat("============================================================\n")
+cat("RETENTION OF SEX-ADJUSTED DEGs\n")
+cat("============================================================\n")
+
+print(
+  retention_summary,
+  row.names = FALSE
+)
+
+write_tab_file(
+  retention_summary,
+  file.path(
+    reversal_output_dir,
+    "TE_TL_TL_AE_DEG_retention_summary.txt"
+  )
+)
+
+
+# =============================================================================
+# 5. RUN DIRECTION-SPECIFIC FISHER TESTS
+# =============================================================================
+
+unadjusted_fisher <- run_directional_fisher(
+  results_list = unadjusted_results,
+  analysis_name = "Filtered_robust_unadjusted",
+  fdr_threshold = primary_fdr_cutoff
+)
+
+sex_adjusted_fisher <- run_directional_fisher(
+  results_list = sex_adjusted_results,
+  analysis_name = "Filtered_robust_sex_adjusted",
+  fdr_threshold = primary_fdr_cutoff
+)
+
+combined_fisher_summary <- rbind(
+  unadjusted_fisher$summary,
+  sex_adjusted_fisher$summary
+)
+
+combined_fisher_summary$
+  BH_Q_value_global_across_4_tests <-
+  p.adjust(
+    combined_fisher_summary$Fisher_P_value,
+    method = "BH"
+  )
+
+cat("\n")
+cat("============================================================\n")
+cat("DIRECTION-SPECIFIC FISHER TESTS\n")
+cat("============================================================\n")
+
+print(
+  combined_fisher_summary,
+  row.names = FALSE
+)
+
+write_tab_file(
+  combined_fisher_summary,
+  file.path(
+    reversal_output_dir,
+    "TE_TL_vs_TL_AE_directional_Fisher_tests.txt"
+  )
+)
+
+
+# =============================================================================
+# 6. OVERALL REVERSAL COUNTS
+# =============================================================================
+
+reversal_count_summary <- data.frame(
+  Analysis = c(
+    "Filtered_robust_unadjusted",
+    "Filtered_robust_sex_adjusted"
+  ),
+  
+  TE_TL_DEGs = c(
+    length(
+      unadjusted_fisher$
+        sets$Significant_TE_TL
+    ),
+    length(
+      sex_adjusted_fisher$
+        sets$Significant_TE_TL
+    )
+  ),
+  
+  TL_AE_DEGs = c(
+    length(
+      unadjusted_fisher$
+        sets$Significant_TL_AE
+    ),
+    length(
+      sex_adjusted_fisher$
+        sets$Significant_TL_AE
+    )
+  ),
+  
+  Shared_DEGs = c(
+    length(
+      unadjusted_fisher$
+        sets$Shared_significant
+    ),
+    length(
+      sex_adjusted_fisher$
+        sets$Shared_significant
+    )
+  ),
+  
+  Increased_TE_to_TL_then_decreased_TL_to_AE = c(
+    length(
+      unadjusted_fisher$
+        sets$Torpor_up_arousal_down
+    ),
+    length(
+      sex_adjusted_fisher$
+        sets$Torpor_up_arousal_down
+    )
+  ),
+  
+  Decreased_TE_to_TL_then_increased_TL_to_AE = c(
+    length(
+      unadjusted_fisher$
+        sets$Torpor_down_arousal_up
+    ),
+    length(
+      sex_adjusted_fisher$
+        sets$Torpor_down_arousal_up
+    )
+  ),
+  
+  Total_opposite_direction = c(
+    length(
+      unadjusted_fisher$
+        sets$All_reversal_genes
+    ),
+    length(
+      sex_adjusted_fisher$
+        sets$All_reversal_genes
+    )
+  ),
+  
+  Shared_same_direction = c(
+    length(
+      unadjusted_fisher$
+        sets$Shared_same_sign
+    ),
+    length(
+      sex_adjusted_fisher$
+        sets$Shared_same_sign
+    )
+  ),
+  
+  Percent_shared_with_opposite_direction = c(
+    100 *
+      length(
+        unadjusted_fisher$
+          sets$All_reversal_genes
+      ) /
+      length(
+        unadjusted_fisher$
+          sets$Shared_significant
+      ),
+    
+    100 *
+      length(
+        sex_adjusted_fisher$
+          sets$All_reversal_genes
+      ) /
+      length(
+        sex_adjusted_fisher$
+          sets$Shared_significant
+      )
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+reversal_count_summary$
+  Percent_shared_with_opposite_direction <-
+  round(
+    reversal_count_summary$
+      Percent_shared_with_opposite_direction,
+    1
+  )
+
+cat("\n")
+cat("============================================================\n")
+cat("REVERSAL COUNTS\n")
+cat("============================================================\n")
+
+print(
+  reversal_count_summary,
+  row.names = FALSE
+)
+
+write_tab_file(
+  reversal_count_summary,
+  file.path(
+    reversal_output_dir,
+    "TE_TL_vs_TL_AE_reversal_count_summary.txt"
+  )
+)
+
+
+# =============================================================================
+# 7. OVERLAP BETWEEN UNADJUSTED AND SEX-ADJUSTED REVERSAL SETS
+# =============================================================================
+
+unadjusted_reversal_ids <-
+  unadjusted_fisher$
+  sets$All_reversal_genes
+
+sex_adjusted_reversal_ids <-
+  sex_adjusted_fisher$
+  sets$All_reversal_genes
+
+shared_reversal_ids <- intersect(
+  unadjusted_reversal_ids,
+  sex_adjusted_reversal_ids
+)
+
+lost_after_sex_adjustment <- setdiff(
+  unadjusted_reversal_ids,
+  sex_adjusted_reversal_ids
+)
+
+gained_after_sex_adjustment <- setdiff(
+  sex_adjusted_reversal_ids,
+  unadjusted_reversal_ids
+)
+
+
+# =============================================================================
+# 8. FDR < 0.05 SENSITIVITY
+# =============================================================================
+
+sex_adjusted_fdr_005_sets <-
+  get_directional_reversal_sets(
+    results_list = sex_adjusted_results,
+    fdr_threshold = sensitivity_fdr_cutoff
+  )
+
+sex_adjusted_reversal_ids_fdr_005 <-
+  sex_adjusted_fdr_005_sets$
+  All_reversal_genes
+
+lost_recovered_at_fdr_005 <- intersect(
+  lost_after_sex_adjustment,
+  sex_adjusted_reversal_ids_fdr_005
+)
+
+
+# =============================================================================
+# 9. GENE-LEVEL SIGN AND SIGNIFICANCE COMPARISON
+# =============================================================================
+
+all_gene_ids <- unadjusted_results$
+  TE_vs_TL$GeneID
+
+gene_comparison <- data.frame(
+  GeneID = all_gene_ids,
+  
+  logFC_unadjusted_TE_TL =
+    unadjusted_results$TE_vs_TL$logFC[
+      match(
+        all_gene_ids,
+        unadjusted_results$TE_vs_TL$GeneID
+      )
+    ],
+  
+  FDR_unadjusted_TE_TL =
+    unadjusted_results$TE_vs_TL$FDR[
+      match(
+        all_gene_ids,
+        unadjusted_results$TE_vs_TL$GeneID
+      )
+    ],
+  
+  logFC_unadjusted_TL_AE =
+    unadjusted_results$TL_vs_AE$logFC[
+      match(
+        all_gene_ids,
+        unadjusted_results$TL_vs_AE$GeneID
+      )
+    ],
+  
+  FDR_unadjusted_TL_AE =
+    unadjusted_results$TL_vs_AE$FDR[
+      match(
+        all_gene_ids,
+        unadjusted_results$TL_vs_AE$GeneID
+      )
+    ],
+  
+  logFC_sex_adjusted_TE_TL =
+    sex_adjusted_results$TE_vs_TL$logFC[
+      match(
+        all_gene_ids,
+        sex_adjusted_results$TE_vs_TL$GeneID
+      )
+    ],
+  
+  FDR_sex_adjusted_TE_TL =
+    sex_adjusted_results$TE_vs_TL$FDR[
+      match(
+        all_gene_ids,
+        sex_adjusted_results$TE_vs_TL$GeneID
+      )
+    ],
+  
+  logFC_sex_adjusted_TL_AE =
+    sex_adjusted_results$TL_vs_AE$logFC[
+      match(
+        all_gene_ids,
+        sex_adjusted_results$TL_vs_AE$GeneID
+      )
+    ],
+  
+  FDR_sex_adjusted_TL_AE =
+    sex_adjusted_results$TL_vs_AE$FDR[
+      match(
+        all_gene_ids,
+        sex_adjusted_results$TL_vs_AE$GeneID
+      )
+    ],
+  
+  stringsAsFactors = FALSE
+)
+
+gene_comparison <- gene_comparison[
+  gene_comparison$GeneID %in%
+    unadjusted_reversal_ids,
+  ,
+  drop = FALSE
+]
+
+gene_comparison$
+  TE_TL_sign_preserved <-
+  sign(
+    gene_comparison$
+      logFC_unadjusted_TE_TL
+  ) ==
+  sign(
+    gene_comparison$
+      logFC_sex_adjusted_TE_TL
+  )
+
+gene_comparison$
+  TL_AE_sign_preserved <-
+  sign(
+    gene_comparison$
+      logFC_unadjusted_TL_AE
+  ) ==
+  sign(
+    gene_comparison$
+      logFC_sex_adjusted_TL_AE
+  )
+
+gene_comparison$
+  Both_signs_preserved <-
+  gene_comparison$
+  TE_TL_sign_preserved &
+  gene_comparison$
+  TL_AE_sign_preserved
+
+gene_comparison$
+  Still_opposite_after_adjustment <-
+  (
+    gene_comparison$
+      logFC_sex_adjusted_TE_TL *
+      gene_comparison$
+      logFC_sex_adjusted_TL_AE
+  ) < 0
+
+gene_comparison$
+  Sex_adjusted_significant_both_FDR_0.01 <-
+  gene_comparison$
+  FDR_sex_adjusted_TE_TL <
+  primary_fdr_cutoff &
+  gene_comparison$
+  FDR_sex_adjusted_TL_AE <
+  primary_fdr_cutoff
+
+gene_comparison$
+  Sex_adjusted_significant_both_FDR_0.05 <-
+  gene_comparison$
+  FDR_sex_adjusted_TE_TL <
+  sensitivity_fdr_cutoff &
+  gene_comparison$
+  FDR_sex_adjusted_TL_AE <
+  sensitivity_fdr_cutoff
+
+gene_comparison$
+  Reversal_recovered_at_FDR_0.05 <-
+  gene_comparison$
+  Sex_adjusted_significant_both_FDR_0.05 &
+  gene_comparison$
+  Still_opposite_after_adjustment
+
+
+# =============================================================================
+# 10. FINAL SENSITIVITY SUMMARY
+# =============================================================================
+
+reversal_sensitivity_summary <- data.frame(
+  Measure = c(
+    "Unadjusted reversal genes at FDR < 0.01",
+    
+    "Sex-adjusted reversal genes at FDR < 0.01",
+    
+    paste0(
+      "Sex-adjusted reversal genes also in ",
+      "the unadjusted reversal set"
+    ),
+    
+    paste0(
+      "Sex-adjusted reversal genes not in ",
+      "the unadjusted reversal set"
+    ),
+    
+    paste0(
+      "Unadjusted reversal genes no longer ",
+      "significant in both adjusted contrasts ",
+      "at FDR < 0.01"
+    ),
+    
+    paste0(
+      "Lost reversal genes recovered in both ",
+      "adjusted contrasts at FDR < 0.05"
+    ),
+    
+    paste0(
+      "Unadjusted reversal genes preserving ",
+      "both logFC signs after adjustment"
+    ),
+    
+    paste0(
+      "Unadjusted reversal genes still showing ",
+      "opposite logFC signs after adjustment"
+    )
+  ),
+  
+  Count = c(
+    length(
+      unadjusted_reversal_ids
+    ),
+    
+    length(
+      sex_adjusted_reversal_ids
+    ),
+    
+    length(
+      shared_reversal_ids
+    ),
+    
+    length(
+      gained_after_sex_adjustment
+    ),
+    
+    length(
+      lost_after_sex_adjustment
+    ),
+    
+    length(
+      lost_recovered_at_fdr_005
+    ),
+    
+    sum(
+      gene_comparison$
+        Both_signs_preserved,
+      na.rm = TRUE
+    ),
+    
+    sum(
+      gene_comparison$
+        Still_opposite_after_adjustment,
+      na.rm = TRUE
+    )
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+cat("\n")
+cat("============================================================\n")
+cat("REVERSAL SENSITIVITY TO SEX ADJUSTMENT\n")
+cat("============================================================\n")
+
+print(
+  reversal_sensitivity_summary,
+  row.names = FALSE
+)
+
+write_tab_file(
+  reversal_sensitivity_summary,
+  file.path(
+    reversal_output_dir,
+    "TE_TL_vs_TL_AE_reversal_sensitivity_summary.txt"
+  )
+)
+
+write_tab_file(
+  gene_comparison,
+  file.path(
+    reversal_output_dir,
+    "TE_TL_vs_TL_AE_reversal_gene_sign_comparison.txt"
+  )
+)
+
+
+# =============================================================================
+# 11. EXPORT GENE LISTS
+# =============================================================================
+
+write_gene_list(
+  unadjusted_fisher$
+    sets$Torpor_up_arousal_down,
+  
+  file.path(
+    reversal_output_dir,
+    paste0(
+      "unadjusted_increased_TE_to_TL_",
+      "then_decreased_TL_to_AE.txt"
+    )
+  )
+)
+
+write_gene_list(
+  unadjusted_fisher$
+    sets$Torpor_down_arousal_up,
+  
+  file.path(
+    reversal_output_dir,
+    paste0(
+      "unadjusted_decreased_TE_to_TL_",
+      "then_increased_TL_to_AE.txt"
+    )
+  )
+)
+
+write_gene_list(
+  sex_adjusted_fisher$
+    sets$Torpor_up_arousal_down,
+  
+  file.path(
+    reversal_output_dir,
+    paste0(
+      "sex_adjusted_increased_TE_to_TL_",
+      "then_decreased_TL_to_AE.txt"
+    )
+  )
+)
+
+write_gene_list(
+  sex_adjusted_fisher$
+    sets$Torpor_down_arousal_up,
+  
+  file.path(
+    reversal_output_dir,
+    paste0(
+      "sex_adjusted_decreased_TE_to_TL_",
+      "then_increased_TL_to_AE.txt"
+    )
+  )
+)
+
+write_gene_list(
+  unadjusted_reversal_ids,
+  
+  file.path(
+    reversal_output_dir,
+    "all_unadjusted_reversal_genes_FDR_lt_0.01.txt"
+  )
+)
+
+write_gene_list(
+  sex_adjusted_reversal_ids,
+  
+  file.path(
+    reversal_output_dir,
+    "all_sex_adjusted_reversal_genes_FDR_lt_0.01.txt"
+  )
+)
+
+write_gene_list(
+  shared_reversal_ids,
+  
+  file.path(
+    reversal_output_dir,
+    "reversal_genes_shared_between_models.txt"
+  )
+)
+
+write_gene_list(
+  lost_after_sex_adjustment,
+  
+  file.path(
+    reversal_output_dir,
+    "unadjusted_reversal_genes_lost_after_sex_adjustment.txt"
+  )
+)
+
+write_gene_list(
+  lost_recovered_at_fdr_005,
+  
+  file.path(
+    reversal_output_dir,
+    paste0(
+      "lost_reversal_genes_recovered_at_",
+      "sex_adjusted_FDR_lt_0.05.txt"
+    )
+  )
+)
+
+
+# =============================================================================
+# 12. CONSISTENCY CHECKS
+# =============================================================================
+
+unadjusted_reversal_n <- length(
+  unadjusted_reversal_ids
+)
+
+sex_adjusted_reversal_n <- length(
+  sex_adjusted_reversal_ids
+)
+
+cat("\n")
+cat("============================================================\n")
+cat("CONSISTENCY CHECKS\n")
+cat("============================================================\n")
+
+cat(
+  "Tested background:",
+  background_n,
+  "\n"
+)
+
+cat(
+  "Unadjusted reversal genes:",
+  unadjusted_reversal_n,
+  "\n"
+)
+
+cat(
+  "Sex-adjusted reversal genes:",
+  sex_adjusted_reversal_n,
+  "\n"
+)
+
+if (unadjusted_reversal_n != 135) {
+  warning(
+    "Expected 135 unadjusted reversal genes from the new Table 2, but found ",
+    unadjusted_reversal_n,
+    "."
+  )
+}
+
+if (sex_adjusted_reversal_n != 46) {
+  warning(
+    "Expected 46 sex-adjusted reversal genes from the new Table 2, but found ",
+    sex_adjusted_reversal_n,
+    "."
+  )
+}
+
+
+# =============================================================================
+# 13. PRINT THE DOMINANT SEX-ADJUSTED DIRECTION
+# =============================================================================
+
+sex_adjusted_dominant_row <-
+  sex_adjusted_fisher$summary[
+    which.max(
+      sex_adjusted_fisher$
+        summary$Observed_overlap
+    ),
+    ,
+    drop = FALSE
+  ]
+
+cat("\n")
+cat("============================================================\n")
+cat("DOMINANT SEX-ADJUSTED REVERSAL CLASS\n")
+cat("============================================================\n")
+
+cat(
+  "Direction:",
+  sex_adjusted_dominant_row$Direction,
+  "\n"
+)
+
+cat(
+  "Observed genes:",
+  sex_adjusted_dominant_row$Observed_overlap,
+  "\n"
+)
+
+cat(
+  "Expected genes:",
+  format(
+    sex_adjusted_dominant_row$Expected_overlap,
+    digits = 4
+  ),
+  "\n"
+)
+
+cat(
+  "One-sided Fisher p-value:",
+  format(
+    sex_adjusted_dominant_row$Fisher_P_value,
+    scientific = TRUE,
+    digits = 4
+  ),
+  "\n"
+)
+
+cat(
+  "Two-direction BH q-value:",
+  format(
+    sex_adjusted_dominant_row$
+      BH_Q_value_within_analysis_2_tests,
+    scientific = TRUE,
+    digits = 4
+  ),
+  "\n"
+)
+
+
+# =============================================================================
+# 14. SAVE SESSION INFORMATION
+# =============================================================================
+
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    reversal_output_dir,
+    "R_sessionInfo.txt"
+  )
+)
+
+
+# =============================================================================
+# 15. FINAL MESSAGE
+# =============================================================================
+
+cat("\n")
+cat("============================================================\n")
+cat("REVERSAL ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+
+cat(
+  "Results were written to:\n",
+  reversal_output_dir,
+  "\n",
+  sep = ""
+)
+
