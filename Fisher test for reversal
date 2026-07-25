@@ -1,32 +1,28 @@
-# ============================================================
-# Reversal analysis matching the filtered robust edgeR pipeline
-#
-# Calculates:
-#   1. Retention of sex-adjusted DEGs in the unadjusted model
-#   2. Opposite-direction reversal between TE-TL and TL-AE
-#   3. Direction-specific Fisher exact tests
-#
-# Contrast definitions:
-#   TE_vs_TL = TE - TL
-#   TL_vs_AE = TL - AE
-#
-# Therefore:
-#   TE_vs_TL logFC < 0 = expression increased from TE to TL
-#   TL_vs_AE logFC > 0 = expression decreased from TL to AE
-# ============================================================
-
 suppressPackageStartupMessages({
   library(edgeR)
   library(dplyr)
 })
 
-expr_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
-meta_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt"
+# ------------------------------------------------------------
+# Paths and settings
+# ------------------------------------------------------------
+
+expr_path <- paste0(
+  "/Users/adrian/Desktop/EQU.03/",
+  "20251016_merged_Cortex_0FPM.txt"
+)
+
+meta_path <- paste0(
+  "/Users/adrian/Desktop/EQU.03/",
+  "20251016_merged_Cortex_samples.txt"
+)
+
+output_dir <- "/Users/adrian/Desktop/EQU.03"
 
 fdr_cutoff <- 0.01
 
 # ------------------------------------------------------------
-# 1. Load data
+# 1. Load count matrix
 # ------------------------------------------------------------
 
 expr <- read.table(
@@ -41,6 +37,18 @@ expr <- read.table(
 expr <- as.matrix(expr)
 storage.mode(expr) <- "numeric"
 
+if (anyNA(expr)) {
+  stop("The count matrix contains missing or non-numeric values.")
+}
+
+if (any(expr < 0)) {
+  stop("The count matrix contains negative values.")
+}
+
+# ------------------------------------------------------------
+# 2. Load metadata
+# ------------------------------------------------------------
+
 meta <- read.table(
   meta_path,
   header = TRUE,
@@ -49,7 +57,11 @@ meta <- read.table(
   check.names = FALSE
 )
 
-required_columns <- c("Sample", "Group", "Sex")
+required_columns <- c(
+  "Sample",
+  "Group",
+  "Sex"
+)
 
 missing_columns <- setdiff(
   required_columns,
@@ -63,20 +75,63 @@ if (length(missing_columns) > 0) {
   )
 }
 
-meta$Sample <- trimws(as.character(meta$Sample))
-meta$Group  <- trimws(as.character(meta$Group))
-meta$Sex    <- trimws(as.character(meta$Sex))
+meta$Sample <- trimws(
+  as.character(meta$Sample)
+)
+
+meta$Group <- trimws(
+  as.character(meta$Group)
+)
+
+meta$Sex <- trimws(
+  as.character(meta$Sex)
+)
+
+if (anyDuplicated(meta$Sample)) {
+  duplicated_samples <- unique(
+    meta$Sample[duplicated(meta$Sample)]
+  )
+  
+  stop(
+    "Duplicated sample names in metadata: ",
+    paste(duplicated_samples, collapse = ", ")
+  )
+}
 
 meta$Group <- factor(
   meta$Group,
-  levels = c("SE", "TE", "TL", "AE", "AL")
+  levels = c(
+    "SE",
+    "TE",
+    "TL",
+    "AE",
+    "AL"
+  )
 )
+
+if (anyNA(meta$Group)) {
+  stop(
+    "Invalid Group labels detected. Expected: ",
+    "SE, TE, TL, AE, or AL."
+  )
+}
 
 meta$Sex <- droplevels(
   factor(meta$Sex)
 )
 
+if (nlevels(meta$Sex) < 2) {
+  stop(
+    "The sex-adjusted sensitivity model requires ",
+    "at least two Sex levels."
+  )
+}
+
 rownames(meta) <- meta$Sample
+
+# ------------------------------------------------------------
+# 3. Match count matrix and metadata
+# ------------------------------------------------------------
 
 missing_samples <- setdiff(
   meta$Sample,
@@ -96,12 +151,30 @@ expr <- expr[
   drop = FALSE
 ]
 
-if (!identical(colnames(expr), rownames(meta))) {
-  stop("Count matrix and metadata are not aligned.")
+if (!identical(
+  colnames(expr),
+  rownames(meta)
+)) {
+  stop(
+    "Count-matrix columns and metadata rows ",
+    "are not aligned."
+  )
 }
 
+cat(
+  "\nSamples included:",
+  ncol(expr),
+  "\n"
+)
+
+cat("\nSamples per physiological state:\n")
+print(table(meta$Group))
+
+cat("\nSex distribution by physiological state:\n")
+print(table(meta$Group, meta$Sex))
+
 # ------------------------------------------------------------
-# 2. Apply the same low-expression filtering and normalization
+# 4. Low-expression filtering and normalization
 # ------------------------------------------------------------
 
 dge_initial <- DGEList(
@@ -109,6 +182,7 @@ dge_initial <- DGEList(
   group = meta$Group
 )
 
+# Filtering uses the original five physiological states.
 keep <- filterByExpr(
   dge_initial,
   group = meta$Group
@@ -120,109 +194,241 @@ dge <- dge_initial[
   keep.lib.sizes = FALSE
 ]
 
-dge <- normLibSizes(dge)
+dge <- calcNormFactors(dge)
 
 N <- nrow(dge)
 
 cat(
-  "\nNumber of genes in the tested background:",
+  "\nNumber of genes before filtering:",
+  nrow(dge_initial),
+  "\n"
+)
+
+cat(
+  "Number of genes in the tested background:",
   N,
   "\n"
 )
 
-# Expected result from the new pipeline: 17,768 genes
+# Expected result from the current filtered pipeline:
+# approximately 17,768 genes.
 
 # ------------------------------------------------------------
-# 3. Fit unadjusted or sex-adjusted robust QL model
+# 5. Function for fitting edgeR models
 # ------------------------------------------------------------
 
-fit_model <- function(with_sex) {
-
+fit_model <- function(
+    with_sex,
+    dge_object,
+    metadata
+) {
+  
   if (with_sex) {
-
+    
     design <- model.matrix(
       ~ 0 + Group + Sex,
-      data = meta
+      data = metadata
     )
-
+    
   } else {
-
+    
     design <- model.matrix(
       ~ 0 + Group,
-      data = meta
+      data = metadata
     )
   }
-
+  
+  # Convert GroupTE, GroupTL, etc. to TE, TL, etc.
   colnames(design) <- sub(
     "^Group",
     "",
     colnames(design)
   )
-
+  
   if (qr(design)$rank < ncol(design)) {
-    stop("The model design is not full rank.")
+    stop(
+      "The model design is not full rank."
+    )
   }
-
+  
   contrast_matrix <- makeContrasts(
     TE_vs_TL = TE - TL,
     TL_vs_AE = TL - AE,
     levels = design
   )
-
+  
   dge_model <- estimateDisp(
-    dge,
+    dge_object,
     design,
     robust = TRUE
   )
-
+  
   fit <- glmQLFit(
     dge_model,
     design,
     robust = TRUE
   )
-
+  
   result_list <- list()
-
-  for (contrast_name in colnames(contrast_matrix)) {
-
+  
+  for (
+    contrast_name in colnames(contrast_matrix)
+  ) {
+    
     qlf_test <- glmQLFTest(
       fit,
-      contrast = contrast_matrix[, contrast_name]
+      contrast = contrast_matrix[
+        ,
+        contrast_name
+      ]
     )
-
+    
     result_table <- topTags(
       qlf_test,
-      n = Inf
+      n = Inf,
+      sort.by = "PValue"
     )$table
-
+    
     result_list[[contrast_name]] <- data.frame(
       GeneID = rownames(result_table),
       logFC = result_table$logFC,
+      logCPM = result_table$logCPM,
+      F = result_table$F,
       PValue = result_table$PValue,
       FDR = result_table$FDR,
       stringsAsFactors = FALSE
     )
   }
-
-  result_list
+  
+  return(result_list)
 }
 
+# ------------------------------------------------------------
+# 6. Fit primary and sensitivity models
+# ------------------------------------------------------------
+
+# Primary model: no adjustment for sex
 unadjusted_results <- fit_model(
-  with_sex = FALSE
+  with_sex = FALSE,
+  dge_object = dge,
+  metadata = meta
 )
 
+# Sensitivity model: includes sex as a covariate
 sex_adjusted_results <- fit_model(
-  with_sex = TRUE
+  with_sex = TRUE,
+  dge_object = dge,
+  metadata = meta
 )
 
-significant_ids <- function(result_table) {
+# All primary reversal calculations below use this object.
+primary_results <- unadjusted_results
+
+# ------------------------------------------------------------
+# 7. Export complete contrast-level results
+# ------------------------------------------------------------
+
+write.table(
+  unadjusted_results$TE_vs_TL,
+  file = file.path(
+    output_dir,
+    "unadjusted_TE_vs_TL_full_results.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  unadjusted_results$TL_vs_AE,
+  file = file.path(
+    output_dir,
+    "unadjusted_TL_vs_AE_full_results.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  sex_adjusted_results$TE_vs_TL,
+  file = file.path(
+    output_dir,
+    "sex_adjusted_TE_vs_TL_full_results.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  sex_adjusted_results$TL_vs_AE,
+  file = file.path(
+    output_dir,
+    "sex_adjusted_TL_vs_AE_full_results.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 8. Helper for significant gene IDs
+# ------------------------------------------------------------
+
+significant_ids <- function(
+    result_table,
+    cutoff
+) {
+  
   result_table$GeneID[
-    result_table$FDR < fdr_cutoff
+    !is.na(result_table$FDR) &
+      result_table$FDR < cutoff
   ]
 }
 
 # ------------------------------------------------------------
-# 4. Retention after sex adjustment
+# 9. Report DEG counts
+# ------------------------------------------------------------
+
+cat("\n")
+cat("============================================================\n")
+cat("DEG COUNTS\n")
+cat("============================================================\n")
+
+for (
+  contrast_name in c(
+    "TE_vs_TL",
+    "TL_vs_AE"
+  )
+) {
+  
+  unadjusted_ids <- significant_ids(
+    unadjusted_results[[contrast_name]],
+    cutoff = fdr_cutoff
+  )
+  
+  adjusted_ids <- significant_ids(
+    sex_adjusted_results[[contrast_name]],
+    cutoff = fdr_cutoff
+  )
+  
+  cat(
+    sprintf(
+      paste0(
+        "%s:\n",
+        "  sex-unadjusted DEGs = %d\n",
+        "  sex-adjusted DEGs   = %d\n"
+      ),
+      contrast_name,
+      length(unadjusted_ids),
+      length(adjusted_ids)
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 10. Retention after sex adjustment
 # ------------------------------------------------------------
 
 cat("\n")
@@ -230,34 +436,47 @@ cat("============================================================\n")
 cat("RETENTION OF SEX-ADJUSTED DEGs\n")
 cat("============================================================\n")
 
-for (contrast_name in c("TE_vs_TL", "TL_vs_AE")) {
-
+for (
+  contrast_name in c(
+    "TE_vs_TL",
+    "TL_vs_AE"
+  )
+) {
+  
   unadjusted_ids <- significant_ids(
-    unadjusted_results[[contrast_name]]
+    unadjusted_results[[contrast_name]],
+    cutoff = fdr_cutoff
   )
-
+  
   sex_adjusted_ids <- significant_ids(
-    sex_adjusted_results[[contrast_name]]
+    sex_adjusted_results[[contrast_name]],
+    cutoff = fdr_cutoff
   )
-
+  
   shared_ids <- intersect(
     unadjusted_ids,
     sex_adjusted_ids
   )
-
+  
   retention_percentage <- if (
     length(sex_adjusted_ids) > 0
   ) {
-    100 * length(shared_ids) / length(sex_adjusted_ids)
+    
+    100 *
+      length(shared_ids) /
+      length(sex_adjusted_ids)
+    
   } else {
+    
     NA_real_
   }
-
+  
   cat(
     sprintf(
       paste0(
         "%s: %d of %d sex-adjusted DEGs ",
-        "(%.1f%%) were also significant without sex adjustment\n"
+        "(%.1f%%) were also significant ",
+        "without sex adjustment.\n"
       ),
       contrast_name,
       length(shared_ids),
@@ -268,76 +487,134 @@ for (contrast_name in c("TE_vs_TL", "TL_vs_AE")) {
 }
 
 # ------------------------------------------------------------
-# 5. Merge sex-adjusted TE-TL and TL-AE results
+# 11. Merge the PRIMARY sex-unadjusted results
 # ------------------------------------------------------------
 
 merged_results <- merge(
-  sex_adjusted_results$TE_vs_TL,
-  sex_adjusted_results$TL_vs_AE,
+  primary_results$TE_vs_TL,
+  primary_results$TL_vs_AE,
   by = "GeneID",
-  suffixes = c("_TE_TL", "_TL_AE")
+  suffixes = c(
+    "_TE_TL",
+    "_TL_AE"
+  )
 )
 
 merged_results <- merged_results %>%
   mutate(
     Significant_TE_TL =
+      !is.na(FDR_TE_TL) &
       FDR_TE_TL < fdr_cutoff,
-
+    
     Significant_TL_AE =
+      !is.na(FDR_TL_AE) &
       FDR_TL_AE < fdr_cutoff,
-
+    
     Significant_in_both =
       Significant_TE_TL &
       Significant_TL_AE,
-
-    # Biological interpretation of the contrast signs:
+    
+    # TE - TL < 0:
+    # expression increased from TE to TL.
     #
-    # TE - TL < 0 means expression increased from TE to TL.
-    # TL - AE > 0 means expression decreased from TL to AE.
+    # TL - AE > 0:
+    # expression decreased from TL to AE.
     Torpor_up_arousal_down =
       Significant_in_both &
       logFC_TE_TL < 0 &
       logFC_TL_AE > 0,
-
-    # Opposite biological pattern:
-    # decreased from TE to TL, then increased from TL to AE.
+    
+    # TE - TL > 0:
+    # expression decreased from TE to TL.
+    #
+    # TL - AE < 0:
+    # expression increased from TL to AE.
     Torpor_down_arousal_up =
       Significant_in_both &
       logFC_TE_TL > 0 &
       logFC_TL_AE < 0,
-
+    
     Opposite_direction =
       Torpor_up_arousal_down |
       Torpor_down_arousal_up,
-
+    
     Same_direction =
       Significant_in_both &
-      sign(logFC_TE_TL) == sign(logFC_TL_AE)
+      sign(logFC_TE_TL) ==
+      sign(logFC_TL_AE)
   )
 
+# ------------------------------------------------------------
+# 12. Primary sex-unadjusted reversal counts
+# ------------------------------------------------------------
+
 shared_between_transitions <- sum(
-  merged_results$Significant_in_both
+  merged_results$Significant_in_both,
+  na.rm = TRUE
 )
 
 opposite_total <- sum(
-  merged_results$Opposite_direction
+  merged_results$Opposite_direction,
+  na.rm = TRUE
 )
 
 same_direction_total <- sum(
-  merged_results$Same_direction
+  merged_results$Same_direction,
+  na.rm = TRUE
 )
 
 torpor_up_arousal_down_count <- sum(
-  merged_results$Torpor_up_arousal_down
+  merged_results$Torpor_up_arousal_down,
+  na.rm = TRUE
 )
 
 torpor_down_arousal_up_count <- sum(
-  merged_results$Torpor_down_arousal_up
+  merged_results$Torpor_down_arousal_up,
+  na.rm = TRUE
 )
+
+opposite_percentage <- if (
+  shared_between_transitions > 0
+) {
+  
+  100 *
+    opposite_total /
+    shared_between_transitions
+  
+} else {
+  
+  NA_real_
+}
+
+dominant_class_percentage <- if (
+  opposite_total > 0
+) {
+  
+  100 *
+    torpor_up_arousal_down_count /
+    opposite_total
+  
+} else {
+  
+  NA_real_
+}
+
+inverse_class_percentage <- if (
+  opposite_total > 0
+) {
+  
+  100 *
+    torpor_down_arousal_up_count /
+    opposite_total
+  
+} else {
+  
+  NA_real_
+}
 
 cat("\n")
 cat("============================================================\n")
-cat("SEX-ADJUSTED REVERSAL RESULTS\n")
+cat("PRIMARY SEX-UNADJUSTED REVERSAL RESULTS\n")
 cat("============================================================\n")
 
 cat(
@@ -353,6 +630,13 @@ cat(
 )
 
 cat(
+  sprintf(
+    "Percentage of shared DEGs changing in opposite directions: %.1f%%\n",
+    opposite_percentage
+  )
+)
+
+cat(
   "Genes changing in the same contrast-sign direction:",
   same_direction_total,
   "\n"
@@ -360,22 +644,38 @@ cat(
 
 cat(
   paste0(
-    "Increased from TE to TL and decreased from TL to AE: "
+    "Increased from TE to TL and decreased ",
+    "from TL to AE: "
   ),
   torpor_up_arousal_down_count,
   "\n"
 )
 
 cat(
+  sprintf(
+    "Percentage of opposite-direction genes in this class: %.1f%%\n",
+    dominant_class_percentage
+  )
+)
+
+cat(
   paste0(
-    "Decreased from TE to TL and increased from TL to AE: "
+    "Decreased from TE to TL and increased ",
+    "from TL to AE: "
   ),
   torpor_down_arousal_up_count,
   "\n"
 )
 
+cat(
+  sprintf(
+    "Percentage of opposite-direction genes in this class: %.1f%%\n",
+    inverse_class_percentage
+  )
+)
+
 # ------------------------------------------------------------
-# 6. Fisher exact tests for the two directional classes
+# 13. Fisher exact-test helper
 # ------------------------------------------------------------
 
 fisher_overlap <- function(
@@ -384,15 +684,21 @@ fisher_overlap <- function(
     observed_overlap,
     background_size
 ) {
-
-  first_only <- first_set_size - observed_overlap
-  second_only <- second_set_size - observed_overlap
-
-  neither <- background_size -
+  
+  first_only <-
+    first_set_size -
+    observed_overlap
+  
+  second_only <-
+    second_set_size -
+    observed_overlap
+  
+  neither <-
+    background_size -
     observed_overlap -
     first_only -
     second_only
-
+  
   contingency_table <- matrix(
     c(
       observed_overlap,
@@ -401,29 +707,61 @@ fisher_overlap <- function(
       neither
     ),
     nrow = 2,
-    byrow = TRUE
+    byrow = TRUE,
+    dimnames = list(
+      First_set = c(
+        "In_first_set",
+        "Not_in_first_set"
+      ),
+      Second_set = c(
+        "In_second_set",
+        "Not_in_second_set"
+      )
+    )
   )
-
+  
   if (any(contingency_table < 0)) {
-    stop("Invalid contingency table.")
+    stop(
+      "Invalid Fisher contingency table."
+    )
   }
-
-  fisher.test(
+  
+  fisher_result <- fisher.test(
     contingency_table,
     alternative = "greater"
-  )$p.value
+  )
+  
+  list(
+    table = contingency_table,
+    p_value = fisher_result$p.value,
+    odds_ratio = unname(
+      fisher_result$estimate
+    ),
+    confidence_interval =
+      fisher_result$conf.int
+  )
 }
 
+# ------------------------------------------------------------
+# 14. Directional sets from SEX-UNADJUSTED results
+# ------------------------------------------------------------
+
 # Main biological reversal:
-# increased from TE to TL, then decreased from TL to AE
+# increased from TE to TL,
+# then decreased from TL to AE.
+
 n_TE_TL_negative <- sum(
-  sex_adjusted_results$TE_vs_TL$FDR < fdr_cutoff &
-    sex_adjusted_results$TE_vs_TL$logFC < 0
+  primary_results$TE_vs_TL$FDR <
+    fdr_cutoff &
+    primary_results$TE_vs_TL$logFC < 0,
+  na.rm = TRUE
 )
 
 n_TL_AE_positive <- sum(
-  sex_adjusted_results$TL_vs_AE$FDR < fdr_cutoff &
-    sex_adjusted_results$TL_vs_AE$logFC > 0
+  primary_results$TL_vs_AE$FDR <
+    fdr_cutoff &
+    primary_results$TL_vs_AE$logFC > 0,
+  na.rm = TRUE
 )
 
 expected_torpor_up_arousal_down <-
@@ -431,23 +769,30 @@ expected_torpor_up_arousal_down <-
   n_TL_AE_positive /
   N
 
-p_torpor_up_arousal_down <- fisher_overlap(
+fisher_torpor_up_arousal_down <- fisher_overlap(
   first_set_size = n_TE_TL_negative,
   second_set_size = n_TL_AE_positive,
-  observed_overlap = torpor_up_arousal_down_count,
+  observed_overlap =
+    torpor_up_arousal_down_count,
   background_size = N
 )
 
 # Inverse biological reversal:
-# decreased from TE to TL, then increased from TL to AE
+# decreased from TE to TL,
+# then increased from TL to AE.
+
 n_TE_TL_positive <- sum(
-  sex_adjusted_results$TE_vs_TL$FDR < fdr_cutoff &
-    sex_adjusted_results$TE_vs_TL$logFC > 0
+  primary_results$TE_vs_TL$FDR <
+    fdr_cutoff &
+    primary_results$TE_vs_TL$logFC > 0,
+  na.rm = TRUE
 )
 
 n_TL_AE_negative <- sum(
-  sex_adjusted_results$TL_vs_AE$FDR < fdr_cutoff &
-    sex_adjusted_results$TL_vs_AE$logFC < 0
+  primary_results$TL_vs_AE$FDR <
+    fdr_cutoff &
+    primary_results$TL_vs_AE$logFC < 0,
+  na.rm = TRUE
 )
 
 expected_torpor_down_arousal_up <-
@@ -455,46 +800,63 @@ expected_torpor_down_arousal_up <-
   n_TL_AE_negative /
   N
 
-p_torpor_down_arousal_up <- fisher_overlap(
+fisher_torpor_down_arousal_up <- fisher_overlap(
   first_set_size = n_TE_TL_positive,
   second_set_size = n_TL_AE_negative,
-  observed_overlap = torpor_down_arousal_up_count,
+  observed_overlap =
+    torpor_down_arousal_up_count,
   background_size = N
 )
 
+# ------------------------------------------------------------
+# 15. Multiple-testing correction
+# ------------------------------------------------------------
+
 raw_p_values <- c(
   Torpor_up_arousal_down =
-    p_torpor_up_arousal_down,
-
+    fisher_torpor_up_arousal_down$p_value,
+  
   Torpor_down_arousal_up =
-    p_torpor_down_arousal_up
+    fisher_torpor_down_arousal_up$p_value
 )
 
-# This BH correction is valid only if these two directional tests
-# constitute the complete multiple-testing family.
+# This correction assumes that these two directional tests
+# form the complete multiple-testing family.
 bh_q_values <- p.adjust(
   raw_p_values,
   method = "BH"
 )
 
+# ------------------------------------------------------------
+# 16. Print Fisher-test results
+# ------------------------------------------------------------
+
 cat("\n")
 cat("============================================================\n")
-cat("DIRECTION-SPECIFIC ENRICHMENT TESTS\n")
+cat("SEX-UNADJUSTED DIRECTION-SPECIFIC FISHER TESTS\n")
 cat("============================================================\n")
 
 cat(
   sprintf(
     paste0(
       "Increased during torpor, decreased at arousal:\n",
-      "  observed = %d\n",
-      "  expected = %.2f\n",
-      "  Fisher p = %.3g\n",
+      "  TE-TL negative DEGs = %d\n",
+      "  TL-AE positive DEGs = %d\n",
+      "  observed overlap = %d\n",
+      "  expected overlap = %.2f\n",
+      "  Fisher odds ratio = %.3f\n",
+      "  one-sided Fisher p = %.3g\n",
       "  two-test BH q = %.3g\n"
     ),
+    n_TE_TL_negative,
+    n_TL_AE_positive,
     torpor_up_arousal_down_count,
     expected_torpor_up_arousal_down,
-    p_torpor_up_arousal_down,
-    bh_q_values["Torpor_up_arousal_down"]
+    fisher_torpor_up_arousal_down$odds_ratio,
+    fisher_torpor_up_arousal_down$p_value,
+    bh_q_values[
+      "Torpor_up_arousal_down"
+    ]
   )
 )
 
@@ -502,20 +864,56 @@ cat(
   sprintf(
     paste0(
       "\nDecreased during torpor, increased at arousal:\n",
-      "  observed = %d\n",
-      "  expected = %.2f\n",
-      "  Fisher p = %.3g\n",
+      "  TE-TL positive DEGs = %d\n",
+      "  TL-AE negative DEGs = %d\n",
+      "  observed overlap = %d\n",
+      "  expected overlap = %.2f\n",
+      "  Fisher odds ratio = %.3f\n",
+      "  one-sided Fisher p = %.3g\n",
       "  two-test BH q = %.3g\n"
     ),
+    n_TE_TL_positive,
+    n_TL_AE_negative,
     torpor_down_arousal_up_count,
     expected_torpor_down_arousal_up,
-    p_torpor_down_arousal_up,
-    bh_q_values["Torpor_down_arousal_up"]
+    fisher_torpor_down_arousal_up$odds_ratio,
+    fisher_torpor_down_arousal_up$p_value,
+    bh_q_values[
+      "Torpor_down_arousal_up"
+    ]
   )
 )
 
+cat("\nMain-direction contingency table:\n")
+print(
+  fisher_torpor_up_arousal_down$table
+)
+
+cat("\nInverse-direction contingency table:\n")
+print(
+  fisher_torpor_down_arousal_up$table
+)
+
 # ------------------------------------------------------------
-# 7. Export reversal genes
+# 17. Export all merged sex-unadjusted results
+# ------------------------------------------------------------
+
+write.table(
+  merged_results,
+  file = file.path(
+    output_dir,
+    paste0(
+      "unadjusted_TE_TL_TL_AE_",
+      "all_merged_results.txt"
+    )
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 18. Export sex-unadjusted reversal genes
 # ------------------------------------------------------------
 
 reversal_output <- merged_results %>%
@@ -525,19 +923,198 @@ reversal_output <- merged_results %>%
   mutate(
     Biological_pattern = case_when(
       Torpor_up_arousal_down ~
-        "Increased_TE_to_TL_then_decreased_TL_to_AE",
-
+        paste0(
+          "Increased_TE_to_TL_then_",
+          "decreased_TL_to_AE"
+        ),
+      
       Torpor_down_arousal_up ~
-        "Decreased_TE_to_TL_then_increased_TL_to_AE",
-
+        paste0(
+          "Decreased_TE_to_TL_then_",
+          "increased_TL_to_AE"
+        ),
+      
       TRUE ~ NA_character_
     )
+  ) %>%
+  arrange(
+    Biological_pattern,
+    FDR_TE_TL,
+    FDR_TL_AE
   )
 
 write.table(
   reversal_output,
-  file = "/Users/adrian/Desktop/EQU.03/sex_adjusted_TE_TL_TL_AE_reversal_genes.txt",
+  file = file.path(
+    output_dir,
+    paste0(
+      "unadjusted_TE_TL_TL_AE_",
+      "reversal_genes.txt"
+    )
+  ),
   sep = "\t",
   quote = FALSE,
   row.names = FALSE
 )
+
+# ------------------------------------------------------------
+# 19. Export the two directional reversal classes separately
+# ------------------------------------------------------------
+
+torpor_up_arousal_down_output <-
+  reversal_output %>%
+  filter(
+    Torpor_up_arousal_down
+  )
+
+torpor_down_arousal_up_output <-
+  reversal_output %>%
+  filter(
+    Torpor_down_arousal_up
+  )
+
+write.table(
+  torpor_up_arousal_down_output,
+  file = file.path(
+    output_dir,
+    paste0(
+      "unadjusted_increased_TE_to_TL_",
+      "decreased_TL_to_AE_genes.txt"
+    )
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  torpor_down_arousal_up_output,
+  file = file.path(
+    output_dir,
+    paste0(
+      "unadjusted_decreased_TE_to_TL_",
+      "increased_TL_to_AE_genes.txt"
+    )
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 20. Export summary statistics
+# ------------------------------------------------------------
+
+summary_table <- data.frame(
+  Analysis = c(
+    "Tested_background",
+    "TE_TL_negative_DEGs",
+    "TL_AE_positive_DEGs",
+    "Torpor_up_arousal_down_observed",
+    "Torpor_up_arousal_down_expected",
+    "Torpor_up_arousal_down_Fisher_p",
+    "Torpor_up_arousal_down_BH_q",
+    "TE_TL_positive_DEGs",
+    "TL_AE_negative_DEGs",
+    "Torpor_down_arousal_up_observed",
+    "Torpor_down_arousal_up_expected",
+    "Torpor_down_arousal_up_Fisher_p",
+    "Torpor_down_arousal_up_BH_q",
+    "Significant_in_both",
+    "Total_opposite_direction",
+    "Total_same_direction"
+  ),
+  Value = c(
+    N,
+    n_TE_TL_negative,
+    n_TL_AE_positive,
+    torpor_up_arousal_down_count,
+    expected_torpor_up_arousal_down,
+    fisher_torpor_up_arousal_down$p_value,
+    bh_q_values[
+      "Torpor_up_arousal_down"
+    ],
+    n_TE_TL_positive,
+    n_TL_AE_negative,
+    torpor_down_arousal_up_count,
+    expected_torpor_down_arousal_up,
+    fisher_torpor_down_arousal_up$p_value,
+    bh_q_values[
+      "Torpor_down_arousal_up"
+    ],
+    shared_between_transitions,
+    opposite_total,
+    same_direction_total
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.table(
+  summary_table,
+  file = file.path(
+    output_dir,
+    paste0(
+      "unadjusted_TE_TL_TL_AE_",
+      "reversal_summary.txt"
+    )
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 21. Final report
+# ------------------------------------------------------------
+
+cat("\n")
+cat("============================================================\n")
+cat("DONE\n")
+cat("============================================================\n")
+
+cat(
+  "Primary reversal model: SEX-UNADJUSTED\n"
+)
+
+cat(
+  "Sensitivity model: SEX-ADJUSTED\n"
+)
+
+cat(
+  "FDR cutoff:",
+  fdr_cutoff,
+  "\n"
+)
+
+cat(
+  "Tested background:",
+  N,
+  "genes\n"
+)
+
+cat(
+  "Genes significant in both unadjusted contrasts:",
+  shared_between_transitions,
+  "\n"
+)
+
+cat(
+  "Unadjusted opposite-direction reversal genes:",
+  opposite_total,
+  "\n"
+)
+
+cat(
+  "Increased TE-to-TL then decreased TL-to-AE:",
+  torpor_up_arousal_down_count,
+  "\n"
+)
+
+cat(
+  "Decreased TE-to-TL then increased TL-to-AE:",
+  torpor_down_arousal_up_count,
+  "\n"
+)
+
+cat("\nFiles saved in:\n")
+cat(output_dir, "\n")
