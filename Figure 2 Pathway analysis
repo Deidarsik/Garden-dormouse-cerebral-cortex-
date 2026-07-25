@@ -1,72 +1,377 @@
+# =============================================================================
+# GO AND KEGG ENRICHMENT OF MOUSE-ORTHOLOG GENE LIST FROM THE OPPOSITE REGULATION TABLE
+# =============================================================================
+
 # ----------------------------
-# Install and load required packages
+# 0) Install and load packages
 # ----------------------------
-if (!requireNamespace("BiocManager", quietly = TRUE))
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
   install.packages("BiocManager")
-
-pkgs <- c(
-  "clusterProfiler", "org.Hs.eg.db",
-  "ggplot2", "ggsci", "dplyr"
-)
-
-for (pkg in pkgs) {
-  if (!requireNamespace(pkg, quietly = TRUE))
-    BiocManager::install(pkg)
-  library(pkg, character.only = TRUE)
 }
 
-# ----------------------------
-# 1) Define your gene list exactly as given
-# ----------------------------
-genes <- c(
-  "GRN","COA3","PHB1","PELP1",
-  "SCAMP4","RPS15","NDUFS7","GPX4","BSG","HCN2",
-  "FCGR1A","GPR37L1","BCKDHA","AP1S1","VGF","ALDOA",
-  "TRAP1","SERPINA3","IFI27L2","LGALS3","GLDN","CIB1",
-  "NDN","TUBA4A","AHCY","HCK","SCG2","CYBA","ADGRG1",
-  "UCHL1","LAPTM5","TUBA1B","EXOC6B","SH3BGRL3",
-  "C1QB","C1QA","GRHPR","ITGB2","ATP5PO","SLC25A34",
-  "TMPRSS3","FBXO44","ME3","UCP2","CCKBR","CCDC86",
-  "NUDT22","ACOT7","PC","TF","GPX1","UQCRC1","GAPDH",
-  "LDHB","LDOC1","GDI1","G6PD","PCSK1N","UBA1","COPE",
-  "TMEM59L","THBS4","FKBP8","MPV17L2","PGLS","LCOR",
-  "CD74","FZD6","MRPL4","PPP1R11","MYO1F","HLA-DPB1",
-  "ALOX5AP","AGT","GPS1"
+bioc_pkgs <- c(
+  "clusterProfiler",
+  "org.Mm.eg.db",
+  "AnnotationDbi"
 )
 
-# Remove blanks and literal "NA"
-genes <- unique(genes[genes != "" & genes != "NA"])
+cran_pkgs <- c(
+  "ggplot2",
+  "ggsci",
+  "dplyr"
+)
+
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggsci)
+library(dplyr)
 
 # ----------------------------
-# 2) Sanity check: map symbols to Entrez IDs and report unmapped
+# 1) Define complete updated list
 # ----------------------------
-gene_map <- bitr(
+
+all_genes <- c(
+  "Acer2",
+  "Axin2",
+  "Dennd11",
+  "Equ03.12086",
+  "Equ03.14032",
+  "Equ03.1438",
+  "Equ03.14894",
+  "Equ03.16718",
+  "Equ03.17202",
+  "Equ03.24943",
+  "Equ03.3459",
+  "Equ03.4823",
+  "Equ03.7111",
+  "Equ03.9507",
+  "Equ03.MT-tRNA-Gln",
+  "Fam76b",
+  "Fzd6",
+  "Hook3",
+  "Lcor",
+  "Mob1b",
+  "Msl1",
+  "Nudt4",
+  "Nufip2",
+  "Ogfrl1",
+  "Pals2",
+  "Per3",
+  "Ppargc1b",
+  "Rasa1",
+  "Rprml",
+  "Ubp1",
+  "Aaas",
+  "Acot7",
+  "Adgrg1",
+  "Ahcy",
+  "Akr1b1",
+  "Akr7a5",
+  "Alox5ap",
+  "Ap1s1",
+  "Arf5",
+  "Atp5po",
+  "Bckdha",
+  "Bsg",
+  "C1qb",
+  "Ccdc86",
+  "Cckbr",
+  "Cd44",
+  "Cib1",
+  "Cndp1",
+  "Cndp2",
+  "Coa3",
+  "Cope",
+  "Cyba",
+  "Ddt",
+  "Eif3k",
+  "Eif6",
+  "Equ03.11845",
+  "Equ03.17644",
+  "Equ03.20334",
+  "Equ03.2122",
+  "Equ03.24508",
+  "Equ03.24512",
+  "Equ03.25229",
+  "Equ03.26526",
+  "Ercc1",
+  "Fbxo44",
+  "Fdx2",
+  "Fkbp8",
+  "Ftl1",
+  "G6pdx",
+  "Gapdh",
+  "Gdi1",
+  "Gldn",
+  "Gpr37l1",
+  "Gps1",
+  "Gpx1",
+  "Gpx4",
+  "Grhpr",
+  "Grn",
+  "H2-Ab1",
+  "Hck",
+  "Hcn2",
+  "Itgb2",
+  "Laptm5",
+  "Ldhb",
+  "Ldoc1",
+  "Lgals3",
+  "Lgmn",
+  "Lman2l",
+  "Me3",
+  "Mpst",
+  "Mpv17l2",
+  "Mrpl38",
+  "Mrpl4",
+  "Myo1f",
+  "Myo1f",
+  "Nans",
+  "Naxe",
+  "Ndn",
+  "Ndufs2",
+  "Ndufs7",
+  "Ndufs8",
+  "Nherf1",
+  "Nudt22",
+  "Parvg",
+  "Pcsk1n",
+  "Pcx",
+  "Pgls",
+  "Ppil1",
+  "Ppp1r11",
+  "Rhog",
+  "Rnh1",
+  "Rpl18a",
+  "Rps15",
+  "Scamp4",
+  "Scg2",
+  "Selenow",
+  "Sh3bgrl3",
+  "Slc25a34",
+  "Slc37a2",
+  "Smpd1",
+  "Tbrg4",
+  "Tecr",
+  "Thbs4",
+  "Timm17b",
+  "Tmem59l",
+  "Tmprss3",
+  "Tom1",
+  "Trap1",
+  "Trf",
+  "Tuba4a",
+  "Uba1",
+  "Uchl1",
+  "Ucp2",
+  "Uqcrc1",
+  "Vsir"
+)
+
+# ----------------------------
+# 2) Exclude Equ03 genes
+# ----------------------------
+
+all_genes <- all_genes[
+  !is.na(all_genes) &
+    all_genes != "" &
+    all_genes != "NA"
+]
+
+equ_genes <- unique(
+  all_genes[grepl("^Equ03\\.", all_genes)]
+)
+
+genes <- unique(
+  all_genes[!grepl("^Equ03\\.", all_genes)]
+)
+
+cat("\nINPUT SUMMARY\n")
+cat("-------------\n")
+cat("Rows supplied:                ", length(all_genes), "\n")
+cat("Equ03 identifiers excluded:   ", length(equ_genes), "\n")
+cat("Unique mouse symbols retained:", length(genes), "\n\n")
+
+cat("Excluded Equ03 identifiers:\n")
+print(equ_genes)
+
+# ----------------------------
+# 3) Create output directory
+# ----------------------------
+
+outdir <- "go_kegg_updated_mouse_genes"
+
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = TRUE)
+}
+
+write.csv(
+  data.frame(Excluded_Equ03_ID = equ_genes),
+  file = file.path(outdir, "excluded_Equ03_genes.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(MouseSymbolSubmitted = genes),
+  file = file.path(outdir, "mouse_symbols_submitted.csv"),
+  row.names = FALSE
+)
+
+# ----------------------------
+# 4) Direct SYMBOL-to-Entrez mapping
+# ----------------------------
+
+direct_map <- suppressMessages(
+  bitr(
+    genes,
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Mm.eg.db
+  )
+)
+
+if (is.null(direct_map) || nrow(direct_map) == 0) {
+  direct_map_clean <- data.frame(
+    InputSymbol = character(),
+    MouseSymbol = character(),
+    ENTREZID    = character(),
+    MappingType = character()
+  )
+} else {
+  direct_map_clean <- direct_map %>%
+    transmute(
+      InputSymbol = SYMBOL,
+      MouseSymbol = SYMBOL,
+      ENTREZID    = as.character(ENTREZID),
+      MappingType = "Direct SYMBOL"
+    )
+}
+
+directly_mapped <- unique(direct_map_clean$InputSymbol)
+
+unmapped_after_symbol <- setdiff(
   genes,
-  fromType = "SYMBOL",
-  toType   = "ENTREZID",
-  OrgDb    = org.Hs.eg.db
+  directly_mapped
 )
 
-mapped   <- gene_map$SYMBOL
-unmapped <- setdiff(genes, mapped)
+# ----------------------------
+# 5) Attempt alias mapping
+# ----------------------------
 
-cat("Total symbols provided:   ", length(genes), "\n")
-cat("Successfully mapped:      ", length(unique(mapped)), "\n")
-cat("Failed to map:            ", length(unmapped), "\n")
+if (length(unmapped_after_symbol) > 0) {
+
+  alias_map <- suppressMessages(
+    AnnotationDbi::select(
+      org.Mm.eg.db,
+      keys    = unmapped_after_symbol,
+      keytype = "ALIAS",
+      columns = c("SYMBOL", "ENTREZID")
+    )
+  )
+
+  alias_map_clean <- alias_map %>%
+    filter(
+      !is.na(ENTREZID),
+      !is.na(SYMBOL)
+    ) %>%
+    transmute(
+      InputSymbol = ALIAS,
+      MouseSymbol = SYMBOL,
+      ENTREZID    = as.character(ENTREZID),
+      MappingType = "Mouse alias"
+    )
+
+} else {
+
+  alias_map_clean <- data.frame(
+    InputSymbol = character(),
+    MouseSymbol = character(),
+    ENTREZID    = character(),
+    MappingType = character()
+  )
+}
+
+# Combine direct and alias mappings
+gene_map <- bind_rows(
+  direct_map_clean,
+  alias_map_clean
+) %>%
+  distinct(
+    InputSymbol,
+    MouseSymbol,
+    ENTREZID,
+    .keep_all = TRUE
+  )
+
+mapped_input_symbols <- unique(gene_map$InputSymbol)
+
+unmapped <- setdiff(
+  genes,
+  mapped_input_symbols
+)
+
+entrez_ids <- unique(gene_map$ENTREZID)
+
+# ----------------------------
+# 6) Mapping summary
+# ----------------------------
+
+cat("\nMAPPING SUMMARY\n")
+cat("---------------\n")
+cat("Unique mouse symbols submitted: ", length(genes), "\n")
+cat("Symbols mapped:                  ",
+    length(mapped_input_symbols), "\n")
+cat("Unique Entrez IDs obtained:      ",
+    length(entrez_ids), "\n")
+cat("Symbols still unmapped:          ",
+    length(unmapped), "\n\n")
 
 if (length(unmapped) > 0) {
   cat("Unmapped symbols:\n")
   print(unmapped)
 }
 
-entrez_ids <- unique(gene_map$ENTREZID)
+write.csv(
+  gene_map,
+  file = file.path(outdir, "mouse_symbol_to_entrez_mapping.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(UnmappedSymbol = unmapped),
+  file = file.path(outdir, "unmapped_mouse_symbols.csv"),
+  row.names = FALSE
+)
+
+if (length(entrez_ids) == 0) {
+  stop(
+    "No genes mapped to mouse Entrez IDs. Enrichment cannot be performed."
+  )
+}
 
 # ----------------------------
-# 3) GO enrichment analysis
+# 7) GO Biological Process enrichment
 # ----------------------------
+
 ego <- enrichGO(
   gene          = entrez_ids,
-  OrgDb         = org.Hs.eg.db,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
   ont           = "BP",
   pAdjustMethod = "BH",
   pvalueCutoff  = 0.05,
@@ -74,177 +379,309 @@ ego <- enrichGO(
   readable      = TRUE
 )
 
-ego_df <- as.data.frame(ego)
+if (is.null(ego)) {
+  ego_df <- data.frame()
+} else {
+  ego_df <- as.data.frame(ego)
+}
 
 if (nrow(ego_df) > 0) {
-  ego_df$Bg <- as.numeric(sub("/.*", "", ego_df$BgRatio))
-  ego_df$RichFactor <- ego_df$Count / ego_df$Bg
+
+  # Numerator of BgRatio is the number of background genes
+  # annotated to that GO term.
+  ego_df$BgTermSize <- as.numeric(
+    sub("/.*", "", ego_df$BgRatio)
+  )
+
+  ego_df$RichFactor <- ego_df$Count / ego_df$BgTermSize
 }
 
 # ----------------------------
-# 4) KEGG pathway enrichment
+# 8) KEGG mouse pathway enrichment
 # ----------------------------
+
 ekegg <- enrichKEGG(
-  gene         = entrez_ids,
-  organism     = "hsa",
-  pvalueCutoff = 0.05
+  gene          = entrez_ids,
+  organism      = "mmu",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.10
 )
 
-ekegg <- setReadable(
-  ekegg,
-  OrgDb   = org.Hs.eg.db,
-  keyType = "ENTREZID"
-)
+if (!is.null(ekegg) && nrow(as.data.frame(ekegg)) > 0) {
 
-ekegg_df <- as.data.frame(ekegg)
+  ekegg <- setReadable(
+    ekegg,
+    OrgDb   = org.Mm.eg.db,
+    keyType = "ENTREZID"
+  )
 
-if (nrow(ekegg_df) > 0) {
-  ekegg_df$ID <- sub("^hsa", "", ekegg_df$ID)
-  ekegg_df$Bg <- as.numeric(sub("/.*", "", ekegg_df$BgRatio))
-  ekegg_df$RichFactor <- ekegg_df$Count / ekegg_df$Bg
+  ekegg_df <- as.data.frame(ekegg)
+
+  ekegg_df$ID <- sub(
+    "^mmu",
+    "",
+    ekegg_df$ID
+  )
+
+  ekegg_df$BgTermSize <- as.numeric(
+    sub("/.*", "", ekegg_df$BgRatio)
+  )
+
+  ekegg_df$RichFactor <- (
+    ekegg_df$Count / ekegg_df$BgTermSize
+  )
+
+} else {
+
+  ekegg_df <- data.frame()
 }
 
 # ----------------------------
-# 5) Create output directory
+# 9) Write enrichment tables
 # ----------------------------
-outdir <- "go_kegg_results"
 
-if (!dir.exists(outdir)) {
-  dir.create(outdir)
-}
-
-# ----------------------------
-# 6) Write results to CSV
-# ----------------------------
 write.csv(
   ego_df,
-  file = file.path(outdir, "GO_BP_enrichment.csv"),
+  file = file.path(
+    outdir,
+    "GO_BP_enrichment.csv"
+  ),
   row.names = FALSE
 )
 
 write.csv(
   ekegg_df,
-  file = file.path(outdir, "KEGG_enrichment.csv"),
+  file = file.path(
+    outdir,
+    "KEGG_mouse_enrichment.csv"
+  ),
   row.names = FALSE
 )
 
 # ----------------------------
-# 7) Visualization
+# 10) Plot settings
 # ----------------------------
 
-# Use only 3 colours
 three_cols <- pal_npg("nrc")(3)
 
-# Helper function to make exactly 3 RichFactor groups
+# Robust three-group assignment.
+# Unlike quantile-based cut(), this does not fail when
+# several terms have identical RichFactor values.
 add_rich_group <- function(df) {
   df %>%
     mutate(
       RichGroup = cut(
         RichFactor,
-        breaks = quantile(RichFactor, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+        breaks = quantile(
+          RichFactor,
+          probs = c(0, 1/3, 2/3, 1),
+          na.rm = TRUE
+        ),
         include.lowest = TRUE,
         labels = c("Low", "Medium", "High")
       )
     )
 }
 
-# Shared clean theme
 clean_theme <- theme_classic() +
   theme(
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-    axis.title.x = element_text(size = 12, face = "bold"),
-    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(
+      size = 14,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.title.x = element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.title.y = element_text(
+      size = 12,
+      face = "bold"
+    ),
     axis.text.x = element_text(size = 10),
     axis.text.y = element_text(size = 10),
-    legend.title = element_text(size = 10, face = "bold"),
+    legend.title = element_text(
+      size = 10,
+      face = "bold"
+    ),
     legend.text = element_text(size = 9)
   )
 
 # ----------------------------
-# 7a) GO RichFactor dotplot
+# 11) GO RichFactor dot plot
 # ----------------------------
+
 if (nrow(ego_df) > 0) {
-  
+
   topGO <- ego_df %>%
-    arrange(desc(RichFactor)) %>%
-    head(20) %>%
+    filter(is.finite(RichFactor)) %>%
+    arrange(
+      desc(RichFactor),
+      p.adjust
+    ) %>%
+    slice_head(n = 20) %>%
     add_rich_group()
-  
+
   p1 <- ggplot(
     topGO,
     aes(
       x = RichFactor,
-      y = reorder(Description, RichFactor),
-      color = RichGroup,
+      y = reorder(
+        Description,
+        RichFactor
+      ),
+      colour = RichGroup,
       size = Count
     )
   ) +
     geom_point(alpha = 0.9) +
-    scale_color_manual(values = three_cols) +
+    scale_colour_manual(
+      values = three_cols,
+      drop = FALSE
+    ) +
     labs(
       title = "GO Biological Process Enrichment",
-      x = "Rich Factor",
+      x = "Rich factor",
       y = "GO term",
-      color = "Rich Factor",
-      size = "Gene Count"
+      colour = "Rich factor",
+      size = "Gene count"
     ) +
     clean_theme
-  
+
   ggsave(
-    file.path(outdir, "GO_RichFactor_dotplot.pdf"),
+    filename = file.path(
+      outdir,
+      "GO_RichFactor_dotplot.pdf"
+    ),
     plot = p1,
     width = 8,
     height = 6
   )
-  
+
 } else {
-  cat("No significant GO BP enrichment results found.\n")
+
+  cat(
+    "\nNo significant GO BP enrichment results found.\n"
+  )
 }
 
 # ----------------------------
-# 7b) KEGG RichFactor barplot
+# 12) KEGG RichFactor bar plot
 # ----------------------------
+
 if (nrow(ekegg_df) > 0) {
-  
+
   topKEGG <- ekegg_df %>%
-    arrange(desc(RichFactor)) %>%
-    head(20) %>%
+    filter(is.finite(RichFactor)) %>%
+    arrange(
+      desc(RichFactor),
+      p.adjust
+    ) %>%
+    slice_head(n = 20) %>%
     add_rich_group()
-  
+
   p2 <- ggplot(
     topKEGG,
     aes(
       x = RichFactor,
-      y = reorder(Description, RichFactor),
+      y = reorder(
+        Description,
+        RichFactor
+      ),
       fill = RichGroup
     )
   ) +
     geom_col(width = 0.75) +
-    scale_fill_manual(values = three_cols) +
+    scale_fill_manual(
+      values = three_cols,
+      drop = FALSE
+    ) +
     labs(
       title = "KEGG Pathway Enrichment",
-      x = "Rich Factor",
+      x = "Rich factor",
       y = "KEGG pathway",
-      fill = "Rich Factor"
+      fill = "Rich factor"
     ) +
     clean_theme
-  
+
   ggsave(
-    file.path(outdir, "KEGG_RichFactor_barplot.pdf"),
+    filename = file.path(
+      outdir,
+      "KEGG_RichFactor_barplot.pdf"
+    ),
     plot = p2,
     width = 8,
     height = 6
   )
-  
+
 } else {
-  cat("No significant KEGG enrichment results found.\n")
+
+  cat(
+    "\nNo significant KEGG enrichment results found.\n"
+  )
 }
 
 # ----------------------------
-# 8) Save session info
+# 13) Save analysis summary
 # ----------------------------
+
+summary_lines <- c(
+  paste(
+    "Rows originally supplied:",
+    length(all_genes)
+  ),
+  paste(
+    "Equ03 identifiers excluded:",
+    length(equ_genes)
+  ),
+  paste(
+    "Unique mouse symbols submitted:",
+    length(genes)
+  ),
+  paste(
+    "Mouse symbols successfully mapped:",
+    length(mapped_input_symbols)
+  ),
+  paste(
+    "Unique Entrez IDs analysed:",
+    length(entrez_ids)
+  ),
+  paste(
+    "Unmapped mouse symbols:",
+    length(unmapped)
+  ),
+  paste(
+    "Significant GO BP terms:",
+    nrow(ego_df)
+  ),
+  paste(
+    "Significant KEGG pathways:",
+    nrow(ekegg_df)
+  )
+)
+
+writeLines(
+  summary_lines,
+  con = file.path(
+    outdir,
+    "analysis_summary.txt"
+  )
+)
+
+# ----------------------------
+# 14) Save session information
+# ----------------------------
+
 writeLines(
   capture.output(sessionInfo()),
-  con = file.path(outdir, "sessionInfo.txt")
+  con = file.path(
+    outdir,
+    "sessionInfo.txt"
+  )
 )
+
+cat("\nAnalysis complete.\n")
+cat("Results saved in:\n")
+cat(normalizePath(outdir), "\n")
 
