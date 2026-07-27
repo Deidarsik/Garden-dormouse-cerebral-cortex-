@@ -599,15 +599,55 @@ col_fun <- circlize::colorRamp2(
   c(heatmap_low, "white", heatmap_high)
 )
 
+# ----------------------------
+# Warm/cold column grouping
+# ----------------------------
+
+thermal_state_plot <- factor(
+  ifelse(
+    metadata$Group %in% warm_groups,
+    "Warm",
+    "Cold"
+  ),
+  levels = c("Warm", "Cold")
+)
+
+# Confirm that the order is:
+# Warm samples first, followed by Cold samples
+if (!identical(
+  as.character(thermal_state_plot),
+  c(
+    rep("Warm", sum(metadata$Group %in% warm_groups)),
+    rep("Cold", sum(metadata$Group %in% cold_groups))
+  )
+)) {
+  stop(
+    "Samples are not arranged as one Warm block followed by one Cold block."
+  )
+}
+
+# Existing coloured stage annotation
 ha <- ComplexHeatmap::HeatmapAnnotation(
   Group = metadata$Group,
-  col = if (use_annotation_colors) annotation_colors else NULL,
+  
+  col = if (use_annotation_colors) {
+    annotation_colors
+  } else {
+    NULL
+  },
+  
   annotation_name_side = "left",
+  show_annotation_name = TRUE,
   simple_anno_size = grid::unit(5, "mm"),
+  
   annotation_legend_param = list(
     Group = list(
-      title_gp = grid::gpar(fontsize = legend_title_fontsize),
-      labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+      title_gp = grid::gpar(
+        fontsize = legend_title_fontsize
+      ),
+      labels_gp = grid::gpar(
+        fontsize = legend_label_fontsize
+      )
     )
   )
 )
@@ -705,56 +745,89 @@ print(
 
 
 # Version 1: clean heatmap, no title, no animal names, no gene names
+# Version 1: clean heatmap, no animal names or gene names
 ht_clean <- ComplexHeatmap::Heatmap(
   z_mat_plot,
   name = "z-score",
   col = col_fun,
+  
   cluster_rows = FALSE,
   cluster_columns = FALSE,
+  
   row_split = row_split_factor,
   cluster_row_slices = FALSE,
+  
+  # Divide columns into Warm and Cold blocks
+  column_split = thermal_state_plot,
+  cluster_column_slices = FALSE,
+  
+  # Keep the two blocks touching
+  column_gap = grid::unit(0, "mm"),
+  
+  # Titles above the two blocks
+  column_title = c("Warm", "Cold"),
+  column_title_side = "top",
+  column_title_gp = grid::gpar(
+    fontsize = 15,
+    fontface = "bold"
+  ),
+  
   show_row_names = FALSE,
   show_column_names = FALSE,
+  
   top_annotation = ha,
-  column_title = NULL,
   border = FALSE,
+  
   heatmap_legend_param = list(
-    title_gp = grid::gpar(fontsize = legend_title_fontsize),
-    labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+    title_gp = grid::gpar(
+      fontsize = legend_title_fontsize
+    ),
+    labels_gp = grid::gpar(
+      fontsize = legend_label_fontsize
+    )
   )
 )
 
-# Version 2: heatmap with dendrogram, mouse ortholog sidebar
-# and annotated gene names
+# Version 2: heatmap with dendrogram and mouse-ortholog sidebar
 ht_mouse_ortholog <- ComplexHeatmap::Heatmap(
   z_mat_named,
   name = "z-score",
   col = col_fun,
   
-  # Dendrogram calculated from the original z-score matrix
+  # Row dendrogram
   cluster_rows = hm$tree_row,
   show_row_dend = TRUE,
   row_dend_side = "left",
   
-  # Cut the dendrogram into six clusters
+  # Two row clusters
   row_split = k_row,
   cluster_row_slices = FALSE,
   
-  # Print annotated gene symbols
   show_row_names = FALSE,
-  #row_labels = gene_labels,
-  #row_names_side = "right",
-  #row_names_gp = grid::gpar(fontsize = 6),
-  #row_names_max_width = grid::unit(5, "cm"),
   
-  # Keep animals in SE, AE, AL, TE, TL order
+  # Keep animals in their existing order
   cluster_columns = FALSE,
+  
+  # Divide columns into Warm and Cold blocks
+  column_split = thermal_state_plot,
+  cluster_column_slices = FALSE,
+  
+  # Keep the blocks touching
+  column_gap = grid::unit(0, "mm"),
+  
+  # Titles above the two blocks
+  column_title = c("Warm", "Cold"),
+  column_title_side = "top",
+  column_title_gp = grid::gpar(
+    fontsize = 15,
+    fontface = "bold"
+  ),
+  
   show_column_names = FALSE,
   
   top_annotation = ha,
   right_annotation = mouse_ra_named,
   
-  column_title = NULL,
   border = FALSE,
   
   heatmap_legend_param = list(
