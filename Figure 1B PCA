@@ -1,37 +1,35 @@
 suppressPackageStartupMessages({
-  if (!requireNamespace("BiocManager", quietly = TRUE)) {
-    install.packages("BiocManager", repos = "https://cloud.r-project.org")
-  }
-  
-  cran_pkgs <- c("ggplot2", "ggsci", "dplyr", "cowplot")
-  bioc_pkgs <- c("edgeR", "clusterProfiler", "org.Mm.eg.db")
-  
-  for (pkg in cran_pkgs) {
-    if (!requireNamespace(pkg, quietly = TRUE)) {
-      install.packages(pkg, repos = "https://cloud.r-project.org")
-    }
-    library(pkg, character.only = TRUE)
-  }
-  
-  for (pkg in bioc_pkgs) {
-    if (!requireNamespace(pkg, quietly = TRUE)) {
-      BiocManager::install(pkg, ask = FALSE, update = FALSE)
-    }
-    library(pkg, character.only = TRUE)
-  }
+  library(edgeR)
+  library(ggplot2)
 })
 
-# ============================================================
-# SETTINGS
-# ============================================================
-base_dir   <- "/Users/adrian/Downloads/alltissues"
-trans_file <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
-outdir     <- file.path(base_dir, "PCA_Pathway_outputs")
+# =============================================================================
+# 1. INPUT AND OUTPUT FILES
+# =============================================================================
 
-if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+count_file <- "/Users/adrian/Desktop/reprex/20251016_merged_Cortex_0FPM.txt"
+sample_file <- "/Users/adrian/Desktop/reprex/20251016_merged_Cortex_samples.txt"
 
-# Only process Cortex
-target_tissue <- "Cortex"
+output_dir <- "/Users/adrian/Desktop/reprex/Cortex_PCA_only_output"
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(file.exists(count_file))
+stopifnot(file.exists(sample_file))
+
+cat("\nCount file:\n", normalizePath(count_file), "\n", sep = "")
+cat("Count-file MD5: ", unname(tools::md5sum(count_file)), "\n", sep = "")
+
+cat("\nMetadata file:\n", normalizePath(sample_file), "\n", sep = "")
+cat("Metadata-file MD5: ", unname(tools::md5sum(sample_file)), "\n", sep = "")
+
+# =============================================================================
+# 2. PHASE LABELS
+# =============================================================================
 
 phase_map <- c(
   "SE" = "summer euthermia",
@@ -41,7 +39,6 @@ phase_map <- c(
   "AL" = "arousal (late)"
 )
 
-# Same order as your heatmap: SE, AE, AL, TE, TL
 ordered_phases <- c(
   "summer euthermia",
   "arousal (early)",
@@ -50,330 +47,53 @@ ordered_phases <- c(
   "torpor (late)"
 )
 
-# Same colours as your heatmap group annotation
-# SE, AE, AL = lighter colours
-# TE, TL = darker colours
 phase_cols <- c(
-  "summer euthermia" = "#BFD7EA",  # SE light blue
-  "arousal (early)"  = "#C7E9C0",  # AE light green
-  "arousal (late)"   = "#FDDDB6",  # AL light orange
-  "torpor (early)"   = "#08519C",  # TE dark blue
-  "torpor (late)"    = "#54278F"   # TL dark purple
+  "summer euthermia" = "#BFD7EA",
+  "arousal (early)"  = "#C7E9C0",
+  "arousal (late)"   = "#FDDDB6",
+  "torpor (early)"   = "#08519C",
+  "torpor (late)"    = "#54278F"
 )
 
-preferred_tissue_order <- c(
-  "BAT", "Cereb", "Cortex", "Heart", "Hippoc", "Hypoth", "Kidney", "Liver", "WAT"
+# =============================================================================
+# 3. READ COUNT MATRIX
+# =============================================================================
+
+counts <- read.table(
+  count_file,
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  quote = ""
 )
 
-# ============================================================
-# HELPERS
-# ============================================================
-axis_lab <- function(pc_index, var_pct) {
-  paste0("PC", pc_index, " (", var_pct[pc_index], "%)")
+if (!"Gene" %in% colnames(counts)) {
+  stop("The count file must contain a column named 'Gene'.")
 }
 
-clean_genes <- function(x) {
-  unique(x[!is.na(x) & trimws(x) != "" & trimws(x) != "NA" & trimws(x) != "?"])
+rownames(counts) <- counts$Gene
+counts$Gene <- NULL
+
+if (any(counts %% 1 != 0, na.rm = TRUE)) {
+  message("Non-integer counts detected; rounding to nearest integer.")
+  counts <- round(as.matrix(counts))
+} else {
+  counts <- as.matrix(counts)
 }
 
-extract_tissue_from_count <- function(path) {
-  x <- basename(path)
-  x <- sub("^[0-9]+_merged_", "", x)
-  x <- sub("_0FPM.*$", "", x)
-  x
+storage.mode(counts) <- "numeric"
+
+if (anyNA(counts)) {
+  stop("The count matrix contains missing or non-numeric values.")
 }
 
-extract_tissue_from_sample <- function(path) {
-  x <- basename(path)
-  x <- sub("^[0-9]+_merged_", "", x)
-  x <- sub("_samples.*$", "", x)
-  x
-}
+# =============================================================================
+# 4. READ AND ALIGN METADATA
+# =============================================================================
 
-plot_pc12 <- function(df, tissue, var_pct, outfile_png, outfile_pdf) {
-  
-  # ------------------------------------------------------------
-  # Force PC1 and PC2 to use the same numerical axis span.
-  # This ensures PC1 is not shorter than PC2.
-  # ------------------------------------------------------------
-  x_range <- range(df$PC1, na.rm = TRUE)
-  y_range <- range(df$PC2, na.rm = TRUE)
-  
-  x_mid <- mean(x_range)
-  y_mid <- mean(y_range)
-  
-  x_span <- diff(x_range)
-  y_span <- diff(y_range)
-  
-  final_span <- max(x_span, y_span) * 1.10
-  
-  if (!is.finite(final_span) || final_span == 0) {
-    final_span <- 1
-  }
-  
-  x_limits <- x_mid + c(-final_span / 2, final_span / 2)
-  y_limits <- y_mid + c(-final_span / 2, final_span / 2)
-  
-  p <- ggplot(df, aes(x = PC1, y = PC2)) +
-    geom_point(
-      aes(color = phase, shape = sex),
-      size = 5,
-      alpha = 0.9,
-      stroke = 1.1
-    ) +
-    scale_color_manual(
-      values = phase_cols,
-      breaks = ordered_phases,
-      drop = FALSE
-    ) +
-    scale_shape_manual(
-      values = c("male" = 16, "female" = 17),
-      drop = FALSE
-    ) +
-    coord_fixed(
-      ratio = 1,
-      xlim = x_limits,
-      ylim = y_limits
-    ) +
-    labs(
-      x = axis_lab(1, var_pct),
-      y = axis_lab(2, var_pct),
-      color = "Hibernation phase",
-      shape = "Sex"
-    ) +
-    theme_minimal(base_size = 18, base_family = "Helvetica") +
-    theme(
-      plot.title = element_text(face = "bold", hjust = 0.5),
-      axis.title = element_text(size = 18),
-      axis.text = element_text(size = 13),
-      legend.title = element_text(size = 14),
-      legend.text = element_text(size = 12),
-      panel.grid.major = element_line(color = "#d9d9d9", linewidth = 0.5),
-      panel.grid.minor = element_blank(),
-      axis.line = element_line(color = "black"),
-      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
-    )
-  
-  ggsave(outfile_png, plot = p, width = 8, height = 6, dpi = 300, bg = "white")
-  ggsave(outfile_pdf, plot = p, width = 8, height = 6, bg = "white")
-}
-
-generate_bubble_plot_twopanel <- function(df, title_text, outfile, top_n = 20) {
-  if (is.null(df) || nrow(df) == 0) {
-    message("No significant terms for ", title_text)
-    return(invisible(NULL))
-  }
-  
-  df2 <- df %>%
-    dplyr::arrange(desc(Count)) %>%
-    dplyr::slice_head(n = top_n) %>%
-    dplyr::mutate(
-      GeneRatio_num = sapply(strsplit(GeneRatio, "/"), function(x) {
-        as.numeric(x[1]) / as.numeric(x[2])
-      })
-    ) %>%
-    dplyr::arrange(Count)
-  
-  desc_levels <- df2$Description
-  
-  annot <- ggplot(
-    df2,
-    aes(
-      x = 1,
-      y = factor(Description, levels = desc_levels),
-      label = Description
-    )
-  ) +
-    geom_text(hjust = 1, size = 5, family = "Helvetica") +
-    scale_y_discrete(limits = rev(desc_levels)) +
-    theme_void() +
-    theme(plot.margin = margin(10, 5, 10, 10)) +
-    xlim(0.85, 1)
-  
-  bubble <- ggplot(
-    df2,
-    aes(
-      x = GeneRatio_num,
-      y = factor(Description, levels = desc_levels),
-      size = Count,
-      color = -log10(p.adjust)
-    )
-  ) +
-    geom_point(alpha = 0.8) +
-    scale_size_continuous(range = c(4, 12)) +
-    scale_color_gradientn(
-      colors = colorRampPalette(ggsci::pal_jco("default")(3))(100)
-    ) +
-    labs(
-      title = title_text,
-      x = "Gene Ratio",
-      y = NULL,
-      size = "Gene Count",
-      color = "-log10(q-value)"
-    ) +
-    theme_minimal(base_size = 18, base_family = "Helvetica") +
-    theme(
-      plot.title = element_text(face = "bold", hjust = 0.5),
-      axis.text.y = element_blank(),
-      axis.ticks.y = element_blank(),
-      axis.title.x = element_text(size = 16, margin = margin(t = 10)),
-      axis.text.x = element_text(size = 12),
-      plot.margin = margin(10, 30, 10, 0),
-      legend.title = element_text(size = 14),
-      legend.text = element_text(size = 11),
-      panel.grid.major.x = element_line(color = "#cccccc"),
-      panel.grid.minor.x = element_blank(),
-      panel.grid.major.y = element_line(color = "#dddddd")
-    )
-  
-  combined <- cowplot::plot_grid(
-    annot, bubble,
-    nrow = 1,
-    rel_widths = c(2, 1),
-    align = "h",
-    axis = "tb"
-  )
-  
-  ggsave(
-    filename = outfile,
-    plot = combined,
-    width = 16,
-    height = 8,
-    units = "in",
-    dpi = 300,
-    bg = "white"
-  )
-}
-
-run_enrichment <- function(symbols, label) {
-  if (length(symbols) == 0L) {
-    warning("No translated symbols for ", label)
-    return(NULL)
-  }
-  
-  gene_map <- suppressMessages(
-    tryCatch(
-      bitr(
-        symbols,
-        fromType = "SYMBOL",
-        toType   = "ENTREZID",
-        OrgDb    = org.Mm.eg.db
-      ),
-      error = function(e) NULL
-    )
-  )
-  
-  if (is.null(gene_map) || nrow(gene_map) == 0L) {
-    warning("No genes could be mapped to Entrez IDs for ", label)
-    return(NULL)
-  }
-  
-  mapped <- unique(gene_map$SYMBOL)
-  unmapped <- setdiff(symbols, mapped)
-  entrez_ids <- unique(gene_map$ENTREZID)
-  
-  cat("=== ", label, " ===\n", sep = "")
-  cat("Total symbols provided: ", length(symbols), "\n")
-  cat("Successfully mapped:    ", length(mapped), "\n")
-  cat("Failed to map:          ", length(unmapped), "\n")
-  if (length(unmapped) > 0) {
-    cat("Unmapped symbols:\n")
-    print(unmapped)
-  }
-  
-  ego <- tryCatch(
-    enrichGO(
-      gene          = entrez_ids,
-      OrgDb         = org.Mm.eg.db,
-      ont           = "BP",
-      pAdjustMethod = "BH",
-      pvalueCutoff  = 0.05,
-      qvalueCutoff  = 0.10,
-      readable      = TRUE
-    ),
-    error = function(e) NULL
-  )
-  
-  ego_df <- if (!is.null(ego)) as.data.frame(ego) else data.frame()
-  if (nrow(ego_df) > 0) {
-    ego_df$Bg <- as.numeric(sub("/.*", "", ego_df$BgRatio))
-    ego_df$RichFactor <- ego_df$Count / ego_df$Bg
-  }
-  
-  ekegg <- tryCatch(
-    enrichKEGG(
-      gene         = entrez_ids,
-      organism     = "mmu",
-      pvalueCutoff = 0.05
-    ),
-    error = function(e) NULL
-  )
-  
-  if (!is.null(ekegg) && nrow(as.data.frame(ekegg)) > 0) {
-    ekegg <- tryCatch(
-      setReadable(ekegg, OrgDb = org.Mm.eg.db, keyType = "ENTREZID"),
-      error = function(e) ekegg
-    )
-    ekegg_df <- as.data.frame(ekegg)
-    if ("ID" %in% colnames(ekegg_df)) {
-      ekegg_df$ID <- sub("^mmu", "", ekegg_df$ID)
-    }
-    ekegg_df$Bg <- as.numeric(sub("/.*", "", ekegg_df$BgRatio))
-    ekegg_df$RichFactor <- ekegg_df$Count / ekegg_df$Bg
-  } else {
-    ekegg_df <- data.frame()
-  }
-  
-  list(
-    ego = ego,
-    ego_df = ego_df,
-    ekegg = ekegg,
-    ekegg_df = ekegg_df
-  )
-}
-
-save_enrichment_outputs <- function(res, prefix, tissue_outdir) {
-  if (is.null(res)) return(invisible(NULL))
-  
-  ego_df <- res$ego_df
-  ekegg_df <- res$ekegg_df
-  
-  write.csv(
-    ego_df,
-    file = file.path(tissue_outdir, paste0("GO_BP_", prefix, ".csv")),
-    row.names = FALSE
-  )
-  
-  write.csv(
-    ekegg_df,
-    file = file.path(tissue_outdir, paste0("KEGG_", prefix, ".csv")),
-    row.names = FALSE
-  )
-  
-  if (nrow(ego_df) > 0) {
-    generate_bubble_plot_twopanel(
-      df = ego_df,
-      title_text = paste("GO Enrichment -", prefix),
-      outfile = file.path(tissue_outdir, paste0("GO_BP_", prefix, "_bubble.png")),
-      top_n = 20
-    )
-  }
-  
-  if (nrow(ekegg_df) > 0) {
-    generate_bubble_plot_twopanel(
-      df = ekegg_df,
-      title_text = paste("KEGG Enrichment -", prefix),
-      outfile = file.path(tissue_outdir, paste0("KEGG_", prefix, "_bubble.png")),
-      top_n = 20
-    )
-  }
-}
-
-# ============================================================
-# READ TRANSLATION TABLE
-# ============================================================
-trans <- read.table(
-  trans_file,
+meta_raw <- read.table(
+  sample_file,
   header = TRUE,
   sep = "\t",
   stringsAsFactors = FALSE,
@@ -381,295 +101,359 @@ trans <- read.table(
   quote = ""
 )
 
-colnames(trans) <- trimws(sub("^\\ufeff", "", colnames(trans)))
-trans$Source_gene <- trimws(trans$Source_gene)
-
-candidate_symbol_cols <- c(
-  "Gene_name.y", "Gene_name", "gene_name", "gene_symbol",
-  "SYMBOL", "Symbol", "mouse_symbol", "Mouse_symbol",
-  "Mmu_symbol", "external_gene_name"
+required_columns <- c(
+  "Sample",
+  "Animal",
+  "Tissue",
+  "Group",
+  "Sex"
 )
 
-symbol_col <- candidate_symbol_cols[candidate_symbol_cols %in% colnames(trans)][1]
+missing_columns <- setdiff(
+  required_columns,
+  colnames(meta_raw)
+)
 
-if (is.na(symbol_col) || length(symbol_col) == 0) {
+if (length(missing_columns) > 0) {
   stop(
-    "Could not find a mouse gene symbol column in translation file. Available columns are: ",
-    paste(colnames(trans), collapse = ", ")
+    "Metadata is missing required columns: ",
+    paste(missing_columns, collapse = ", ")
   )
 }
 
-message("Using translation column: ", symbol_col)
+idx <- match(
+  colnames(counts),
+  meta_raw$Sample
+)
 
-# ============================================================
-# FIND FILES SAFELY
-# ============================================================
-all_files <- list.files(base_dir, full.names = TRUE, recursive = FALSE)
+if (anyNA(idx)) {
+  stop(
+    "These count columns are absent from metadata: ",
+    paste(
+      colnames(counts)[is.na(idx)],
+      collapse = ", "
+    )
+  )
+}
 
-count_files <- all_files[
-  grepl("_0FPM", basename(all_files)) &
-    !grepl("\\.gz$", basename(all_files)) &
-    grepl("\\.txt($|-)", basename(all_files))
+meta <- meta_raw[
+  idx,
+  ,
+  drop = FALSE
 ]
 
-sample_files <- all_files[
-  grepl("_samples", basename(all_files)) &
-    grepl("\\.txt$", basename(all_files))
+rownames(meta) <- meta$Sample
+
+if (!identical(colnames(counts), rownames(meta))) {
+  stop("Count columns and metadata rows are not identically ordered.")
+}
+
+if (any(meta$Tissue != "Cortex", na.rm = TRUE)) {
+  stop(
+    "Non-Cortex samples are present: ",
+    paste(unique(meta$Tissue), collapse = ", ")
+  )
+}
+
+# Group stays coded as SE, TE, TL, AE, and AL.
+# phase is the separate descriptive plotting variable.
+meta$phase <- phase_map[meta$Group]
+
+if (anyNA(meta$phase)) {
+  stop(
+    "These Group values could not be mapped: ",
+    paste(unique(meta$Group[is.na(meta$phase)]), collapse = ", ")
+  )
+}
+
+meta$phase <- factor(
+  meta$phase,
+  levels = ordered_phases
+)
+
+meta$sex <- ifelse(
+  toupper(meta$Sex) == "M",
+  "male",
+  "female"
+)
+
+meta$sex <- factor(
+  meta$sex,
+  levels = c("male", "female")
+)
+
+cat("\nGroup values:\n")
+print(unique(meta$Group))
+
+cat("\nMapped phase values:\n")
+print(unique(meta$phase))
+
+cat("\nCount/metadata alignment:\n")
+print(identical(colnames(counts), rownames(meta)))
+
+# =============================================================================
+# 5. FILTERING AND NORMALISATION
+# =============================================================================
+
+dge <- DGEList(
+  counts = counts
+)
+
+keep <- filterByExpr(
+  dge,
+  group = meta$phase
+)
+
+dge <- dge[
+  keep,
+  ,
+  keep.lib.sizes = FALSE
 ]
 
-count_tissues  <- vapply(count_files, extract_tissue_from_count, character(1))
-sample_tissues <- vapply(sample_files, extract_tissue_from_sample, character(1))
+dge <- calcNormFactors(
+  dge,
+  method = "TMM"
+)
 
-count_order <- match(count_tissues, preferred_tissue_order)
-count_files <- count_files[order(ifelse(is.na(count_order), 999, count_order), count_tissues)]
-count_tissues <- vapply(count_files, extract_tissue_from_count, character(1))
+logCPM <- cpm(
+  dge,
+  log = TRUE,
+  prior.count = 1
+)
 
-sample_order <- match(sample_tissues, preferred_tissue_order)
-sample_files <- sample_files[order(ifelse(is.na(sample_order), 999, sample_order), sample_tissues)]
-sample_tissues <- vapply(sample_files, extract_tissue_from_sample, character(1))
+cat(
+  "\nGenes before filterByExpr: ",
+  nrow(counts),
+  "\n",
+  sep = ""
+)
 
-sample_map <- setNames(sample_files, sample_tissues)
+cat(
+  "Genes after filterByExpr: ",
+  nrow(logCPM),
+  "\n",
+  sep = ""
+)
 
-cat("Count files detected:\n")
-print(basename(count_files))
-cat("\nSample files detected:\n")
-print(basename(sample_files))
-cat("\nTissues detected in count files:\n")
-print(count_tissues)
+# =============================================================================
+# 6. PCA
+# =============================================================================
 
-if (length(count_files) == 0) {
-  stop("No count files were detected. Please inspect base_dir and filename patterns.")
+pca_res <- prcomp(
+  t(logCPM),
+  center = TRUE,
+  scale. = TRUE
+)
+
+variance_fraction <- (
+  pca_res$sdev^2
+) / sum(
+  pca_res$sdev^2
+)
+
+variance_percent <- 100 * variance_fraction
+variance_labels <- sprintf("%.2f", variance_percent)
+
+score_df <- as.data.frame(
+  pca_res$x
+)
+
+score_df$sample <- meta$Sample
+score_df$animal <- meta$Animal
+score_df$group  <- meta$Group
+score_df$phase  <- meta$phase
+score_df$sex    <- meta$sex
+
+cat(
+  "PC1 variance explained: ",
+  variance_labels[1],
+  "%\n",
+  sep = ""
+)
+
+cat(
+  "PC2 variance explained: ",
+  variance_labels[2],
+  "%\n",
+  sep = ""
+)
+
+cat(
+  "PC1 + PC2 variance explained: ",
+  sprintf("%.2f", sum(variance_percent[1:2])),
+  "%\n",
+  sep = ""
+)
+
+# =============================================================================
+# 7. PC1-VERSUS-PC2 PLOT
+# =============================================================================
+
+x_range <- range(
+  score_df$PC1,
+  na.rm = TRUE
+)
+
+y_range <- range(
+  score_df$PC2,
+  na.rm = TRUE
+)
+
+x_mid <- mean(x_range)
+y_mid <- mean(y_range)
+
+final_span <- max(
+  diff(x_range),
+  diff(y_range)
+) * 1.10
+
+if (!is.finite(final_span) || final_span == 0) {
+  final_span <- 1
 }
 
-if (!target_tissue %in% count_tissues) {
-  stop(
-    "Target tissue '", target_tissue, "' was not found in count files. ",
-    "Detected tissues are: ",
-    paste(count_tissues, collapse = ", ")
-  )
-}
+x_limits <- x_mid + c(
+  -final_span / 2,
+  final_span / 2
+)
 
-summary_rows <- list()
+y_limits <- y_mid + c(
+  -final_span / 2,
+  final_span / 2
+)
 
-# ============================================================
-# MAIN LOOP: CORTEX ONLY
-# ============================================================
-for (count_file in count_files) {
-  tissue <- extract_tissue_from_count(count_file)
-  
-  # Only run Cortex
-  if (tissue != target_tissue) next
-  
-  message("\n==============================")
-  message("Processing tissue: ", tissue)
-  
-  sample_file <- unname(sample_map[tissue])
-  if (is.na(sample_file) || length(sample_file) == 0L) {
-    warning("No matching sample file found for tissue: ", tissue)
-    next
-  }
-  
-  tissue_outdir <- file.path(outdir, tissue)
-  if (!dir.exists(tissue_outdir)) dir.create(tissue_outdir, recursive = TRUE)
-  
-  counts <- read.table(
-    count_file,
-    header = TRUE,
-    sep = "\t",
-    check.names = FALSE,
-    stringsAsFactors = FALSE,
-    quote = ""
+pca_plot <- ggplot(
+  score_df,
+  aes(
+    x = PC1,
+    y = PC2
   )
-  
-  if (!"Gene" %in% colnames(counts)) {
-    warning("Skipping ", tissue, ": first column must be named 'Gene'.")
-    next
-  }
-  
-  rownames(counts) <- counts$Gene
-  counts$Gene <- NULL
-  
-  if (any(counts %% 1 != 0, na.rm = TRUE)) {
-    message("Non-integer counts detected; rounding to nearest integer for edgeR.")
-    counts <- round(as.matrix(counts))
-  } else {
-    counts <- as.matrix(counts)
-  }
-  storage.mode(counts) <- "numeric"
-  
-  meta_raw <- read.table(
-    sample_file,
-    header = TRUE,
-    sep = "\t",
-    stringsAsFactors = FALSE,
-    check.names = FALSE,
-    quote = ""
-  )
-  
-  required_cols <- c("Sample", "Animal", "Tissue", "Group", "Sex")
-  missing_cols <- setdiff(required_cols, colnames(meta_raw))
-  if (length(missing_cols) > 0) {
-    warning(
-      "Skipping ", tissue, ": sample file missing columns: ",
-      paste(missing_cols, collapse = ", ")
+) +
+  geom_point(
+    aes(
+      colour = phase,
+      shape = sex
+    ),
+    size = 5,
+    alpha = 0.9,
+    stroke = 1.1
+  ) +
+  scale_colour_manual(
+    values = phase_cols,
+    breaks = ordered_phases,
+    drop = FALSE
+  ) +
+  scale_shape_manual(
+    values = c(
+      "male" = 16,
+      "female" = 17
+    ),
+    drop = FALSE
+  ) +
+  coord_fixed(
+    ratio = 1,
+    xlim = x_limits,
+    ylim = y_limits
+  ) +
+  labs(
+    x = paste0(
+      "PC1 (",
+      variance_labels[1],
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      variance_labels[2],
+      "%)"
+    ),
+    colour = "Hibernation phase",
+    shape = "Sex"
+  ) +
+  theme_minimal(
+    base_size = 18,
+    base_family = "Helvetica"
+  ) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 13),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    panel.grid.major = element_line(
+      colour = "#d9d9d9",
+      linewidth = 0.5
+    ),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = "black"),
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8
     )
-    next
-  }
-  
-  idx <- match(colnames(counts), meta_raw$Sample)
-  if (any(is.na(idx))) {
-    warning(
-      "Skipping ", tissue, ": these count columns are not found in metadata: ",
-      paste(colnames(counts)[is.na(idx)], collapse = ", ")
-    )
-    next
-  }
-  
-  meta <- meta_raw[idx, , drop = FALSE]
-  
-  if (any(meta$Tissue != tissue, na.rm = TRUE)) {
-    warning(
-      "Tissue mismatch detected in sample file for ", tissue,
-      ". Sample metadata tissues found: ",
-      paste(unique(meta$Tissue), collapse = ", ")
-    )
-  }
-  
-  meta$phase <- phase_map[meta$Group]
-  meta$sex   <- ifelse(toupper(meta$Sex) == "M", "male", "female")
-  
-  meta$phase <- factor(meta$phase, levels = ordered_phases)
-  meta$sex   <- factor(meta$sex, levels = c("male", "female"))
-  
-  rownames(meta) <- meta$Sample
-  
-  # ============================================================
-  # NORMALIZATION
-  # ============================================================
-  dge <- DGEList(counts = counts)
-  keep <- filterByExpr(dge, group = meta$phase)
-  dge  <- dge[keep, , keep.lib.sizes = FALSE]
-  dge  <- calcNormFactors(dge, method = "TMM")
-  logCPM <- cpm(dge, log = TRUE, prior.count = 1)
-  
-  # ============================================================
-  # PCA INCLUDING SUMMER EUTHERMIA
-  # ============================================================
-  keep_pca <- !is.na(meta$phase)
-  
-  logCPM_pca <- logCPM[, keep_pca, drop = FALSE]
-  meta_pca   <- meta[keep_pca, , drop = FALSE]
-  
-  if (ncol(logCPM_pca) < 3) {
-    warning("Skipping ", tissue, ": fewer than 3 samples available.")
-    next
-  }
-  
-  pca_res <- prcomp(t(logCPM_pca), center = TRUE, scale. = TRUE)
-  var_expl <- (pca_res$sdev^2) / sum(pca_res$sdev^2)
-  var_pct  <- sprintf("%.2f", 100 * var_expl)
-  
-  score_df <- as.data.frame(pca_res$x)
-  score_df$sample <- meta_pca$Sample
-  score_df$animal <- meta_pca$Animal
-  score_df$phase  <- meta_pca$phase
-  score_df$sex    <- meta_pca$sex
-  
-  # ============================================================
-  # PLOT PC1 VS PC2 ONLY
-  # ============================================================
-  plot_pc12(
-    df = score_df,
-    tissue = tissue,
-    var_pct = var_pct,
-    outfile_png = file.path(tissue_outdir, paste0(tissue, "_PCA_PC1_vs_PC2_with_summer.png")),
-    outfile_pdf = file.path(tissue_outdir, paste0(tissue, "_PCA_PC1_vs_PC2_with_summer.pdf"))
   )
-  
-  # ============================================================
-  # PC1 AND PC2 LOADINGS + ENRICHMENT
-  # ============================================================
-  loadings <- as.data.frame(pca_res$rotation)
-  loadings$Gene <- rownames(loadings)
-  
-  n_top <- max(1, ceiling(nrow(loadings) * 0.10))
-  
-  top_PC1 <- loadings[order(abs(loadings$PC1), decreasing = TRUE), ][1:n_top, , drop = FALSE]
-  top_PC2 <- loadings[order(abs(loadings$PC2), decreasing = TRUE), ][1:n_top, , drop = FALSE]
-  
-  top_PC1_merged <- merge(
-    top_PC1,
-    trans,
-    by.x = "Gene",
-    by.y = "Source_gene",
-    all.x = TRUE
-  )
-  
-  top_PC2_merged <- merge(
-    top_PC2,
-    trans,
-    by.x = "Gene",
-    by.y = "Source_gene",
-    all.x = TRUE
-  )
-  
-  write.table(
-    top_PC1_merged,
-    file.path(tissue_outdir, paste0(tissue, "_Top10pct_PC1_genes_annotated_with_summer.tsv")),
-    sep = "\t",
-    quote = FALSE,
-    row.names = FALSE
-  )
-  
-  write.table(
-    top_PC2_merged,
-    file.path(tissue_outdir, paste0(tissue, "_Top10pct_PC2_genes_annotated_with_summer.tsv")),
-    sep = "\t",
-    quote = FALSE,
-    row.names = FALSE
-  )
-  
-  genes_PC1 <- clean_genes(top_PC1_merged[[symbol_col]])
-  genes_PC2 <- clean_genes(top_PC2_merged[[symbol_col]])
-  
-  res_PC1 <- run_enrichment(genes_PC1, paste0(tissue, "_PC1_top10pct_with_summer"))
-  res_PC2 <- run_enrichment(genes_PC2, paste0(tissue, "_PC2_top10pct_with_summer"))
-  
-  save_enrichment_outputs(res_PC1, paste0(tissue, "_PC1_top10pct_with_summer"), tissue_outdir)
-  save_enrichment_outputs(res_PC2, paste0(tissue, "_PC2_top10pct_with_summer"), tissue_outdir)
-  
-  summary_rows[[length(summary_rows) + 1L]] <- data.frame(
-    Tissue = tissue,
-    Count_file = basename(count_file),
-    Sample_file = basename(sample_file),
-    Samples_total = ncol(counts),
-    Samples_used_for_PCA = ncol(logCPM_pca),
-    Genes_after_filterByExpr = nrow(logCPM),
-    Top10pct_genes = n_top,
-    PC1_translated_symbols = length(genes_PC1),
-    PC2_translated_symbols = length(genes_PC2),
-    PC1_GO_terms = if (is.null(res_PC1)) 0 else nrow(res_PC1$ego_df),
-    PC1_KEGG_terms = if (is.null(res_PC1)) 0 else nrow(res_PC1$ekegg_df),
-    PC2_GO_terms = if (is.null(res_PC2)) 0 else nrow(res_PC2$ego_df),
-    PC2_KEGG_terms = if (is.null(res_PC2)) 0 else nrow(res_PC2$ekegg_df),
-    stringsAsFactors = FALSE
-  )
-}
 
-# ============================================================
-# SAVE SUMMARY
-# ============================================================
-if (length(summary_rows) > 0) {
-  summary_df <- do.call(rbind, summary_rows)
-  write.csv(
-    summary_df,
-    file.path(outdir, "summary_Cortex_with_summer.csv"),
-    row.names = FALSE
-  )
-}
+print(pca_plot)
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    "Cortex_PCA_PC1_vs_PC2.png"
+  ),
+  plot = pca_plot,
+  width = 8,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    "Cortex_PCA_PC1_vs_PC2.pdf"
+  ),
+  plot = pca_plot,
+  width = 8,
+  height = 6,
+  bg = "white"
+)
+
+write.table(
+  score_df,
+  file = file.path(
+    output_dir,
+    "PCA_sample_scores.tsv"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  data.frame(
+    PC = paste0(
+      "PC",
+      seq_along(variance_percent)
+    ),
+    Variance_percent = variance_percent
+  ),
+  file = file.path(
+    output_dir,
+    "PCA_variance_explained.tsv"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
 
 writeLines(
   capture.output(sessionInfo()),
-  con = file.path(outdir, "sessionInfo_Cortex_with_summer.txt")
+  con = file.path(
+    output_dir,
+    "sessionInfo.txt"
+  )
 )
 
+cat(
+  "\nPCA outputs written to:\n",
+  normalizePath(output_dir),
+  "\n",
+  sep = ""
+)
