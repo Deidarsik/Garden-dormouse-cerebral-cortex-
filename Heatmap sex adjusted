@@ -1,0 +1,1090 @@
+# ============================================================
+# Warm-versus-cold heatmap using a sex-adjusted edgeR QL model
+#
+# Statistical model:
+#   ~ ThermalState + Sex
+#
+# Tested effect:
+#   ThermalStatewarm, with cold as the reference level
+#
+# Therefore, positive logFC means higher expression in warm states.
+# Heatmaps show observed TMM-normalized logCPM values for genes selected
+# using the sex-adjusted FDR threshold.
+# ============================================================
+
+# ----------------------------
+# Install/load packages
+# ----------------------------
+install_if_missing_cran <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+install_if_missing_bioc <- function(pkg) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  }
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+install_if_missing_bioc("edgeR")
+install_if_missing_cran("dplyr")
+install_if_missing_cran("pheatmap")
+install_if_missing_cran("grid")
+install_if_missing_bioc("ComplexHeatmap")
+install_if_missing_cran("circlize")
+
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(dplyr)
+  library(pheatmap)
+  library(grid)
+  library(ComplexHeatmap)
+  library(circlize)
+})
+
+# ----------------------------
+# Paths
+# ----------------------------
+expression_matrix_path <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_0FPM.txt"
+metadata_path          <- "/Users/adrian/Desktop/EQU.03/20251016_merged_Cortex_samples.txt"
+gene_annotations_path  <- "/Users/adrian/Desktop/EQU.03/20251016_Equ03_CDS_Mmu_genes.txt"
+output_dir             <- "/Users/adrian/Desktop/EQU.03/warm_vs_cold_sex_adjusted"
+
+# ----------------------------
+# Settings
+# ----------------------------
+fdr_cutoff <- 1e-2
+fdr_label <- "1e-2"
+
+# Change this only if the metadata column has a different name.
+sex_column <- "Sex"
+
+z_cap <- 2
+cluster_rows <- TRUE
+cluster_cols <- FALSE
+use_annotation_colors <- TRUE
+order_by_group <- TRUE
+
+# Make legend letters approximately twice the default size
+legend_title_fontsize <- 20
+legend_label_fontsize <- 20
+
+# Number of row clusters to cut from the dendrogram
+k_row <- 2
+
+# Define warm vs cold groups for extracting the block
+warm_groups <- c("SE", "AE", "AL")
+cold_groups <- c("TE", "TL")
+
+# ----------------------------
+# Manual colours for group annotation
+# ----------------------------
+# SE, AE, AL = lighter colours
+# TE, TL = darker colours
+
+group_levels <- c("SE", "AE", "AL", "TE", "TL")
+
+group_cols <- c(
+  SE = "#BFD7EA",  # light blue
+  AE = "#C7E9C0",  # light green
+  AL = "#FDDDB6",  # light orange
+  TE = "#08519C",  # dark blue
+  TL = "#54278F"   # dark purple
+)
+
+# Mouse ortholog sidebar colours
+mouse_ortholog_colors <- c(
+  Yes = "black",
+  No = "white"
+)
+
+# Heatmap body colours
+# Keep these separate from the group annotation colours.
+heatmap_low  <- "#2166AC"   # blue for low z-score
+heatmap_high <- "#B2182B"   # red for high z-score
+
+# ----------------------------
+# Helper: detect mouse ortholog column
+# ----------------------------
+detect_mouse_ortholog_column <- function(gene_info) {
+  candidate_cols <- grep(
+    "mouse|mmu|ortholog|homolog",
+    colnames(gene_info),
+    ignore.case = TRUE,
+    value = TRUE
+  )
+  
+  # Avoid accidentally using GeneID itself if possible
+  candidate_cols <- setdiff(candidate_cols, c("GeneID"))
+  
+  if (length(candidate_cols) == 0) {
+    stop(
+      "Could not automatically find a mouse ortholog column.\n",
+      "Available columns are:\n",
+      paste(colnames(gene_info), collapse = ", "),
+      "\n\n",
+      "Set ortholog_col manually in the script, for example:\n",
+      "ortholog_col <- 'Mmu_gene_name'"
+    )
+  }
+  
+  return(candidate_cols[1])
+}
+
+# ----------------------------
+# Helper: classify ortholog presence
+# ----------------------------
+classify_mouse_ortholog_presence <- function(x) {
+  x <- as.character(x)
+  
+  has_ortholog <- !is.na(x) &
+    x != "" &
+    !(x %in% c("-", ".", "NA", "na", "None", "none", "NULL", "null"))
+  
+  factor(
+    ifelse(has_ortholog, "Yes", "No"),
+    levels = c("Yes", "No")
+  )
+}
+
+# ----------------------------
+# Create output folder
+# ----------------------------
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# ----------------------------
+# Load count matrix
+# ----------------------------
+expression_matrix <- read.table(
+  expression_matrix_path,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+
+# ----------------------------
+# Load metadata
+# ----------------------------
+metadata <- read.table(
+  metadata_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+required_metadata_columns <- c(
+  "Sample",
+  "Group",
+  sex_column
+)
+
+missing_metadata_columns <- setdiff(
+  required_metadata_columns,
+  colnames(metadata)
+)
+
+if (length(missing_metadata_columns) > 0) {
+  stop(
+    "Metadata is missing these required columns: ",
+    paste(missing_metadata_columns, collapse = ", "),
+    ". If the sex column has a different name, change sex_column at the top."
+  )
+}
+
+metadata$Sample <- trimws(as.character(metadata$Sample))
+metadata$Group  <- trimws(as.character(metadata$Group))
+metadata$Sex    <- trimws(as.character(metadata[[sex_column]]))
+
+if (any(is.na(metadata$Sample) | metadata$Sample == "")) {
+  stop("Metadata contains missing or empty Sample values.")
+}
+
+if (anyDuplicated(metadata$Sample)) {
+  stop(
+    "Duplicated Sample values were found in the metadata: ",
+    paste(unique(metadata$Sample[duplicated(metadata$Sample)]), collapse = ", ")
+  )
+}
+
+if (any(is.na(metadata$Group) | metadata$Group == "")) {
+  stop("Metadata contains missing or empty Group values.")
+}
+
+if (any(is.na(metadata$Sex) | metadata$Sex == "")) {
+  stop(
+    "Metadata contains missing or empty Sex values. ",
+    "Sex adjustment requires a sex value for every sample."
+  )
+}
+
+rownames(metadata) <- metadata$Sample
+
+# ----------------------------
+# Load gene annotations
+# ----------------------------
+gene_annotations <- read.table(
+  gene_annotations_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+colnames(gene_annotations)[1] <- "GeneID"
+
+gene_annotations <- gene_annotations %>%
+  dplyr::distinct(GeneID, .keep_all = TRUE)
+
+# ----------------------------
+# Check sample matching
+# ----------------------------
+missing_in_counts <- setdiff(rownames(metadata), colnames(expression_matrix))
+
+if (length(missing_in_counts) > 0) {
+  stop(
+    "These metadata samples are missing from the count matrix: ",
+    paste(missing_in_counts, collapse = ", ")
+  )
+}
+
+expression_matrix <- expression_matrix[, rownames(metadata), drop = FALSE]
+
+# ----------------------------
+# Set exact group order for x-axis
+# ----------------------------
+metadata$Group <- factor(
+  metadata$Group,
+  levels = group_levels
+)
+
+if (any(is.na(metadata$Group))) {
+  stop("Some samples have invalid Group labels. Expected: SE, AE, AL, TE, TL.")
+}
+
+metadata$Sex <- droplevels(factor(metadata$Sex))
+
+if (nlevels(metadata$Sex) < 2) {
+  stop(
+    "The Sex column contains fewer than two levels, ",
+    "so a sex-adjusted model cannot be fitted."
+  )
+}
+
+cat("\nSample composition by Group and Sex:\n")
+print(
+  table(
+    Group = metadata$Group,
+    Sex = metadata$Sex
+  )
+)
+
+if (order_by_group) {
+  metadata <- metadata[order(metadata$Group), , drop = FALSE]
+  expression_matrix <- expression_matrix[, rownames(metadata), drop = FALSE]
+}
+
+# ----------------------------
+# DGEList + stage-based filtering + normalization
+# ----------------------------
+dge <- edgeR::DGEList(
+  counts = expression_matrix,
+  group = metadata$Group
+)
+
+keep <- edgeR::filterByExpr(
+  dge,
+  group = metadata$Group
+)
+
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+
+cat(
+  "Genes after stage-based filterByExpr:",
+  nrow(dge),
+  "\n"
+)
+
+dge <- edgeR::calcNormFactors(dge)
+
+# ----------------------------
+# Sex-adjusted differential expression: warm vs cold
+# ----------------------------
+metadata$ThermalState <- ifelse(
+  metadata$Group %in% warm_groups,
+  "warm",
+  ifelse(
+    metadata$Group %in% cold_groups,
+    "cold",
+    NA
+  )
+)
+
+if (any(is.na(metadata$ThermalState))) {
+  stop("Some samples were not assigned to warm or cold.")
+}
+
+# Cold is the reference level, so a positive logFC means higher expression
+# in pooled warm states than in pooled cold states.
+metadata$ThermalState <- factor(
+  metadata$ThermalState,
+  levels = c("cold", "warm")
+)
+
+# The warm-versus-cold coefficient is estimated while controlling for Sex.
+design <- model.matrix(
+  ~ ThermalState + Sex,
+  data = metadata
+)
+
+if (qr(design)$rank < ncol(design)) {
+  stop(
+    "The sex-adjusted design matrix is not full rank. ",
+    "ThermalState and Sex may be completely confounded."
+  )
+}
+
+if (!"ThermalStatewarm" %in% colnames(design)) {
+  stop(
+    "Could not find the ThermalStatewarm coefficient in the design matrix. ",
+    "Design columns are: ",
+    paste(colnames(design), collapse = ", ")
+  )
+}
+
+write.table(
+  design,
+  file = file.path(output_dir, "sex_adjusted_design_matrix.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+write.table(
+  as.data.frame(
+    table(
+      Group = metadata$Group,
+      Sex = metadata$Sex
+    )
+  ),
+  file = file.path(output_dir, "sample_composition_by_group_and_sex.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+dge <- edgeR::estimateDisp(
+  dge,
+  design
+)
+
+fit <- edgeR::glmQLFit(
+  dge,
+  design,
+  robust = TRUE
+)
+
+qlf <- edgeR::glmQLFTest(
+  fit,
+  coef = "ThermalStatewarm"
+)
+
+# ----------------------------
+# Compute TMM-normalized logCPM
+# ----------------------------
+# These are observed normalized expression values used for visualization.
+# Gene selection and inferential statistics come from the sex-adjusted model.
+logCPM <- edgeR::cpm(
+  dge,
+  log = TRUE,
+  prior.count = 2
+)
+
+cat("Animals in matrix:", ncol(logCPM), "\n")
+
+de_table <- edgeR::topTags(
+  qlf,
+  n = Inf,
+  sort.by = "PValue"
+)$table
+
+de_table$GeneID <- rownames(de_table)
+
+# Save full DE table
+write.table(
+  de_table,
+  file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_warm_vs_cold_sex_adjusted_full_results.txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# Keep only genes passing FDR cutoff
+de_sig <- de_table %>%
+  dplyr::filter(FDR < fdr_cutoff) %>%
+  dplyr::arrange(FDR)
+
+if (nrow(de_sig) == 0) {
+  stop(paste0("No genes found with FDR < ", fdr_cutoff))
+}
+
+top_gene_ids <- de_sig$GeneID
+expr_sel <- logCPM[top_gene_ids, , drop = FALSE]
+
+cat("Genes selected with FDR <", fdr_cutoff, ":", nrow(expr_sel), "\n")
+
+# ----------------------------
+# Add gene info
+# ----------------------------
+gene_info <- data.frame(
+  GeneID = rownames(expr_sel),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::left_join(gene_annotations, by = "GeneID") %>%
+  dplyr::left_join(de_table, by = "GeneID")
+
+if (!"Gene_name" %in% colnames(gene_info)) {
+  gene_info$Gene_name <- NA_character_
+}
+
+# ----------------------------
+# Detect mouse ortholog column
+# ----------------------------
+# Automatic detection searches for column names containing:
+# mouse, mmu, ortholog, or homolog.
+#
+# If this chooses the wrong column, replace the next line manually, e.g.:
+# ortholog_col <- "Mmu_gene_name"
+
+ortholog_col <- detect_mouse_ortholog_column(gene_info)
+
+cat("Using mouse ortholog column:", ortholog_col, "\n")
+
+gene_info$Has_mouse_ortholog <- classify_mouse_ortholog_presence(
+  gene_info[[ortholog_col]]
+)
+
+cat("Genes with mouse ortholog:", sum(gene_info$Has_mouse_ortholog == "Yes"), "\n")
+cat("Genes without mouse ortholog:", sum(gene_info$Has_mouse_ortholog == "No"), "\n")
+
+# ----------------------------
+# Z-transform across animals
+# ----------------------------
+z_mat <- t(scale(t(expr_sel)))
+
+keep_rows <- apply(z_mat, 1, function(x) all(is.finite(x)))
+
+z_mat <- z_mat[keep_rows, , drop = FALSE]
+expr_sel <- expr_sel[rownames(z_mat), , drop = FALSE]
+
+gene_info <- gene_info[
+  match(rownames(z_mat), gene_info$GeneID),
+  ,
+  drop = FALSE
+]
+
+if (nrow(z_mat) == 0) {
+  stop("No genes left after z-scoring.")
+}
+
+# Cap for display
+z_mat[z_mat > z_cap] <- z_cap
+z_mat[z_mat < -z_cap] <- -z_cap
+
+# ----------------------------
+# Column annotation with manual colours
+# ----------------------------
+annotation_col <- data.frame(
+  Group = metadata$Group
+)
+
+rownames(annotation_col) <- rownames(metadata)
+
+annotation_colors <- list(
+  Group = group_cols
+)
+
+# ----------------------------
+# Save base tables
+# ----------------------------
+write.table(
+  expr_sel,
+  file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_logCPM_matrix.txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+write.table(
+  z_mat,
+  file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_zscore_logCPM_matrix.txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+write.table(
+  gene_info,
+  file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_gene_info.txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ----------------------------
+# Build pheatmap object silently
+# Needed for row-tree extraction
+# ----------------------------
+hm <- pheatmap::pheatmap(
+  z_mat,
+  color = colorRampPalette(c(heatmap_low, "white", heatmap_high))(100),
+  breaks = seq(-z_cap, z_cap, length.out = 101),
+  cluster_rows = cluster_rows,
+  cluster_cols = cluster_cols,
+  cutree_rows = k_row,
+  border_color = NA,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  fontsize = legend_label_fontsize,
+  fontsize_row = 5,
+  fontsize_col = 8,
+  angle_col = 45,
+  annotation_col = annotation_col,
+  annotation_colors = if (use_annotation_colors) annotation_colors else NULL,
+  main = paste0(
+    "Genes with sex-adjusted FDR < ", fdr_label,
+    " | warm vs cold | observed logCPM z-scored across animals"
+  ),
+  silent = TRUE
+)
+
+if (is.null(hm$tree_row)) {
+  stop("Row clustering tree was not created. Set cluster_rows = TRUE.")
+}
+
+# ----------------------------
+# Extract row clusters
+# ----------------------------
+row_clusters <- cutree(hm$tree_row, k = k_row)
+
+cluster_assignment_df <- data.frame(
+  GeneID = names(row_clusters),
+  RowCluster = as.integer(row_clusters),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::left_join(gene_info, by = "GeneID")
+
+write.table(
+  cluster_assignment_df,
+  file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_row_cluster_assignments.txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+cluster_members <- split(names(row_clusters), row_clusters)
+
+# ----------------------------
+# Define warm and cold samples
+# ----------------------------
+warm_samples <- rownames(metadata)[metadata$Group %in% warm_groups]
+cold_samples <- rownames(metadata)[metadata$Group %in% cold_groups]
+
+if (length(warm_samples) == 0 || length(cold_samples) == 0) {
+  stop("Warm or cold sample groups are empty. Check warm_groups / cold_groups.")
+}
+
+# ----------------------------
+# Summarize each row cluster
+# ----------------------------
+cluster_summary_list <- lapply(names(cluster_members), function(cl) {
+  genes_here <- cluster_members[[cl]]
+  
+  mean_warm <- mean(
+    z_mat[genes_here, warm_samples, drop = FALSE],
+    na.rm = TRUE
+  )
+  
+  mean_cold <- mean(
+    z_mat[genes_here, cold_samples, drop = FALSE],
+    na.rm = TRUE
+  )
+  
+  data.frame(
+    RowCluster = as.integer(cl),
+    NGenes = length(genes_here),
+    MeanWarm = mean_warm,
+    MeanCold = mean_cold,
+    WarmMinusCold = mean_warm - mean_cold,
+    stringsAsFactors = FALSE
+  )
+})
+
+cluster_summary_df <- do.call(rbind, cluster_summary_list) %>%
+  dplyr::arrange(dplyr::desc(WarmMinusCold))
+
+write.table(
+  cluster_summary_df,
+  file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_row_cluster_summary.txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+print(cluster_summary_df)
+
+# ----------------------------
+# Save every row cluster as its own file
+# ----------------------------
+for (cl in names(cluster_members)) {
+  genes_here <- cluster_members[[cl]]
+  
+  cluster_gene_table <- data.frame(
+    GeneID = genes_here,
+    stringsAsFactors = FALSE
+  ) %>%
+    dplyr::left_join(gene_info, by = "GeneID") %>%
+    dplyr::mutate(RowCluster = as.integer(cl))
+  
+  write.table(
+    cluster_gene_table,
+    file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_row_cluster_", cl, "_genes.txt")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+}
+
+# ----------------------------
+# Automatically choose strongest warm-up / cold-down block
+# ----------------------------
+target_cluster <- cluster_summary_df$RowCluster[
+  which.max(cluster_summary_df$WarmMinusCold)
+]
+
+target_gene_ids <- cluster_members[[as.character(target_cluster)]]
+
+target_gene_table <- data.frame(
+  GeneID = target_gene_ids,
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::left_join(gene_info, by = "GeneID") %>%
+  dplyr::mutate(RowCluster = target_cluster)
+
+write.table(
+  target_gene_table,
+  file = file.path(output_dir, paste0("FDR_lt_", fdr_label, "_warm_up_cold_down_cluster_genes.txt")),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# ----------------------------
+# Build ComplexHeatmap versions
+# ----------------------------
+
+# Keep the same row order as the pheatmap clustering
+row_order <- hm$tree_row$order
+ordered_gene_ids <- rownames(z_mat)[row_order]
+
+z_mat_plot <- z_mat[ordered_gene_ids, , drop = FALSE]
+
+row_split_factor <- factor(
+  row_clusters[ordered_gene_ids],
+  levels = sort(unique(row_clusters))
+)
+
+mouse_ortholog_plot <- gene_info$Has_mouse_ortholog[
+  match(ordered_gene_ids, gene_info$GeneID)
+]
+
+mouse_ortholog_plot <- factor(
+  mouse_ortholog_plot,
+  levels = c("Yes", "No")
+)
+
+col_fun <- circlize::colorRamp2(
+  c(-z_cap, 0, z_cap),
+  c(heatmap_low, "white", heatmap_high)
+)
+
+# ----------------------------
+# Warm/cold column grouping
+# ----------------------------
+
+thermal_state_plot <- factor(
+  ifelse(
+    metadata$Group %in% warm_groups,
+    "Warm",
+    "Cold"
+  ),
+  levels = c("Warm", "Cold")
+)
+
+# Confirm that the order is:
+# Warm samples first, followed by Cold samples
+if (!identical(
+  as.character(thermal_state_plot),
+  c(
+    rep("Warm", sum(metadata$Group %in% warm_groups)),
+    rep("Cold", sum(metadata$Group %in% cold_groups))
+  )
+)) {
+  stop(
+    "Samples are not arranged as one Warm block followed by one Cold block."
+  )
+}
+
+# Existing coloured stage annotation
+ha <- ComplexHeatmap::HeatmapAnnotation(
+  Group = metadata$Group,
+  
+  col = if (use_annotation_colors) {
+    annotation_colors
+  } else {
+    NULL
+  },
+  
+  annotation_name_side = "left",
+  show_annotation_name = TRUE,
+  simple_anno_size = grid::unit(5, "mm"),
+  
+  annotation_legend_param = list(
+    Group = list(
+      title_gp = grid::gpar(
+        fontsize = legend_title_fontsize
+      ),
+      labels_gp = grid::gpar(
+        fontsize = legend_label_fontsize
+      )
+    )
+  )
+)
+
+mouse_ra <- ComplexHeatmap::rowAnnotation(
+  Mouse_ortholog = mouse_ortholog_plot,
+  col = list(
+    Mouse_ortholog = mouse_ortholog_colors
+  ),
+  annotation_name_side = "top",
+  show_annotation_name = FALSE,
+  simple_anno_size = grid::unit(4, "mm"),
+  border = TRUE,
+  annotation_legend_param = list(
+    Mouse_ortholog = list(
+      title_gp = grid::gpar(fontsize = legend_title_fontsize),
+      labels_gp = grid::gpar(fontsize = legend_label_fontsize)
+    )
+  )
+)
+
+# ---------------------------------------------------------
+# Prepare correctly aligned matrix, gene names and sidebar
+# for the dendrogram heatmap
+# ---------------------------------------------------------
+
+# Use the original z-score matrix because hm$tree_row
+# was calculated from this exact row order
+z_mat_named <- z_mat
+
+# Obtain gene symbols in the same order as the heatmap rows
+gene_labels <- gene_info$Gene_name[
+  match(rownames(z_mat_named), gene_info$GeneID)
+]
+
+# Identify genes without an available gene symbol
+missing_gene_name <- is.na(gene_labels) |
+  trimws(gene_labels) == "" |
+  gene_labels %in% c(
+    "-", ".", "NA", "na",
+    "None", "none",
+    "NULL", "null"
+  )
+
+# Only use Equ03 GeneID when no gene symbol is available
+gene_labels[missing_gene_name] <-
+  rownames(z_mat_named)[missing_gene_name]
+
+# Mouse-ortholog annotation in exactly the same row order
+mouse_ortholog_named <- gene_info$Has_mouse_ortholog[
+  match(rownames(z_mat_named), gene_info$GeneID)
+]
+
+mouse_ortholog_named <- factor(
+  mouse_ortholog_named,
+  levels = c("Yes", "No")
+)
+
+mouse_ra_named <- ComplexHeatmap::rowAnnotation(
+  Mouse_ortholog = mouse_ortholog_named,
+  col = list(
+    Mouse_ortholog = mouse_ortholog_colors
+  ),
+  annotation_name_side = "top",
+  show_annotation_name = FALSE,
+  simple_anno_size = grid::unit(4, "mm"),
+  border = TRUE,
+  annotation_legend_param = list(
+    Mouse_ortholog = list(
+      title_gp = grid::gpar(
+        fontsize = legend_title_fontsize
+      ),
+      labels_gp = grid::gpar(
+        fontsize = legend_label_fontsize
+      )
+    )
+  )
+)
+
+
+cat("\nAll gene names in heatmap row order:\n")
+cat(gene_labels[hm$tree_row$order], sep = "\n")
+
+heatmap_gene_list <- data.frame(
+  GeneID = rownames(z_mat_named)[hm$tree_row$order],
+  Gene_name = gene_labels[hm$tree_row$order],
+  stringsAsFactors = FALSE
+)
+
+print(
+  heatmap_gene_list,
+  row.names = FALSE,
+  max = nrow(heatmap_gene_list)
+)
+
+
+# Version 1: clean heatmap, no title, no animal names, no gene names
+# Version 1: clean heatmap, no animal names or gene names
+ht_clean <- ComplexHeatmap::Heatmap(
+  z_mat_plot,
+  name = "z-score",
+  col = col_fun,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  row_split = row_split_factor,
+  cluster_row_slices = FALSE,
+  
+  # Divide columns into Warm and Cold blocks
+  column_split = thermal_state_plot,
+  cluster_column_slices = FALSE,
+  
+  # Keep the two blocks touching
+  column_gap = grid::unit(0, "mm"),
+  
+  # Titles above the two blocks
+  column_title = c("Warm", "Cold"),
+  column_title_side = "top",
+  column_title_gp = grid::gpar(
+    fontsize = 15,
+    fontface = "bold"
+  ),
+  
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  
+  top_annotation = ha,
+  border = FALSE,
+  
+  heatmap_legend_param = list(
+    title_gp = grid::gpar(
+      fontsize = legend_title_fontsize
+    ),
+    labels_gp = grid::gpar(
+      fontsize = legend_label_fontsize
+    )
+  )
+)
+
+# Version 2: heatmap with dendrogram and mouse-ortholog sidebar
+ht_mouse_ortholog <- ComplexHeatmap::Heatmap(
+  z_mat_named,
+  name = "z-score",
+  col = col_fun,
+  
+  # Row dendrogram
+  cluster_rows = hm$tree_row,
+  show_row_dend = TRUE,
+  row_dend_side = "left",
+  
+  # Two row clusters
+  row_split = k_row,
+  cluster_row_slices = FALSE,
+  
+  show_row_names = FALSE,
+  
+  # Keep animals in their existing order
+  cluster_columns = FALSE,
+  
+  # Divide columns into Warm and Cold blocks
+  column_split = thermal_state_plot,
+  cluster_column_slices = FALSE,
+  
+  # Keep the blocks touching
+  column_gap = grid::unit(0, "mm"),
+  
+  # Titles above the two blocks
+  column_title = c("Warm", "Cold"),
+  column_title_side = "top",
+  column_title_gp = grid::gpar(
+    fontsize = 15,
+    fontface = "bold"
+  ),
+  
+  show_column_names = FALSE,
+  
+  top_annotation = ha,
+  right_annotation = mouse_ra_named,
+  
+  border = FALSE,
+  
+  heatmap_legend_param = list(
+    title_gp = grid::gpar(
+      fontsize = legend_title_fontsize
+    ),
+    labels_gp = grid::gpar(
+      fontsize = legend_label_fontsize
+    )
+  )
+)
+# ----------------------------
+# Save clean version
+# ----------------------------
+pdf(
+  file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_clean.pdf")),
+  width = 11.5,
+  height = max(8, nrow(z_mat_plot) * 0.05)
+)
+
+ComplexHeatmap::draw(
+  ht_clean,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dev.off()
+
+png(
+  file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_clean.png")),
+  width = 2600,
+  height = max(2200, nrow(z_mat_plot) * 12),
+  res = 200
+)
+
+ComplexHeatmap::draw(
+  ht_clean,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dev.off()
+
+# ----------------------------
+# Save mouse ortholog sidebar version
+# ----------------------------
+pdf(
+  file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_mouse_ortholog_sidebar.pdf")),
+  width = 12,
+  height = max(8, nrow(z_mat_plot) * 0.05)
+)
+
+ComplexHeatmap::draw(
+  ht_mouse_ortholog,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dev.off()
+
+png(
+  file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_mouse_ortholog_sidebar.png")),
+  width = 2800,
+  height = max(2200, nrow(z_mat_plot) * 12),
+  res = 200
+)
+
+ComplexHeatmap::draw(
+  ht_mouse_ortholog,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+dev.off()
+
+# ----------------------------
+# Optional: sample correlation heatmap in fixed order
+# ----------------------------
+sample_cor <- cor(
+  expr_sel,
+  method = "pearson",
+  use = "pairwise.complete.obs"
+)
+
+pdf(
+  file.path(output_dir, paste0("FDR_lt_", fdr_label, "_sample_correlation_heatmap_fixed_order.pdf")),
+  width = 9,
+  height = 8
+)
+
+pheatmap::pheatmap(
+  sample_cor,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  border_color = NA,
+  annotation_col = annotation_col,
+  annotation_row = annotation_col,
+  annotation_colors = if (use_annotation_colors) annotation_colors else NULL,
+  fontsize = legend_label_fontsize,
+  fontsize_row = 14,
+  fontsize_col = 14,
+  main = paste0("Sample-to-sample correlation | genes with sex-adjusted FDR < ", fdr_label)
+)
+
+dev.off()
+
+# ----------------------------
+# Final report
+# ----------------------------
+cat("\nDone.\n")
+cat("DE model: ~ ThermalState + Sex\n")
+cat("Tested coefficient: ThermalStatewarm (warm versus cold)\n")
+cat("Genes with sex-adjusted FDR <", fdr_cutoff, "used:", nrow(z_mat), "\n")
+cat("Animals plotted:", ncol(z_mat), "\n")
+cat("Row clusters cut:", k_row, "\n")
+cat("Selected warm-up / cold-down cluster:", target_cluster, "\n")
+cat("Genes in selected cluster:", nrow(target_gene_table), "\n")
+cat("Mouse ortholog column used:", ortholog_col, "\n")
+cat("Genes with mouse ortholog:", sum(gene_info$Has_mouse_ortholog == "Yes"), "\n")
+cat("Genes without mouse ortholog:", sum(gene_info$Has_mouse_ortholog == "No"), "\n\n")
+
+cat("Group colours used:\n")
+print(group_cols)
+
+cat("\nLegend font sizes:\n")
+cat("Legend title fontsize:", legend_title_fontsize, "\n")
+cat("Legend label fontsize:", legend_label_fontsize, "\n\n")
+
+cat("Saved files:\n")
+cat(file.path(output_dir, "sex_adjusted_design_matrix.txt"), "\n")
+cat(file.path(output_dir, "sample_composition_by_group_and_sex.txt"), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_warm_vs_cold_sex_adjusted_full_results.txt")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_clean.pdf")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_clean.png")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_mouse_ortholog_sidebar.pdf")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_heatmap_mouse_ortholog_sidebar.png")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_sample_correlation_heatmap_fixed_order.pdf")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_logCPM_matrix.txt")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_zscore_logCPM_matrix.txt")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_gene_info.txt")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_row_cluster_summary.txt")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_row_cluster_assignments.txt")), "\n")
+cat(file.path(output_dir, paste0("FDR_lt_", fdr_label, "_warm_up_cold_down_cluster_genes.txt")), "\n")
