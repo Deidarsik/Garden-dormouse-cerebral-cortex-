@@ -1,0 +1,1678 @@
+#!/usr/bin/env Rscript
+
+# =============================================================================
+# SEX-ADJUSTED GO AND KEGG ENRICHMENT OF MOUSE-ORTHOLOG REVERSAL CLASSES
+# =============================================================================
+
+# =============================================================================
+# 0. USER SETTINGS
+# =============================================================================
+
+base_dir <- "/Users/adrian/Desktop/EQU.03"
+
+expression_matrix_path <- file.path(
+  base_dir,
+  "20251016_merged_Cortex_0FPM.txt"
+)
+
+metadata_path <- file.path(
+  base_dir,
+  "20251016_merged_Cortex_samples.txt"
+)
+
+gene_annotations_path <- file.path(
+  base_dir,
+  "20251016_Equ03_CDS_Mmu_genes.txt"
+)
+
+# Change this only if the metadata column has a different name.
+sex_column <- "Sex"
+
+output_root <- file.path(
+  base_dir,
+  "GO_KEGG_TE_TL_TL_AE_REVERSAL_SEX_ADJUSTED"
+)
+
+# edgeR model:
+#   ~ 0 + Group + Sex
+#
+# The TE-TL and TL-AE stage contrasts are therefore tested after adjustment
+# for sex. The expected reversal classes are 46 shared opposite-direction
+# genes: 34 increase-then-decrease and 12 decrease-then-increase.
+
+# edgeR DEG threshold
+fdr_cutoff <- 0.01
+
+# Enrichment thresholds
+pvalue_cutoff <- 0.05
+qvalue_cutoff <- 0.10
+top_terms_to_plot <- 20L
+go_ontology <- "BP"
+
+# Mouse ortholog information in the annotation table.
+# Your previous mapping selected Target_gene as mouse Ensembl identifiers.
+mouse_ortholog_col <- "Target_gene"
+mouse_key_type <- "ENSEMBL"
+
+# Dataset-specific checks. Leave TRUE to stop if the reversal counts no longer
+# match the sex-adjusted manuscript analysis. Set FALSE only when intentionally analysing a
+# different dataset or pipeline.
+strict_expected_counts <- TRUE
+
+expected_filtered_genes <- 17768L
+expected_shared_reversal_genes <- 46L
+expected_dominant_genes <- 34L
+expected_inverse_genes <- 12L
+
+# The mapped Entrez universe can change slightly with org.Mm.eg.db versions,
+# so a mismatch here generates a warning rather than stopping.
+expected_mapped_universe <- 12894L
+
+
+# =============================================================================
+# 1. INSTALL AND LOAD PACKAGES
+# =============================================================================
+
+install_cran_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+install_bioc_if_missing <- function(pkg) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages(
+      "BiocManager",
+      repos = "https://cloud.r-project.org"
+    )
+  }
+  
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(
+      pkg,
+      ask = FALSE,
+      update = FALSE
+    )
+  }
+}
+
+for (pkg in c(
+  "edgeR",
+  "limma",
+  "clusterProfiler",
+  "org.Mm.eg.db",
+  "AnnotationDbi"
+)) {
+  install_bioc_if_missing(pkg)
+}
+
+for (pkg in c(
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "ggsci"
+)) {
+  install_cran_if_missing(pkg)
+}
+
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggsci)
+})
+
+dir.create(
+  output_root,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# =============================================================================
+# 2. GENERAL HELPERS
+# =============================================================================
+
+is_valid_identifier <- function(x) {
+  x <- trimws(as.character(x))
+  
+  !is.na(x) &
+    x != "" &
+    !(x %in% c(
+      "-", ".", "NA", "na", "N/A", "n/a",
+      "None", "none", "NULL", "null",
+      "No", "no", "FALSE", "False", "false", "?"
+    ))
+}
+
+normalise_mouse_identifier <- function(x, key_type) {
+  x <- trimws(as.character(x))
+  
+  if (identical(key_type, "ENSEMBL")) {
+    x <- sub("\\.[0-9]+$", "", x)
+  }
+  
+  x
+}
+
+expand_mouse_identifiers <- function(df, identifier_col) {
+  if (!all(c("GeneID", identifier_col) %in% colnames(df))) {
+    stop(
+      "expand_mouse_identifiers(): required columns are missing. ",
+      "Required: GeneID and ", identifier_col
+    )
+  }
+  
+  df %>%
+    dplyr::transmute(
+      GeneID = as.character(GeneID),
+      MouseInputOriginal = as.character(.data[[identifier_col]])
+    ) %>%
+    dplyr::filter(is_valid_identifier(MouseInputOriginal)) %>%
+    tidyr::separate_rows(
+      MouseInputOriginal,
+      sep = "\\s*[,;|]+\\s*"
+    ) %>%
+    dplyr::mutate(
+      MouseInputOriginal = trimws(MouseInputOriginal),
+      MouseInput = normalise_mouse_identifier(
+        MouseInputOriginal,
+        mouse_key_type
+      )
+    ) %>%
+    dplyr::filter(
+      is_valid_identifier(MouseInputOriginal),
+      is_valid_identifier(MouseInput)
+    ) %>%
+    dplyr::distinct()
+}
+
+map_mouse_identifiers <- function(identifier_long, from_type) {
+  empty_result <- data.frame(
+    MouseInput = character(),
+    ENTREZID = character(),
+    MouseSymbol = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  if (nrow(identifier_long) == 0) {
+    return(empty_result)
+  }
+  
+  supported_keytypes <- AnnotationDbi::keytypes(org.Mm.eg.db)
+  
+  if (!from_type %in% supported_keytypes) {
+    stop(
+      "Key type '", from_type,
+      "' is not supported by org.Mm.eg.db."
+    )
+  }
+  
+  keys_here <- unique(identifier_long$MouseInput)
+  keys_here <- keys_here[is_valid_identifier(keys_here)]
+  
+  if (length(keys_here) == 0) {
+    return(empty_result)
+  }
+  
+  mapped <- tryCatch(
+    suppressMessages(
+      AnnotationDbi::select(
+        org.Mm.eg.db,
+        keys = keys_here,
+        keytype = from_type,
+        columns = c("ENTREZID", "SYMBOL")
+      )
+    ),
+    error = function(e) {
+      warning(
+        "Mouse identifier mapping failed: ",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+  
+  if (is.null(mapped) || nrow(mapped) == 0) {
+    return(empty_result)
+  }
+  
+  data.frame(
+    MouseInput = as.character(mapped[[from_type]]),
+    ENTREZID = as.character(mapped$ENTREZID),
+    MouseSymbol = as.character(mapped$SYMBOL),
+    stringsAsFactors = FALSE
+  ) %>%
+    dplyr::filter(
+      is_valid_identifier(MouseInput),
+      is_valid_identifier(ENTREZID)
+    ) %>%
+    dplyr::distinct()
+}
+
+empty_enrichment_table <- function() {
+  data.frame(
+    ID = character(),
+    Description = character(),
+    GeneRatio = character(),
+    BgRatio = character(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    qvalue = numeric(),
+    geneID = character(),
+    Count = integer(),
+    BackgroundTermGenes = numeric(),
+    RichFactor = numeric(),
+    stringsAsFactors = FALSE
+  )
+}
+
+add_rich_factor <- function(df) {
+  if (
+    nrow(df) == 0 ||
+    !all(c("Count", "BgRatio") %in% colnames(df))
+  ) {
+    return(df)
+  }
+  
+  df %>%
+    dplyr::mutate(
+      BackgroundTermGenes = as.numeric(
+        sub("/.*", "", BgRatio)
+      ),
+      RichFactor = Count / BackgroundTermGenes
+    )
+}
+
+add_rich_group <- function(df) {
+  if (
+    nrow(df) == 0 ||
+    !"RichFactor" %in% colnames(df)
+  ) {
+    return(df)
+  }
+  
+  df <- df %>%
+    dplyr::filter(is.finite(RichFactor))
+  
+  if (nrow(df) == 0) {
+    return(df)
+  }
+  
+  rich_breaks <- stats::quantile(
+    df$RichFactor,
+    probs = c(0, 1 / 3, 2 / 3, 1),
+    na.rm = TRUE
+  )
+  
+  if (length(unique(rich_breaks)) == 4) {
+    return(
+      df %>%
+        dplyr::mutate(
+          RichGroup = cut(
+            RichFactor,
+            breaks = rich_breaks,
+            include.lowest = TRUE,
+            labels = c("Low", "Medium", "High")
+          )
+        )
+    )
+  }
+  
+  distinct_values <- sort(unique(df$RichFactor))
+  
+  if (length(distinct_values) == 1) {
+    df$RichGroup <- factor(
+      rep("Low", nrow(df)),
+      levels = c("Low", "Medium", "High")
+    )
+  } else if (length(distinct_values) == 2) {
+    df$RichGroup <- factor(
+      ifelse(
+        df$RichFactor == min(distinct_values),
+        "Low",
+        "High"
+      ),
+      levels = c("Low", "Medium", "High")
+    )
+  } else {
+    df$RichGroup <- factor(
+      c("Low", "Medium", "High")[
+        dplyr::ntile(
+          rank(df$RichFactor, ties.method = "first"),
+          3
+        )
+      ],
+      levels = c("Low", "Medium", "High")
+    )
+  }
+  
+  df
+}
+
+safe_enrich_go <- function(genes, universe) {
+  tryCatch(
+    clusterProfiler::enrichGO(
+      gene = genes,
+      universe = universe,
+      OrgDb = org.Mm.eg.db,
+      keyType = "ENTREZID",
+      ont = go_ontology,
+      pAdjustMethod = "BH",
+      pvalueCutoff = pvalue_cutoff,
+      qvalueCutoff = qvalue_cutoff,
+      readable = TRUE
+    ),
+    error = function(e) {
+      warning(
+        "GO enrichment failed: ",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+}
+
+safe_enrich_kegg <- function(genes, universe) {
+  result <- tryCatch(
+    clusterProfiler::enrichKEGG(
+      gene = genes,
+      universe = universe,
+      organism = "mmu",
+      keyType = "ncbi-geneid",
+      pAdjustMethod = "BH",
+      pvalueCutoff = pvalue_cutoff,
+      qvalueCutoff = qvalue_cutoff
+    ),
+    error = function(e) {
+      warning(
+        "KEGG enrichment failed: ",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+  
+  if (is.null(result)) {
+    return(NULL)
+  }
+  
+  if (nrow(as.data.frame(result)) > 0) {
+    result <- tryCatch(
+      clusterProfiler::setReadable(
+        result,
+        OrgDb = org.Mm.eg.db,
+        keyType = "ENTREZID"
+      ),
+      error = function(e) {
+        warning(
+          "KEGG enrichment succeeded, but setReadable() failed: ",
+          conditionMessage(e)
+        )
+        result
+      }
+    )
+  }
+  
+  result
+}
+
+
+# =============================================================================
+# 3. READ AND VALIDATE COUNTS
+# =============================================================================
+
+counts_df <- read.table(
+  expression_matrix_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+if (ncol(counts_df) < 2) {
+  stop(
+    "The expression matrix must contain one GeneID column and ",
+    "at least one sample column."
+  )
+}
+
+colnames(counts_df)[1] <- "GeneID"
+
+counts_df$GeneID <- trimws(
+  as.character(counts_df$GeneID)
+)
+
+counts_df <- counts_df %>%
+  dplyr::filter(
+    !is.na(GeneID),
+    GeneID != ""
+  )
+
+if (anyDuplicated(counts_df$GeneID)) {
+  duplicated_ids <- unique(
+    counts_df$GeneID[duplicated(counts_df$GeneID)]
+  )
+  
+  stop(
+    "Duplicate GeneIDs found in the count matrix: ",
+    paste(utils::head(duplicated_ids, 20), collapse = ", ")
+  )
+}
+
+expression_matrix <- as.matrix(
+  counts_df[
+    ,
+    setdiff(colnames(counts_df), "GeneID"),
+    drop = FALSE
+  ]
+)
+
+rownames(expression_matrix) <- counts_df$GeneID
+storage.mode(expression_matrix) <- "numeric"
+
+if (anyNA(expression_matrix)) {
+  stop(
+    "The count matrix contains missing or non-numeric values."
+  )
+}
+
+if (any(expression_matrix < 0)) {
+  stop("The count matrix contains negative values.")
+}
+
+
+# =============================================================================
+# 4. READ AND VALIDATE METADATA
+# =============================================================================
+
+metadata <- read.table(
+  metadata_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+required_metadata_columns <- c("Sample", "Group", sex_column)
+missing_metadata_columns <- setdiff(
+  required_metadata_columns,
+  colnames(metadata)
+)
+
+if (length(missing_metadata_columns) > 0) {
+  stop(
+    "Missing metadata columns: ",
+    paste(missing_metadata_columns, collapse = ", ")
+  )
+}
+
+metadata$Sample <- trimws(as.character(metadata$Sample))
+metadata$Group <- trimws(as.character(metadata$Group))
+metadata$Sex <- trimws(
+  as.character(metadata[[sex_column]])
+)
+
+if (any(is.na(metadata$Sex) | metadata$Sex == "")) {
+  stop(
+    "The metadata contains missing or empty Sex values. ",
+    "The sex-adjusted model requires a sex value for every sample."
+  )
+}
+
+if (anyDuplicated(metadata$Sample)) {
+  stop("The metadata contains duplicated sample names.")
+}
+
+group_levels <- c("SE", "TE", "TL", "AE", "AL")
+
+unexpected_groups <- setdiff(
+  unique(metadata$Group),
+  group_levels
+)
+
+if (length(unexpected_groups) > 0) {
+  stop(
+    "Unexpected Group values: ",
+    paste(unexpected_groups, collapse = ", ")
+  )
+}
+
+metadata$Group <- factor(
+  metadata$Group,
+  levels = group_levels
+)
+
+metadata$Sex <- droplevels(
+  factor(metadata$Sex)
+)
+
+if (nlevels(metadata$Sex) < 2) {
+  stop(
+    "The Sex column contains fewer than two levels, ",
+    "so a sex-adjusted model cannot be fitted."
+  )
+}
+
+missing_samples <- setdiff(
+  metadata$Sample,
+  colnames(expression_matrix)
+)
+
+if (length(missing_samples) > 0) {
+  stop(
+    "Metadata samples absent from the count matrix: ",
+    paste(missing_samples, collapse = ", ")
+  )
+}
+
+expression_matrix <- expression_matrix[
+  ,
+  metadata$Sample,
+  drop = FALSE
+]
+
+rownames(metadata) <- metadata$Sample
+
+if (!identical(
+  colnames(expression_matrix),
+  rownames(metadata)
+)) {
+  stop(
+    "Count-matrix columns and metadata rows are not aligned."
+  )
+}
+
+cat("\nSAMPLE COMPOSITION\n")
+print(table(metadata$Group))
+
+
+# =============================================================================
+# 5. READ AND VALIDATE ANNOTATIONS
+# =============================================================================
+
+gene_annotations <- read.table(
+  gene_annotations_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+if (ncol(gene_annotations) == 0) {
+  stop("The annotation file contains no columns.")
+}
+
+colnames(gene_annotations)[1] <- "GeneID"
+
+gene_annotations$GeneID <- trimws(
+  as.character(gene_annotations$GeneID)
+)
+
+gene_annotations <- gene_annotations %>%
+  dplyr::filter(
+    !is.na(GeneID),
+    GeneID != ""
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    .keep_all = TRUE
+  )
+
+if (!mouse_ortholog_col %in% colnames(gene_annotations)) {
+  stop(
+    "Mouse ortholog column not found: ",
+    mouse_ortholog_col,
+    "\nAvailable annotation columns:\n",
+    paste(colnames(gene_annotations), collapse = ", ")
+  )
+}
+
+
+# =============================================================================
+# 6. PRIMARY FILTERED ROBUST SEX-ADJUSTED edgeR ANALYSIS
+# =============================================================================
+
+dge <- edgeR::DGEList(
+  counts = expression_matrix,
+  group = metadata$Group
+)
+
+genes_before_filtering <- nrow(dge)
+
+keep <- edgeR::filterByExpr(
+  dge,
+  group = metadata$Group
+)
+
+dge <- dge[
+  keep,
+  ,
+  keep.lib.sizes = FALSE
+]
+
+dge <- edgeR::normLibSizes(dge)
+
+genes_after_filtering <- nrow(dge)
+
+cat("\nLOW-EXPRESSION FILTERING\n")
+cat("Genes before filtering:", genes_before_filtering, "\n")
+cat("Genes retained:", genes_after_filtering, "\n")
+
+if (
+  strict_expected_counts &&
+  genes_after_filtering != expected_filtered_genes
+) {
+  stop(
+    "Expected ", expected_filtered_genes,
+    " filtered/tested genes, but obtained ",
+    genes_after_filtering,
+    ". Check that the same counts, metadata, and filtering pipeline are used."
+  )
+}
+
+design <- model.matrix(
+  ~ 0 + Group + Sex,
+  data = metadata
+)
+
+colnames(design) <- sub(
+  "^Group",
+  "",
+  colnames(design)
+)
+
+if (qr(design)$rank < ncol(design)) {
+  stop(
+    "The sex-adjusted design matrix is not full rank. ",
+    "Group and Sex may be completely confounded in the metadata."
+  )
+}
+
+write.table(
+  design,
+  file = file.path(
+    output_root,
+    "sex_adjusted_design_matrix.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+write.table(
+  as.data.frame(
+    table(
+      Group = metadata$Group,
+      Sex = metadata$Sex
+    )
+  ),
+  file = file.path(
+    output_root,
+    "sample_composition_by_group_and_sex.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+contrast_matrix <- limma::makeContrasts(
+  TE_vs_TL = TE - TL,
+  TL_vs_AE = TL - AE,
+  levels = design
+)
+
+dge <- edgeR::estimateDisp(
+  dge,
+  design,
+  robust = TRUE
+)
+
+fit <- edgeR::glmQLFit(
+  dge,
+  design,
+  robust = TRUE
+)
+
+extract_contrast <- function(contrast_name) {
+  qlf <- edgeR::glmQLFTest(
+    fit,
+    contrast = contrast_matrix[, contrast_name]
+  )
+  
+  result <- edgeR::topTags(
+    qlf,
+    n = Inf,
+    sort.by = "none"
+  )$table
+  
+  result <- data.frame(
+    GeneID = rownames(result),
+    result,
+    row.names = NULL,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  result %>%
+    dplyr::distinct(
+      GeneID,
+      .keep_all = TRUE
+    )
+}
+
+te_tl <- extract_contrast("TE_vs_TL")
+tl_ae <- extract_contrast("TL_vs_AE")
+
+write.csv(
+  te_tl,
+  file = file.path(
+    output_root,
+    "TE_vs_TL_ALL_tested_gene_results.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  tl_ae,
+  file = file.path(
+    output_root,
+    "TL_vs_AE_ALL_tested_gene_results.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# =============================================================================
+# 7. DERIVE THE EXACT REVERSAL CLASSES
+# =============================================================================
+
+paired_results <- te_tl %>%
+  dplyr::select(
+    GeneID,
+    logFC_TE_TL = logFC,
+    logCPM_TE_TL = logCPM,
+    F_TE_TL = F,
+    PValue_TE_TL = PValue,
+    FDR_TE_TL = FDR
+  ) %>%
+  dplyr::inner_join(
+    tl_ae %>%
+      dplyr::select(
+        GeneID,
+        logFC_TL_AE = logFC,
+        logCPM_TL_AE = logCPM,
+        F_TL_AE = F,
+        PValue_TL_AE = PValue,
+        FDR_TL_AE = FDR
+      ),
+    by = "GeneID"
+  )
+
+shared_significant <- paired_results %>%
+  dplyr::filter(
+    FDR_TE_TL < fdr_cutoff,
+    FDR_TL_AE < fdr_cutoff
+  ) %>%
+  dplyr::mutate(
+    ReversalClass = dplyr::case_when(
+      logFC_TE_TL < 0 & logFC_TL_AE > 0 ~
+        "Dominant_increased_TE_to_TL_then_decreased_TL_to_AE",
+      
+      logFC_TE_TL > 0 & logFC_TL_AE < 0 ~
+        "Inverse_decreased_TE_to_TL_then_increased_TL_to_AE",
+      
+      TRUE ~
+        "Same_direction_or_zero"
+    )
+  )
+
+opposite_direction <- shared_significant %>%
+  dplyr::filter(
+    ReversalClass != "Same_direction_or_zero"
+  )
+
+dominant_class <- opposite_direction %>%
+  dplyr::filter(
+    ReversalClass ==
+      "Dominant_increased_TE_to_TL_then_decreased_TL_to_AE"
+  )
+
+inverse_class <- opposite_direction %>%
+  dplyr::filter(
+    ReversalClass ==
+      "Inverse_decreased_TE_to_TL_then_increased_TL_to_AE"
+  )
+
+cat("\nREVERSAL COUNTS\n")
+cat(
+  "Shared significant TE–TL and TL–AE genes:",
+  nrow(shared_significant),
+  "\n"
+)
+cat(
+  "Opposite-direction genes:",
+  nrow(opposite_direction),
+  "\n"
+)
+cat(
+  "Dominant increase-then-decrease class:",
+  nrow(dominant_class),
+  "\n"
+)
+cat(
+  "Inverse decrease-then-increase class:",
+  nrow(inverse_class),
+  "\n"
+)
+
+if (strict_expected_counts) {
+  observed_counts <- c(
+    shared = nrow(shared_significant),
+    opposite = nrow(opposite_direction),
+    dominant = nrow(dominant_class),
+    inverse = nrow(inverse_class)
+  )
+  
+  expected_counts <- c(
+    shared = expected_shared_reversal_genes,
+    opposite = expected_shared_reversal_genes,
+    dominant = expected_dominant_genes,
+    inverse = expected_inverse_genes
+  )
+  
+  if (!identical(
+    unname(observed_counts),
+    unname(expected_counts)
+  )) {
+    stop(
+      "Reversal counts do not match the expected manuscript analysis.\n",
+      "Observed: ",
+      paste(
+        names(observed_counts),
+        observed_counts,
+        sep = "=",
+        collapse = ", "
+      ),
+      "\nExpected: ",
+      paste(
+        names(expected_counts),
+        expected_counts,
+        sep = "=",
+        collapse = ", "
+      )
+    )
+  }
+}
+
+annotation_display_columns <- intersect(
+  c(
+    "GeneID",
+    "Gene_name",
+    "Mmu_gene_name",
+    "Mmu_Gene_name",
+    mouse_ortholog_col
+  ),
+  colnames(gene_annotations)
+)
+
+opposite_annotated <- opposite_direction %>%
+  dplyr::left_join(
+    gene_annotations %>%
+      dplyr::select(
+        dplyr::all_of(annotation_display_columns)
+      ),
+    by = "GeneID"
+  )
+
+write.csv(
+  opposite_annotated,
+  file = file.path(
+    output_root,
+    paste0(
+      "ALL_",
+      nrow(opposite_direction),
+      "_opposite_direction_genes_with_class_and_logFC.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  opposite_annotated %>%
+    dplyr::filter(
+      ReversalClass ==
+        "Dominant_increased_TE_to_TL_then_decreased_TL_to_AE"
+    ),
+  file = file.path(
+    output_root,
+    paste0(
+      "DOMINANT_",
+      nrow(dominant_class),
+      "_increased_TE_to_TL_then_decreased_TL_to_AE.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  opposite_annotated %>%
+    dplyr::filter(
+      ReversalClass ==
+        "Inverse_decreased_TE_to_TL_then_increased_TL_to_AE"
+    ),
+  file = file.path(
+    output_root,
+    paste0(
+      "INVERSE_",
+      nrow(inverse_class),
+      "_decreased_TE_to_TL_then_increased_TL_to_AE.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+
+# =============================================================================
+# 8. BUILD THE EXPLICIT FILTERED/TESTED MOUSE-ORTHOLOG UNIVERSE
+# =============================================================================
+
+tested_gene_annotations <- data.frame(
+  GeneID = rownames(dge$counts),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::left_join(
+    gene_annotations %>%
+      dplyr::select(
+        GeneID,
+        dplyr::all_of(mouse_ortholog_col)
+      ),
+    by = "GeneID"
+  )
+
+universe_long <- expand_mouse_identifiers(
+  tested_gene_annotations,
+  identifier_col = mouse_ortholog_col
+)
+
+universe_id_map <- map_mouse_identifiers(
+  universe_long,
+  from_type = mouse_key_type
+)
+
+universe_gene_map <- universe_long %>%
+  dplyr::inner_join(
+    universe_id_map,
+    by = "MouseInput",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    MouseInputOriginal,
+    MouseInput,
+    ENTREZID,
+    MouseSymbol
+  )
+
+universe_entrez <- sort(
+  unique(universe_gene_map$ENTREZID)
+)
+
+if (length(universe_entrez) == 0) {
+  stop(
+    "No filtered/tested genes mapped to mouse Entrez IDs."
+  )
+}
+
+cat(
+  "\nMapped filtered/tested background universe:",
+  length(universe_entrez),
+  "unique mouse Entrez IDs\n"
+)
+
+if (length(universe_entrez) != expected_mapped_universe) {
+  warning(
+    "Expected approximately ", expected_mapped_universe,
+    " mapped background Entrez IDs, but obtained ",
+    length(universe_entrez),
+    ". This can change slightly with annotation-package versions."
+  )
+}
+
+write.csv(
+  universe_gene_map,
+  file = file.path(
+    output_root,
+    "BACKGROUND_tested_gene_to_mouse_Entrez_mapping.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(
+    ENTREZID = universe_entrez,
+    stringsAsFactors = FALSE
+  ),
+  file = file.path(
+    output_root,
+    "BACKGROUND_exact_mouse_Entrez_universe.csv"
+  ),
+  row.names = FALSE
+)
+
+writeLines(
+  universe_entrez,
+  con = file.path(
+    output_root,
+    "BACKGROUND_exact_mouse_Entrez_universe_one_per_line.txt"
+  )
+)
+
+
+# =============================================================================
+# 9. PLOT STYLE
+# =============================================================================
+
+three_cols <- ggsci::pal_npg("nrc")(3)
+
+clean_theme <- ggplot2::theme_classic() +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      size = 14,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.title.x = ggplot2::element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.title.y = ggplot2::element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.text.x = ggplot2::element_text(size = 10),
+    axis.text.y = ggplot2::element_text(size = 10),
+    legend.title = ggplot2::element_text(
+      size = 10,
+      face = "bold"
+    ),
+    legend.text = ggplot2::element_text(size = 9)
+  )
+
+
+# =============================================================================
+# 10. RUN ENRICHMENT FOR ONE EXACT REVERSAL CLASS
+# =============================================================================
+
+run_reversal_class_enrichment <- function(
+    class_table,
+    class_key,
+    class_title
+) {
+  class_dir <- file.path(
+    output_root,
+    class_key
+  )
+  
+  dir.create(
+    class_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  original_genes <- class_table %>%
+    dplyr::distinct(
+      GeneID,
+      .keep_all = TRUE
+    ) %>%
+    dplyr::left_join(
+      gene_annotations,
+      by = "GeneID"
+    )
+  
+  class_long <- expand_mouse_identifiers(
+    original_genes,
+    identifier_col = mouse_ortholog_col
+  )
+  
+  class_id_map <- map_mouse_identifiers(
+    class_long,
+    from_type = mouse_key_type
+  )
+  
+  mapped_before_universe <- class_long %>%
+    dplyr::inner_join(
+      class_id_map,
+      by = "MouseInput",
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::distinct(
+      GeneID,
+      MouseInputOriginal,
+      MouseInput,
+      ENTREZID,
+      MouseSymbol
+    )
+  
+  mapped_foreground <- mapped_before_universe %>%
+    dplyr::filter(
+      ENTREZID %in% universe_entrez
+    ) %>%
+    dplyr::left_join(
+      original_genes %>%
+        dplyr::select(
+          dplyr::any_of(
+            c(
+              "GeneID",
+              "ReversalClass",
+              "logFC_TE_TL",
+              "FDR_TE_TL",
+              "logFC_TL_AE",
+              "FDR_TL_AE",
+              "Gene_name",
+              "Mmu_gene_name",
+              "Mmu_Gene_name",
+              mouse_ortholog_col
+            )
+          )
+        ),
+      by = "GeneID"
+    ) %>%
+    dplyr::distinct()
+  
+  foreground_entrez <- sort(
+    unique(mapped_foreground$ENTREZID)
+  )
+  
+  # One row per original dormouse gene showing exactly why it was or was not
+  # used in enrichment.
+  valid_input_status <- class_long %>%
+    dplyr::distinct(GeneID) %>%
+    dplyr::mutate(HasValidMouseInput = TRUE)
+  
+  mapped_status <- mapped_before_universe %>%
+    dplyr::distinct(GeneID) %>%
+    dplyr::mutate(MappedToMouseEntrez = TRUE)
+  
+  used_status <- mapped_foreground %>%
+    dplyr::distinct(GeneID) %>%
+    dplyr::mutate(UsedForEnrichment = TRUE)
+  
+  audit <- original_genes %>%
+    dplyr::distinct(
+      GeneID,
+      .keep_all = TRUE
+    ) %>%
+    dplyr::left_join(
+      valid_input_status,
+      by = "GeneID"
+    ) %>%
+    dplyr::left_join(
+      mapped_status,
+      by = "GeneID"
+    ) %>%
+    dplyr::left_join(
+      used_status,
+      by = "GeneID"
+    ) %>%
+    dplyr::mutate(
+      HasValidMouseInput = tidyr::replace_na(
+        HasValidMouseInput,
+        FALSE
+      ),
+      MappedToMouseEntrez = tidyr::replace_na(
+        MappedToMouseEntrez,
+        FALSE
+      ),
+      UsedForEnrichment = tidyr::replace_na(
+        UsedForEnrichment,
+        FALSE
+      ),
+      Status = dplyr::case_when(
+        UsedForEnrichment ~
+          "Used for GO/KEGG",
+        
+        !HasValidMouseInput ~
+          "Excluded: no valid mouse ortholog identifier",
+        
+        HasValidMouseInput & !MappedToMouseEntrez ~
+          "Excluded: mouse identifier did not map to Entrez",
+        
+        MappedToMouseEntrez & !UsedForEnrichment ~
+          "Excluded: mapped Entrez ID absent from tested universe",
+        
+        TRUE ~
+          "Unknown"
+      )
+    ) %>%
+    dplyr::arrange(
+      Status,
+      GeneID
+    )
+  
+  write.csv(
+    original_genes,
+    file = file.path(
+      class_dir,
+      paste0(
+        class_key,
+        "_ALL_original_dormouse_genes.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    audit,
+    file = file.path(
+      class_dir,
+      paste0(
+        class_key,
+        "_AUDIT_every_original_gene.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    mapped_foreground,
+    file = file.path(
+      class_dir,
+      paste0(
+        class_key,
+        "_EXACT_mapped_foreground.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    data.frame(
+      ENTREZID = foreground_entrez,
+      stringsAsFactors = FALSE
+    ),
+    file = file.path(
+      class_dir,
+      paste0(
+        class_key,
+        "_EXACT_foreground_EntrezIDs.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  writeLines(
+    foreground_entrez,
+    con = file.path(
+      class_dir,
+      paste0(
+        class_key,
+        "_EXACT_foreground_EntrezIDs_one_per_line.txt"
+      )
+    )
+  )
+  
+  cat("\n============================================================\n")
+  cat(class_title, "\n")
+  cat(
+    "Original dormouse genes:",
+    nrow(original_genes),
+    "\n"
+  )
+  cat(
+    "Original genes mapped and used:",
+    dplyr::n_distinct(mapped_foreground$GeneID),
+    "\n"
+  )
+  cat(
+    "Unique mouse Entrez IDs submitted:",
+    length(foreground_entrez),
+    "\n"
+  )
+  cat(
+    "Explicit tested universe:",
+    length(universe_entrez),
+    "mouse Entrez IDs\n"
+  )
+  
+  if (length(foreground_entrez) == 0) {
+    go_object <- NULL
+    kegg_object <- NULL
+    go_df <- empty_enrichment_table()
+    kegg_df <- empty_enrichment_table()
+  } else {
+    if (!all(foreground_entrez %in% universe_entrez)) {
+      stop(
+        class_key,
+        " contains foreground IDs outside the tested universe."
+      )
+    }
+    
+    go_object <- safe_enrich_go(
+      genes = foreground_entrez,
+      universe = universe_entrez
+    )
+    
+    kegg_object <- safe_enrich_kegg(
+      genes = foreground_entrez,
+      universe = universe_entrez
+    )
+    
+    go_df <- if (is.null(go_object)) {
+      empty_enrichment_table()
+    } else {
+      add_rich_factor(
+        as.data.frame(go_object)
+      )
+    }
+    
+    kegg_df <- if (is.null(kegg_object)) {
+      empty_enrichment_table()
+    } else {
+      add_rich_factor(
+        as.data.frame(kegg_object)
+      )
+    }
+  }
+  
+  write.csv(
+    go_df,
+    file = file.path(
+      class_dir,
+      paste0(
+        class_key,
+        "_GO_BP_enrichment.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    kegg_df,
+    file = file.path(
+      class_dir,
+      paste0(
+        class_key,
+        "_KEGG_mouse_enrichment.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  if (
+    nrow(go_df) > 0 &&
+    "RichFactor" %in% colnames(go_df)
+  ) {
+    top_go <- go_df %>%
+      dplyr::filter(is.finite(RichFactor)) %>%
+      dplyr::arrange(
+        dplyr::desc(RichFactor),
+        p.adjust
+      ) %>%
+      utils::head(top_terms_to_plot) %>%
+      add_rich_group()
+    
+    if (nrow(top_go) > 0) {
+      go_plot <- ggplot2::ggplot(
+        top_go,
+        ggplot2::aes(
+          x = RichFactor,
+          y = reorder(Description, RichFactor),
+          color = RichGroup,
+          size = Count
+        )
+      ) +
+        ggplot2::geom_point(alpha = 0.9) +
+        ggplot2::scale_color_manual(
+          values = three_cols,
+          drop = FALSE
+        ) +
+        ggplot2::labs(
+          title = paste0(
+            class_title,
+            ": GO Biological Process"
+          ),
+          x = "Rich Factor",
+          y = "GO term",
+          color = "Rich Factor",
+          size = "Gene Count"
+        ) +
+        clean_theme
+      
+      ggplot2::ggsave(
+        filename = file.path(
+          class_dir,
+          paste0(
+            class_key,
+            "_GO_RichFactor_dotplot.pdf"
+          )
+        ),
+        plot = go_plot,
+        width = 9,
+        height = 7
+      )
+    }
+  } else {
+    cat(
+      class_title,
+      ": no significant GO BP terms.\n"
+    )
+  }
+  
+  if (
+    nrow(kegg_df) > 0 &&
+    "RichFactor" %in% colnames(kegg_df)
+  ) {
+    top_kegg <- kegg_df %>%
+      dplyr::filter(is.finite(RichFactor)) %>%
+      dplyr::arrange(
+        dplyr::desc(RichFactor),
+        p.adjust
+      ) %>%
+      utils::head(top_terms_to_plot) %>%
+      add_rich_group()
+    
+    if (nrow(top_kegg) > 0) {
+      kegg_plot <- ggplot2::ggplot(
+        top_kegg,
+        ggplot2::aes(
+          x = RichFactor,
+          y = reorder(Description, RichFactor),
+          fill = RichGroup
+        )
+      ) +
+        ggplot2::geom_col(width = 0.75) +
+        ggplot2::scale_fill_manual(
+          values = three_cols,
+          drop = FALSE
+        ) +
+        ggplot2::labs(
+          title = paste0(
+            class_title,
+            ": KEGG pathways"
+          ),
+          x = "Rich Factor",
+          y = "KEGG pathway",
+          fill = "Rich Factor"
+        ) +
+        clean_theme
+      
+      ggplot2::ggsave(
+        filename = file.path(
+          class_dir,
+          paste0(
+            class_key,
+            "_KEGG_RichFactor_barplot.pdf"
+          )
+        ),
+        plot = kegg_plot,
+        width = 9,
+        height = 7
+      )
+    }
+  } else {
+    cat(
+      class_title,
+      ": no significant KEGG pathways.\n"
+    )
+  }
+  
+  summary <- data.frame(
+    Class = class_key,
+    Biological_description = class_title,
+    Original_dormouse_genes = nrow(original_genes),
+    Original_genes_with_valid_mouse_input =
+      dplyr::n_distinct(class_long$GeneID),
+    Original_genes_mapped_to_Entrez =
+      dplyr::n_distinct(mapped_before_universe$GeneID),
+    Original_genes_used_for_enrichment =
+      dplyr::n_distinct(mapped_foreground$GeneID),
+    Unique_mouse_Entrez_foreground =
+      length(foreground_entrez),
+    Tested_mouse_Entrez_universe =
+      length(universe_entrez),
+    Significant_GO_BP_terms =
+      nrow(go_df),
+    Significant_KEGG_pathways =
+      nrow(kegg_df),
+    stringsAsFactors = FALSE
+  )
+  
+  list(
+    summary = summary,
+    original_genes = original_genes,
+    audit = audit,
+    mapped_foreground = mapped_foreground,
+    foreground_entrez = foreground_entrez,
+    GO_object = go_object,
+    GO_table = go_df,
+    KEGG_object = kegg_object,
+    KEGG_table = kegg_df
+  )
+}
+
+
+# =============================================================================
+# 11. RUN THE TWO REVERSAL CLASSES SEPARATELY
+# =============================================================================
+
+dominant_result <- run_reversal_class_enrichment(
+  class_table = dominant_class,
+  class_key =
+    "dominant_increased_TE_to_TL_then_decreased_TL_to_AE",
+  class_title =
+    "Increased TE to TL, then decreased TL to AE"
+)
+
+inverse_result <- run_reversal_class_enrichment(
+  class_table = inverse_class,
+  class_key =
+    "inverse_decreased_TE_to_TL_then_increased_TL_to_AE",
+  class_title =
+    "Decreased TE to TL, then increased TL to AE"
+)
+
+enrichment_summary <- dplyr::bind_rows(
+  dominant_result$summary,
+  inverse_result$summary
+)
+
+write.csv(
+  enrichment_summary,
+  file = file.path(
+    output_root,
+    "reversal_class_GO_KEGG_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+write.table(
+  enrichment_summary,
+  file = file.path(
+    output_root,
+    "reversal_class_GO_KEGG_summary.txt"
+  ),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+saveRDS(
+  list(
+    dominant = dominant_result,
+    inverse = inverse_result,
+    paired_results = paired_results,
+    shared_significant = shared_significant,
+    opposite_direction = opposite_direction,
+    universe_gene_map = universe_gene_map,
+    universe_entrez = universe_entrez
+  ),
+  file = file.path(
+    output_root,
+    "sex_adjusted_reversal_GO_KEGG_objects.rds"
+  )
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(
+    output_root,
+    "sessionInfo.txt"
+  )
+)
+
+
+# =============================================================================
+# 12. FINAL REPORT
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("SEX-ADJUSTED REVERSAL GO/KEGG ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+cat("Model: ~ 0 + Group + Sex\n")
+cat("Filtered/tested genes:", genes_after_filtering, "\n")
+cat(
+  "Shared significant TE–TL and TL–AE genes:",
+  nrow(shared_significant),
+  "\n"
+)
+cat(
+  "Dominant class:",
+  nrow(dominant_class),
+  "genes\n"
+)
+cat(
+  "Inverse class:",
+  nrow(inverse_class),
+  "genes\n"
+)
+cat(
+  "Mapped tested universe:",
+  length(universe_entrez),
+  "mouse Entrez IDs\n"
+)
+cat("\nEnrichment summary:\n")
+print(enrichment_summary, row.names = FALSE)
+cat("\nOutput directory:\n")
+cat(output_root, "\n")
+
+cat(
+  "\nFor the manuscript's dominant reversal enrichment, use the files in:\n",
+  file.path(
+    output_root,
+    "dominant_increased_TE_to_TL_then_decreased_TL_to_AE"
+  ),
+  "\n",
+  sep = ""
+)
