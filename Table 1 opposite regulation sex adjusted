@@ -1,0 +1,839 @@
+#!/usr/bin/env Rscript
+
+###############################################################################
+# Table_2_reversal_analysis_SEX_ADJUSTED_ONLY.R
+#
+# PURPOSE
+#   Analyse reversal between selected contrast pairs using ONLY the
+#   sex-adjusted edgeR results.
+#
+# REQUIRED OBJECT
+#   sex_adjusted_analysis$results_list
+#
+# The script:
+#   - identifies DEGs at FDR < 0.01 in each contrast;
+#   - finds genes significant in both contrasts;
+#   - marks genes as reversed when logFC signs are opposite;
+#   - prints only the sex-adjusted reversed gene names;
+#   - saves shared and reversed-gene tables for every contrast pair;
+#   - saves a sex-adjusted Table 2 summary.
+###############################################################################
+
+# =============================================================================
+# 0. SETTINGS
+# =============================================================================
+
+# Change this path if required.
+output_root <- file.path(
+  "/Users/adrian/Desktop/EQU.03",
+  "gene_stats_filtered_robust_QL_FDR_0.01"
+)
+
+fdr_cutoff <- 0.01
+
+table_2_output_dir <- file.path(
+  output_root,
+  "04_Table_2_reversal_analysis_sex_adjusted"
+)
+
+dir.create(
+  table_2_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# =============================================================================
+# 1. REQUIRED PACKAGE
+# =============================================================================
+
+if (!requireNamespace("dplyr", quietly = TRUE)) {
+  stop(
+    "The dplyr package is required. Install it with:\n",
+    "install.packages('dplyr')"
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+})
+
+# =============================================================================
+# 2. VERIFY THE SEX-ADJUSTED RESULTS OBJECT
+# =============================================================================
+
+if (!exists(
+  "sex_adjusted_analysis",
+  inherits = TRUE
+)) {
+  stop(
+    "The object 'sex_adjusted_analysis' does not exist.\n",
+    "Run the sex-adjusted edgeR analysis first in the same R session."
+  )
+}
+
+if (
+  is.null(sex_adjusted_analysis$results_list) ||
+  !is.list(sex_adjusted_analysis$results_list)
+) {
+  stop(
+    "sex_adjusted_analysis$results_list is missing or is not a list."
+  )
+}
+
+# =============================================================================
+# 3. CONTRAST PAIRS
+# =============================================================================
+
+table_2_pairs <- list(
+  c("SE_vs_TE", "TE_vs_TL"),
+  c("TE_vs_TL", "TL_vs_AE"),
+  c("TL_vs_AE", "AE_vs_AL"),
+  c("AE_vs_AL", "TE_vs_TL"),
+  c("SE_vs_TE", "AL_vs_SE")
+)
+
+table_2_labels <- c(
+  "SE-TE vs TE-TL",
+  "TE-TL vs TL-AE",
+  "TL-AE vs AE-AL",
+  "AE-AL vs TE-TL",
+  "SE-TE vs AL-SE"
+)
+
+# =============================================================================
+# 4. HELPER FUNCTIONS
+# =============================================================================
+
+write_tab_file <- function(
+    x,
+    filename
+) {
+  write.table(
+    x,
+    file = filename,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    na = ""
+  )
+}
+
+first_condition <- function(
+    contrast_name
+) {
+  parts <- strsplit(
+    contrast_name,
+    "_vs_",
+    fixed = TRUE
+  )[[1]]
+
+  if (length(parts) != 2) {
+    stop(
+      "Could not parse contrast name: ",
+      contrast_name
+    )
+  }
+
+  parts[1]
+}
+
+second_condition <- function(
+    contrast_name
+) {
+  parts <- strsplit(
+    contrast_name,
+    "_vs_",
+    fixed = TRUE
+  )[[1]]
+
+  if (length(parts) != 2) {
+    stop(
+      "Could not parse contrast name: ",
+      contrast_name
+    )
+  }
+
+  parts[2]
+}
+
+is_valid_gene_name <- function(x) {
+  x <- trimws(
+    as.character(x)
+  )
+
+  !is.na(x) &
+    x != "" &
+    !toupper(x) %in% c(
+      "NA",
+      "N/A",
+      "NONE",
+      "NULL",
+      "UNKNOWN",
+      "UNANNOTATED",
+      "-",
+      ".",
+      "?"
+    )
+}
+
+find_gene_name_column <- function(
+    result_table
+) {
+  candidates <- c(
+    "Gene_name",
+    "Gene_name.x",
+    "Gene_name.y",
+    "Mmu_gene_name",
+    "Mmu_Gene_name",
+    "Gene_label",
+    "Target_gene"
+  )
+
+  available <- candidates[
+    candidates %in% colnames(result_table)
+  ]
+
+  if (length(available) == 0) {
+    return(NA_character_)
+  }
+
+  available[1]
+}
+
+prepare_reversal_table <- function(
+    result_table,
+    suffix,
+    fdr_cutoff
+) {
+  required_columns <- c(
+    "GeneID",
+    "logFC",
+    "FDR"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    colnames(result_table)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "The result table is missing these required columns: ",
+      paste(
+        missing_columns,
+        collapse = ", "
+      )
+    )
+  }
+
+  gene_name_column <- find_gene_name_column(
+    result_table
+  )
+
+  if (is.na(gene_name_column)) {
+    result_table$Resolved_gene_name <- NA_character_
+  } else {
+    result_table$Resolved_gene_name <- as.character(
+      result_table[[gene_name_column]]
+    )
+  }
+
+  prepared <- result_table %>%
+    dplyr::mutate(
+      GeneID = as.character(GeneID),
+
+      Gene_name = dplyr::if_else(
+        is_valid_gene_name(
+          Resolved_gene_name
+        ),
+        trimws(
+          as.character(
+            Resolved_gene_name
+          )
+        ),
+        NA_character_
+      ),
+
+      Gene_label = dplyr::if_else(
+        is_valid_gene_name(
+          Gene_name
+        ),
+        Gene_name,
+        GeneID
+      )
+    ) %>%
+    dplyr::filter(
+      !is.na(FDR),
+      FDR < fdr_cutoff
+    ) %>%
+    dplyr::select(
+      GeneID,
+      Gene_label,
+      Gene_name,
+      logFC,
+      FDR
+    ) %>%
+    dplyr::distinct(
+      GeneID,
+      .keep_all = TRUE
+    )
+
+  names(prepared)[
+    names(prepared) == "Gene_label"
+  ] <- paste0(
+    "Gene_label_",
+    suffix
+  )
+
+  names(prepared)[
+    names(prepared) == "Gene_name"
+  ] <- paste0(
+    "Gene_name_",
+    suffix
+  )
+
+  names(prepared)[
+    names(prepared) == "logFC"
+  ] <- paste0(
+    "logFC_",
+    suffix
+  )
+
+  names(prepared)[
+    names(prepared) == "FDR"
+  ] <- paste0(
+    "FDR_",
+    suffix
+  )
+
+  prepared
+}
+
+format_reversal_result <- function(
+    reversed_count,
+    percent_reversed
+) {
+  if (is.na(percent_reversed)) {
+    return("NA")
+  }
+
+  paste0(
+    reversed_count,
+    " (",
+    format(
+      percent_reversed,
+      nsmall = 1,
+      trim = TRUE
+    ),
+    "%)"
+  )
+}
+
+# =============================================================================
+# 5. REVERSAL CALCULATION FOR ONE CONTRAST PAIR
+# =============================================================================
+
+calculate_reversal_statistics <- function(
+    results_list,
+    contrast_1,
+    contrast_2,
+    analysis_name,
+    output_dir,
+    fdr_cutoff
+) {
+  if (is.null(
+    results_list[[contrast_1]]
+  )) {
+    stop(
+      "Contrast is missing from results_list: ",
+      contrast_1
+    )
+  }
+
+  if (is.null(
+    results_list[[contrast_2]]
+  )) {
+    stop(
+      "Contrast is missing from results_list: ",
+      contrast_2
+    )
+  }
+
+  table_1 <- prepare_reversal_table(
+    result_table = results_list[[contrast_1]],
+    suffix = "1",
+    fdr_cutoff = fdr_cutoff
+  )
+
+  table_2 <- prepare_reversal_table(
+    result_table = results_list[[contrast_2]],
+    suffix = "2",
+    fdr_cutoff = fdr_cutoff
+  )
+
+  shared_table <- dplyr::inner_join(
+    table_1,
+    table_2,
+    by = "GeneID"
+  ) %>%
+    dplyr::mutate(
+      Gene_name = dplyr::case_when(
+        is_valid_gene_name(
+          Gene_name_1
+        ) ~ Gene_name_1,
+
+        is_valid_gene_name(
+          Gene_name_2
+        ) ~ Gene_name_2,
+
+        TRUE ~ NA_character_
+      ),
+
+      Gene_label = dplyr::case_when(
+        is_valid_gene_name(
+          Gene_name
+        ) ~ Gene_name,
+
+        is_valid_gene_name(
+          Gene_label_1
+        ) ~ Gene_label_1,
+
+        is_valid_gene_name(
+          Gene_label_2
+        ) ~ Gene_label_2,
+
+        TRUE ~ GeneID
+      ),
+
+      Contrast_1 = contrast_1,
+      Contrast_2 = contrast_2,
+
+      Regulation_1 = dplyr::if_else(
+        logFC_1 > 0,
+        paste0(
+          "Higher_in_",
+          first_condition(
+            contrast_1
+          )
+        ),
+        paste0(
+          "Higher_in_",
+          second_condition(
+            contrast_1
+          )
+        )
+      ),
+
+      Regulation_2 = dplyr::if_else(
+        logFC_2 > 0,
+        paste0(
+          "Higher_in_",
+          first_condition(
+            contrast_2
+          )
+        ),
+        paste0(
+          "Higher_in_",
+          second_condition(
+            contrast_2
+          )
+        )
+      ),
+
+      Reversed = (
+        logFC_1 * logFC_2 < 0
+      )
+    ) %>%
+    dplyr::select(
+      GeneID,
+      Gene_label,
+      Gene_name,
+      Contrast_1,
+      Contrast_2,
+      logFC_1,
+      FDR_1,
+      Regulation_1,
+      logFC_2,
+      FDR_2,
+      Regulation_2,
+      Reversed
+    ) %>%
+    dplyr::arrange(
+      Gene_label
+    )
+
+  reversed_table <- shared_table %>%
+    dplyr::filter(
+      Reversed
+    ) %>%
+    dplyr::arrange(
+      Gene_label
+    )
+
+  reversed_gene_names <- reversed_table %>%
+    dplyr::transmute(
+      Gene = dplyr::if_else(
+        is_valid_gene_name(
+          Gene_name
+        ),
+        Gene_name,
+        GeneID
+      )
+    ) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(
+      Gene
+    )
+
+  number_deg_1 <- nrow(
+    table_1
+  )
+
+  number_deg_2 <- nrow(
+    table_2
+  )
+
+  number_shared <- nrow(
+    shared_table
+  )
+
+  number_reversed <- nrow(
+    reversed_table
+  )
+
+  percent_reversed <- if (
+    number_shared > 0
+  ) {
+    round(
+      100 *
+        number_reversed /
+        number_shared,
+      1
+    )
+  } else {
+    NA_real_
+  }
+
+  safe_analysis_name <- gsub(
+    "[^A-Za-z0-9_-]",
+    "_",
+    analysis_name
+  )
+
+  pair_name <- paste0(
+    contrast_1,
+    "__",
+    contrast_2
+  )
+
+  write_tab_file(
+    shared_table,
+    file.path(
+      output_dir,
+      paste0(
+        safe_analysis_name,
+        "_",
+        pair_name,
+        "_shared_DEGs.txt"
+      )
+    )
+  )
+
+  write_tab_file(
+    reversed_table,
+    file.path(
+      output_dir,
+      paste0(
+        safe_analysis_name,
+        "_",
+        pair_name,
+        "_reversed_shared_DEGs.txt"
+      )
+    )
+  )
+
+  write_tab_file(
+    reversed_gene_names,
+    file.path(
+      output_dir,
+      paste0(
+        safe_analysis_name,
+        "_",
+        pair_name,
+        "_reversed_gene_names.txt"
+      )
+    )
+  )
+
+  cat("\n")
+  cat("============================================================\n")
+  cat(
+    "SEX-ADJUSTED REVERSED GENES: ",
+    contrast_1,
+    " vs ",
+    contrast_2,
+    "\n",
+    sep = ""
+  )
+  cat("============================================================\n")
+  cat(
+    "DEGs in ",
+    contrast_1,
+    ": ",
+    number_deg_1,
+    "\n",
+    sep = ""
+  )
+  cat(
+    "DEGs in ",
+    contrast_2,
+    ": ",
+    number_deg_2,
+    "\n",
+    sep = ""
+  )
+  cat(
+    "Shared DEGs: ",
+    number_shared,
+    "\n",
+    sep = ""
+  )
+  cat(
+    "Reversed shared DEGs: ",
+    number_reversed,
+    "\n",
+    sep = ""
+  )
+
+  if (nrow(
+    reversed_gene_names
+  ) == 0) {
+    cat(
+      "No reversed shared genes.\n"
+    )
+  } else {
+    cat(
+      "\nGene names:\n"
+    )
+
+    cat(
+      reversed_gene_names$Gene,
+      sep = "\n"
+    )
+
+    cat("\n")
+  }
+
+  data.frame(
+    Analysis = analysis_name,
+    Contrast_1 = contrast_1,
+    Contrast_2 = contrast_2,
+    DEG_count_1 = number_deg_1,
+    DEG_count_2 = number_deg_2,
+    DEG_counts = paste(
+      number_deg_1,
+      "vs",
+      number_deg_2
+    ),
+    Shared_DEGs = number_shared,
+    Reversed_shared_DEGs = number_reversed,
+    Percent_reversed = percent_reversed,
+    Reversed_gene_names = paste(
+      reversed_gene_names$Gene,
+      collapse = "; "
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+
+# =============================================================================
+# 6. RUN ONLY THE SEX-ADJUSTED ANALYSIS
+# =============================================================================
+
+sex_adjusted_table_2_rows <- lapply(
+  seq_along(
+    table_2_pairs
+  ),
+  function(i) {
+    calculate_reversal_statistics(
+      results_list =
+        sex_adjusted_analysis$results_list,
+
+      contrast_1 =
+        table_2_pairs[[i]][1],
+
+      contrast_2 =
+        table_2_pairs[[i]][2],
+
+      analysis_name =
+        "Filtered_robust_sex_adjusted",
+
+      output_dir =
+        table_2_output_dir,
+
+      fdr_cutoff =
+        fdr_cutoff
+    )
+  }
+)
+
+sex_adjusted_table_2 <- dplyr::bind_rows(
+  sex_adjusted_table_2_rows
+)
+
+sex_adjusted_table_2$Comparison <- table_2_labels
+
+sex_adjusted_table_2 <- sex_adjusted_table_2 %>%
+  dplyr::select(
+    Comparison,
+    dplyr::everything()
+  )
+
+# =============================================================================
+# 7. SAVE LONG-FORM SUMMARY
+# =============================================================================
+
+write_tab_file(
+  sex_adjusted_table_2,
+  file.path(
+    table_2_output_dir,
+    "Table_2_reversal_summary_sex_adjusted_long_format.txt"
+  )
+)
+
+# =============================================================================
+# 8. CREATE WORD-LAYOUT TABLE
+# =============================================================================
+
+table_2_word_layout <- data.frame(
+  Metric = c(
+    "Number of DEGs, sex-adjusted",
+    "Number of shared DEGs, sex-adjusted",
+    "Reversed shared DEGs, sex-adjusted, n (%)",
+    "Reversed gene names, sex-adjusted"
+  ),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+for (i in seq_along(
+  table_2_labels
+)) {
+  table_2_word_layout[[
+    table_2_labels[i]
+  ]] <- c(
+    sex_adjusted_table_2$DEG_counts[i],
+
+    as.character(
+      sex_adjusted_table_2$Shared_DEGs[i]
+    ),
+
+    format_reversal_result(
+      sex_adjusted_table_2$
+        Reversed_shared_DEGs[i],
+
+      sex_adjusted_table_2$
+        Percent_reversed[i]
+    ),
+
+    sex_adjusted_table_2$
+      Reversed_gene_names[i]
+  )
+}
+
+write_tab_file(
+  table_2_word_layout,
+  file.path(
+    table_2_output_dir,
+    "Table_2_reversal_Word_layout_sex_adjusted.txt"
+  )
+)
+
+# =============================================================================
+# 9. SAVE ONE COMBINED GENE-NAME TABLE
+# =============================================================================
+
+combined_reversed_gene_names <- dplyr::bind_rows(
+  lapply(
+    seq_along(
+      table_2_pairs
+    ),
+    function(i) {
+      gene_string <- sex_adjusted_table_2$
+        Reversed_gene_names[i]
+
+      if (
+        is.na(gene_string) ||
+        trimws(gene_string) == ""
+      ) {
+        return(
+          data.frame(
+            Comparison = character(),
+            Gene = character(),
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+
+      genes <- trimws(
+        unlist(
+          strsplit(
+            gene_string,
+            ";",
+            fixed = TRUE
+          )
+        )
+      )
+
+      data.frame(
+        Comparison = table_2_labels[i],
+        Gene = genes,
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+) %>%
+  dplyr::distinct() %>%
+  dplyr::arrange(
+    Comparison,
+    Gene
+  )
+
+write_tab_file(
+  combined_reversed_gene_names,
+  file.path(
+    table_2_output_dir,
+    "ALL_sex_adjusted_reversed_gene_names_by_comparison.txt"
+  )
+)
+
+# =============================================================================
+# 10. FINAL REPORT
+# =============================================================================
+
+cat("\n")
+cat("============================================================\n")
+cat("TABLE 2: SEX-ADJUSTED REVERSAL ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+
+print(
+  table_2_word_layout,
+  row.names = FALSE
+)
+
+cat(
+  "\nOutput directory:\n",
+  table_2_output_dir,
+  "\n",
+  sep = ""
+)
+
+cat(
+  "\nCombined reversed-gene-name file:\n",
+  file.path(
+    table_2_output_dir,
+    "ALL_sex_adjusted_reversed_gene_names_by_comparison.txt"
+  ),
+  "\n",
+  sep = ""
+)
