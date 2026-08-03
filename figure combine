@@ -1,0 +1,1203 @@
+#!/usr/bin/env Rscript
+
+###############################################################################
+# Combined_sex_adjusted_GO_KEGG_ONE_PAGE.R
+#
+# PURPOSE
+#   Create one large, single-page PDF containing every non-empty GO Biological
+#   Process and KEGG enrichment panel from the sex-adjusted edgeR analysis.
+#
+# INPUT ANALYSIS
+#   Filtered_robust_sex_adjusted
+#
+# DIRECTION INTERPRETATION
+#   Contrasts were defined as first phase minus second phase.
+#
+#   Increased_in_second_phase:
+#     logFC < 0; expression is higher in the second phase.
+#
+#   Decreased_in_second_phase:
+#     logFC > 0; expression is higher in the first phase.
+###############################################################################
+
+# =============================================================================
+# 1. PATHS AND SETTINGS
+# =============================================================================
+
+base_dir <- "/Users/adrian/Desktop/EQU.03"
+
+edgeR_output_root <- file.path(
+  base_dir,
+  "gene_stats_filtered_robust_QL_FDR_0.01"
+)
+
+enrichment_output_root <- file.path(
+  edgeR_output_root,
+  "04_GO_KEGG_transition_direction_UNADJUSTED_VS_SEX_ADJUSTED_FDR_0.01"
+)
+
+analysis_label <- "Filtered_robust_sex_adjusted"
+
+sex_adjusted_results_dir <- file.path(
+  enrichment_output_root,
+  analysis_label
+)
+
+summary_path <- file.path(
+  enrichment_output_root,
+  "GO_KEGG_transition_direction_all_contrasts_summary.txt"
+)
+
+figure_output_dir <- file.path(
+  enrichment_output_root,
+  "SEX_ADJUSTED_COMBINED_FIGURE"
+)
+
+combined_pdf_path <- file.path(
+  figure_output_dir,
+  "Combined_nonempty_GO_KEGG_SEX_ADJUSTED_ONE_PAGE.pdf"
+)
+
+panel_key_path <- file.path(
+  figure_output_dir,
+  "Combined_nonempty_GO_KEGG_SEX_ADJUSTED_ONE_PAGE_panel_key.txt"
+)
+
+plotted_terms_path <- file.path(
+  figure_output_dir,
+  "Combined_nonempty_GO_KEGG_SEX_ADJUSTED_plotted_terms.txt"
+)
+
+# Number of enriched terms displayed in each panel.
+top_n_terms <- 20L
+
+# Large vector-PDF page so every panel remains legible when zoomed.
+pdf_width_inches <- 34
+pdf_height_inches <- 25
+
+# Number of panels per row in each database section.
+panels_per_row <- 4L
+
+# =============================================================================
+# 2. PACKAGES
+# =============================================================================
+
+required_packages <- c(
+  "ggplot2",
+  "grid",
+  "gridExtra"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    quietly = TRUE,
+    FUN.VALUE = logical(1)
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Please install these packages first: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(grid)
+  library(gridExtra)
+})
+
+# =============================================================================
+# 3. VALIDATE INPUTS
+# =============================================================================
+
+if (!dir.exists(enrichment_output_root)) {
+  stop(
+    "The GO/KEGG enrichment output directory was not found:\n",
+    enrichment_output_root
+  )
+}
+
+if (!dir.exists(sex_adjusted_results_dir)) {
+  stop(
+    "The sex-adjusted enrichment directory was not found:\n",
+    sex_adjusted_results_dir
+  )
+}
+
+if (!file.exists(summary_path)) {
+  stop(
+    "The enrichment summary was not found:\n",
+    summary_path
+  )
+}
+
+dir.create(
+  figure_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+summary_df <- read.delim(
+  summary_path,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+required_summary_columns <- c(
+  "Analysis",
+  "Contrast",
+  "Direction",
+  "Significant_GO_BP_terms",
+  "Significant_KEGG_terms"
+)
+
+missing_summary_columns <- setdiff(
+  required_summary_columns,
+  colnames(summary_df)
+)
+
+if (length(missing_summary_columns) > 0) {
+  stop(
+    "The enrichment summary is missing these required columns: ",
+    paste(missing_summary_columns, collapse = ", "),
+    "\nAvailable columns: ",
+    paste(colnames(summary_df), collapse = ", ")
+  )
+}
+
+# Use only the sex-adjusted model.
+summary_df <- summary_df[
+  summary_df$Analysis == analysis_label,
+  ,
+  drop = FALSE
+]
+
+if (nrow(summary_df) == 0) {
+  stop(
+    "No summary rows were found for analysis: ",
+    analysis_label
+  )
+}
+
+summary_df$ShortContrast <- gsub(
+  "_vs_",
+  "-",
+  summary_df$Contrast,
+  fixed = TRUE
+)
+
+direction_to_folder <- function(direction) {
+  if (identical(direction, "Increased_in_second_phase")) {
+    return("increased_in_second_phase")
+  }
+
+  if (identical(direction, "Decreased_in_second_phase")) {
+    return("decreased_in_second_phase")
+  }
+
+  stop(
+    "Unrecognised direction: ",
+    direction
+  )
+}
+
+direction_to_title <- function(direction) {
+  if (identical(direction, "Increased_in_second_phase")) {
+    return("increased in second phase")
+  }
+
+  if (identical(direction, "Decreased_in_second_phase")) {
+    return("decreased in second phase")
+  }
+
+  stop(
+    "Unrecognised direction: ",
+    direction
+  )
+}
+
+extract_contrast_groups <- function(contrast_name) {
+  groups <- strsplit(
+    contrast_name,
+    "_vs_",
+    fixed = TRUE
+  )[[1]]
+
+  if (length(groups) != 2) {
+    stop(
+      "Could not parse contrast name: ",
+      contrast_name
+    )
+  }
+
+  groups
+}
+
+higher_group_from_direction <- function(
+    contrast_name,
+    direction
+) {
+
+  groups <- extract_contrast_groups(
+    contrast_name
+  )
+
+  if (identical(
+    direction,
+    "Increased_in_second_phase"
+  )) {
+    return(groups[2])
+  }
+
+  if (identical(
+    direction,
+    "Decreased_in_second_phase"
+  )) {
+    return(groups[1])
+  }
+
+  stop(
+    "Unrecognised direction: ",
+    direction
+  )
+}
+
+summary_df$DirectionFolder <- vapply(
+  summary_df$Direction,
+  direction_to_folder,
+  FUN.VALUE = character(1)
+)
+
+summary_df$DirectionTitle <- vapply(
+  summary_df$Direction,
+  direction_to_title,
+  FUN.VALUE = character(1)
+)
+
+summary_df$Higher_in_group <- mapply(
+  higher_group_from_direction,
+  contrast_name = summary_df$Contrast,
+  direction = summary_df$Direction,
+  USE.NAMES = FALSE
+)
+
+# =============================================================================
+# 4. LOCATE EXACT ENRICHMENT TABLES
+# =============================================================================
+
+find_result_csv <- function(
+    contrast,
+    direction_folder,
+    database
+) {
+
+  result_dir <- file.path(
+    sex_adjusted_results_dir,
+    contrast,
+    direction_folder
+  )
+
+  if (!dir.exists(result_dir)) {
+    stop(
+      "The expected result directory was not found:\n",
+      result_dir
+    )
+  }
+
+  if (identical(database, "GO_BP")) {
+    filename <- paste0(
+      contrast,
+      "_",
+      direction_folder,
+      "_GO_BP_enrichment.csv"
+    )
+  } else if (identical(database, "KEGG")) {
+    filename <- paste0(
+      contrast,
+      "_",
+      direction_folder,
+      "_KEGG_mouse_enrichment.csv"
+    )
+  } else {
+    stop(
+      "Unsupported database: ",
+      database
+    )
+  }
+
+  csv_path <- file.path(
+    result_dir,
+    filename
+  )
+
+  if (!file.exists(csv_path)) {
+    stop(
+      "The expected ", database,
+      " result table was not found:\n",
+      csv_path
+    )
+  }
+
+  csv_path
+}
+
+# =============================================================================
+# 5. ENRICHMENT-TABLE HELPERS
+# =============================================================================
+
+first_existing_column <- function(
+    data,
+    candidates,
+    required = TRUE
+) {
+
+  hit <- candidates[
+    candidates %in% colnames(data)
+  ]
+
+  if (length(hit) > 0) {
+    return(hit[[1]])
+  }
+
+  if (required) {
+    stop(
+      "None of these expected columns was found: ",
+      paste(candidates, collapse = ", "),
+      ". Available columns: ",
+      paste(colnames(data), collapse = ", ")
+    )
+  }
+
+  NA_character_
+}
+
+ratio_numerator <- function(x) {
+  x <- as.character(x)
+
+  suppressWarnings(
+    as.numeric(
+      sub(
+        "/.*$",
+        "",
+        x
+      )
+    )
+  )
+}
+
+prepare_enrichment_table <- function(
+    csv_path,
+    top_n
+) {
+
+  dat <- read.csv(
+    csv_path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  if (nrow(dat) == 0) {
+    stop(
+      "An analysis marked as non-empty has an empty CSV:\n",
+      csv_path
+    )
+  }
+
+  description_col <- first_existing_column(
+    dat,
+    c(
+      "Description",
+      "description",
+      "Term",
+      "term"
+    )
+  )
+
+  adjusted_p_col <- first_existing_column(
+    dat,
+    c(
+      "p.adjust",
+      "p_adjust",
+      "padj",
+      "FDR",
+      "adjusted_p_value",
+      "Adjusted.P.value"
+    )
+  )
+
+  count_col <- first_existing_column(
+    dat,
+    c(
+      "Count",
+      "count",
+      "GeneCount",
+      "gene_count"
+    )
+  )
+
+  rich_factor_col <- first_existing_column(
+    dat,
+    c(
+      "RichFactor",
+      "Rich_factor",
+      "rich_factor",
+      "Rich.Factor",
+      "richFactor"
+    ),
+    required = FALSE
+  )
+
+  background_ratio_col <- first_existing_column(
+    dat,
+    c(
+      "BgRatio",
+      "BG_Ratio",
+      "BackgroundRatio"
+    ),
+    required = FALSE
+  )
+
+  gene_id_col <- first_existing_column(
+    dat,
+    c(
+      "geneID",
+      "GeneID",
+      "gene_id"
+    ),
+    required = FALSE
+  )
+
+  out <- data.frame(
+    Description = as.character(
+      dat[[description_col]]
+    ),
+    AdjustedP = suppressWarnings(
+      as.numeric(
+        dat[[adjusted_p_col]]
+      )
+    ),
+    Count = suppressWarnings(
+      as.numeric(
+        dat[[count_col]]
+      )
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  if (!is.na(gene_id_col)) {
+    out$ContributingGenes <- as.character(
+      dat[[gene_id_col]]
+    )
+  } else {
+    out$ContributingGenes <- NA_character_
+  }
+
+  if (!is.na(rich_factor_col)) {
+    out$RichFactor <- suppressWarnings(
+      as.numeric(
+        dat[[rich_factor_col]]
+      )
+    )
+  } else {
+    if (is.na(background_ratio_col)) {
+      stop(
+        "No RichFactor or BgRatio column was found in:\n",
+        csv_path
+      )
+    }
+
+    background_term_size <- ratio_numerator(
+      dat[[background_ratio_col]]
+    )
+
+    out$RichFactor <- (
+      out$Count /
+        background_term_size
+    )
+  }
+
+  out <- out[
+    !is.na(out$Description) &
+      trimws(out$Description) != "" &
+      is.finite(out$AdjustedP) &
+      out$AdjustedP > 0 &
+      is.finite(out$Count) &
+      is.finite(out$RichFactor),
+    ,
+    drop = FALSE
+  ]
+
+  if (nrow(out) == 0) {
+    stop(
+      "No usable enrichment rows remained after reading:\n",
+      csv_path
+    )
+  }
+
+  # Select terms by statistical significance.
+  out <- out[
+    order(
+      out$AdjustedP,
+      -out$RichFactor
+    ),
+    ,
+    drop = FALSE
+  ]
+
+  out <- utils::head(
+    out,
+    top_n
+  )
+
+  out$NegLog10AdjustedP <- -log10(
+    out$AdjustedP
+  )
+
+  # Arrange the displayed y-axis by Rich Factor.
+  display_order <- order(
+    out$RichFactor,
+    decreasing = FALSE
+  )
+
+  out$Description <- factor(
+    out$Description,
+    levels = out$Description[
+      display_order
+    ]
+  )
+
+  out
+}
+
+# =============================================================================
+# 6. PLOT FUNCTIONS
+# =============================================================================
+
+base_theme <- ggplot2::theme_classic(
+  base_size = 7
+) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      size = 9,
+      face = "bold",
+      hjust = 0.5,
+      margin = ggplot2::margin(
+        b = 4
+      )
+    ),
+    axis.title.x = ggplot2::element_text(
+      size = 7,
+      face = "bold"
+    ),
+    axis.title.y = ggplot2::element_blank(),
+    axis.text.x = ggplot2::element_text(
+      size = 5.5
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = 5.2
+    ),
+    axis.line = ggplot2::element_line(
+      linewidth = 0.35
+    ),
+    legend.title = ggplot2::element_text(
+      size = 5.5
+    ),
+    legend.text = ggplot2::element_text(
+      size = 5
+    ),
+    legend.key.height = grid::unit(
+      0.32,
+      "cm"
+    ),
+    legend.key.width = grid::unit(
+      0.28,
+      "cm"
+    ),
+    legend.margin = ggplot2::margin(
+      0,
+      0,
+      0,
+      0
+    ),
+    legend.box.margin = ggplot2::margin(
+      0,
+      0,
+      0,
+      0
+    ),
+    plot.margin = ggplot2::margin(
+      7,
+      5,
+      4,
+      7
+    )
+  )
+
+make_go_plot <- function(
+    dat,
+    title_text
+) {
+
+  ggplot2::ggplot(
+    dat,
+    ggplot2::aes(
+      x = RichFactor,
+      y = Description,
+      size = Count,
+      colour = NegLog10AdjustedP
+    )
+  ) +
+    ggplot2::geom_point(
+      alpha = 0.95
+    ) +
+    ggplot2::scale_colour_viridis_c(
+      name = "-log10(adjusted P)"
+    ) +
+    ggplot2::scale_size_continuous(
+      name = "Gene count",
+      range = c(
+        1.2,
+        4.8
+      )
+    ) +
+    ggplot2::labs(
+      title = title_text,
+      x = "Rich factor"
+    ) +
+    base_theme
+}
+
+make_kegg_plot <- function(
+    dat,
+    title_text
+) {
+
+  ggplot2::ggplot(
+    dat,
+    ggplot2::aes(
+      x = RichFactor,
+      y = Description,
+      fill = NegLog10AdjustedP
+    )
+  ) +
+    ggplot2::geom_col(
+      width = 0.72
+    ) +
+    ggplot2::scale_fill_viridis_c(
+      name = "-log10(adjusted P)"
+    ) +
+    ggplot2::labs(
+      title = title_text,
+      x = "Rich factor"
+    ) +
+    base_theme
+}
+
+make_panel_label <- function(index) {
+  letters_vector <- letters
+  x <- index
+  label_parts <- character(0)
+
+  while (x > 0) {
+    remainder <- (x - 1) %% 26
+
+    label_parts <- c(
+      letters_vector[
+        remainder + 1
+      ],
+      label_parts
+    )
+
+    x <- (x - 1) %/% 26
+  }
+
+  paste0(
+    label_parts,
+    collapse = ""
+  )
+}
+
+add_panel_label <- function(
+    plot_object,
+    panel_label
+) {
+
+  grid::grobTree(
+    ggplot2::ggplotGrob(
+      plot_object
+    ),
+    grid::textGrob(
+      paste0(
+        panel_label,
+        ")"
+      ),
+      x = grid::unit(
+        0.004,
+        "npc"
+      ),
+      y = grid::unit(
+        0.997,
+        "npc"
+      ),
+      just = c(
+        "left",
+        "top"
+      ),
+      gp = grid::gpar(
+        fontsize = 11,
+        fontface = "bold"
+      )
+    )
+  )
+}
+
+pad_grobs <- function(
+    grobs,
+    ncol
+) {
+
+  if (length(grobs) == 0) {
+    return(grobs)
+  }
+
+  required_blank_count <- (
+    ncol -
+      length(grobs) %% ncol
+  ) %% ncol
+
+  if (required_blank_count > 0) {
+    grobs <- c(
+      grobs,
+      replicate(
+        required_blank_count,
+        grid::nullGrob(),
+        simplify = FALSE
+      )
+    )
+  }
+
+  grobs
+}
+
+make_section_grid <- function(
+    grobs,
+    ncol
+) {
+
+  if (length(grobs) == 0) {
+    return(
+      grid::textGrob(
+        "No significant enrichment results",
+        gp = grid::gpar(
+          fontsize = 10,
+          fontface = "italic"
+        )
+      )
+    )
+  }
+
+  padded_grobs <- pad_grobs(
+    grobs,
+    ncol = ncol
+  )
+
+  gridExtra::arrangeGrob(
+    grobs = padded_grobs,
+    ncol = ncol,
+    nrow = ceiling(
+      length(padded_grobs) /
+        ncol
+    )
+  )
+}
+
+# =============================================================================
+# 7. BUILD ALL NON-EMPTY SEX-ADJUSTED PANELS
+# =============================================================================
+
+go_rows <- summary_df[
+  summary_df$Significant_GO_BP_terms > 0,
+  ,
+  drop = FALSE
+]
+
+kegg_rows <- summary_df[
+  summary_df$Significant_KEGG_terms > 0,
+  ,
+  drop = FALSE
+]
+
+if (
+  nrow(go_rows) == 0 &&
+    nrow(kegg_rows) == 0
+) {
+  stop(
+    "No non-empty sex-adjusted GO or KEGG analyses were found."
+  )
+}
+
+all_panel_records <- list()
+all_plotted_term_records <- list()
+
+go_grobs <- list()
+kegg_grobs <- list()
+
+panel_index <- 1L
+term_record_index <- 1L
+
+if (nrow(go_rows) > 0) {
+  for (i in seq_len(
+    nrow(go_rows)
+  )) {
+
+    csv_path <- find_result_csv(
+      contrast = go_rows$Contrast[i],
+      direction_folder = go_rows$DirectionFolder[i],
+      database = "GO_BP"
+    )
+
+    plot_data <- prepare_enrichment_table(
+      csv_path = csv_path,
+      top_n = top_n_terms
+    )
+
+    title_text <- paste0(
+      go_rows$ShortContrast[i],
+      ": ",
+      go_rows$DirectionTitle[i],
+      " (higher in ",
+      go_rows$Higher_in_group[i],
+      ")"
+    )
+
+    panel_label <- make_panel_label(
+      panel_index
+    )
+
+    go_grobs[[
+      length(go_grobs) + 1L
+    ]] <- add_panel_label(
+      make_go_plot(
+        plot_data,
+        title_text
+      ),
+      panel_label
+    )
+
+    all_panel_records[[
+      length(all_panel_records) + 1L
+    ]] <- data.frame(
+      Panel = panel_label,
+      Analysis = analysis_label,
+      Database = "GO Biological Process",
+      Contrast = go_rows$Contrast[i],
+      Direction = go_rows$Direction[i],
+      Higher_in_group = go_rows$Higher_in_group[i],
+      Terms_available = go_rows$Significant_GO_BP_terms[i],
+      Terms_plotted = nrow(plot_data),
+      SourceCSV = csv_path,
+      stringsAsFactors = FALSE
+    )
+
+    term_table <- plot_data
+    term_table$Description <- as.character(
+      term_table$Description
+    )
+    term_table$Panel <- panel_label
+    term_table$Database <- "GO Biological Process"
+    term_table$Contrast <- go_rows$Contrast[i]
+    term_table$Direction <- go_rows$Direction[i]
+    term_table$Higher_in_group <- go_rows$Higher_in_group[i]
+
+    all_plotted_term_records[[
+      term_record_index
+    ]] <- term_table
+
+    term_record_index <- (
+      term_record_index + 1L
+    )
+
+    panel_index <- panel_index + 1L
+  }
+}
+
+if (nrow(kegg_rows) > 0) {
+  for (i in seq_len(
+    nrow(kegg_rows)
+  )) {
+
+    csv_path <- find_result_csv(
+      contrast = kegg_rows$Contrast[i],
+      direction_folder = kegg_rows$DirectionFolder[i],
+      database = "KEGG"
+    )
+
+    plot_data <- prepare_enrichment_table(
+      csv_path = csv_path,
+      top_n = top_n_terms
+    )
+
+    title_text <- paste0(
+      kegg_rows$ShortContrast[i],
+      ": ",
+      kegg_rows$DirectionTitle[i],
+      " (higher in ",
+      kegg_rows$Higher_in_group[i],
+      ")"
+    )
+
+    panel_label <- make_panel_label(
+      panel_index
+    )
+
+    kegg_grobs[[
+      length(kegg_grobs) + 1L
+    ]] <- add_panel_label(
+      make_kegg_plot(
+        plot_data,
+        title_text
+      ),
+      panel_label
+    )
+
+    all_panel_records[[
+      length(all_panel_records) + 1L
+    ]] <- data.frame(
+      Panel = panel_label,
+      Analysis = analysis_label,
+      Database = "KEGG",
+      Contrast = kegg_rows$Contrast[i],
+      Direction = kegg_rows$Direction[i],
+      Higher_in_group = kegg_rows$Higher_in_group[i],
+      Terms_available = kegg_rows$Significant_KEGG_terms[i],
+      Terms_plotted = nrow(plot_data),
+      SourceCSV = csv_path,
+      stringsAsFactors = FALSE
+    )
+
+    term_table <- plot_data
+    term_table$Description <- as.character(
+      term_table$Description
+    )
+    term_table$Panel <- panel_label
+    term_table$Database <- "KEGG"
+    term_table$Contrast <- kegg_rows$Contrast[i]
+    term_table$Direction <- kegg_rows$Direction[i]
+    term_table$Higher_in_group <- kegg_rows$Higher_in_group[i]
+
+    all_plotted_term_records[[
+      term_record_index
+    ]] <- term_table
+
+    term_record_index <- (
+      term_record_index + 1L
+    )
+
+    panel_index <- panel_index + 1L
+  }
+}
+
+go_grid <- make_section_grid(
+  go_grobs,
+  ncol = panels_per_row
+)
+
+kegg_grid <- make_section_grid(
+  kegg_grobs,
+  ncol = panels_per_row
+)
+
+go_row_count <- if (
+  length(go_grobs) == 0
+) {
+  1L
+} else {
+  ceiling(
+    length(go_grobs) /
+      panels_per_row
+  )
+}
+
+kegg_row_count <- if (
+  length(kegg_grobs) == 0
+) {
+  1L
+} else {
+  ceiling(
+    length(kegg_grobs) /
+      panels_per_row
+  )
+}
+
+go_section_height <- max(
+  2,
+  go_row_count * 4.3
+)
+
+kegg_section_height <- max(
+  2,
+  kegg_row_count * 4.3
+)
+
+figure_grob <- gridExtra::arrangeGrob(
+  grid::textGrob(
+    "Sex-adjusted GO Biological Process",
+    gp = grid::gpar(
+      fontsize = 15,
+      fontface = "bold"
+    )
+  ),
+  go_grid,
+  grid::textGrob(
+    "Sex-adjusted KEGG",
+    gp = grid::gpar(
+      fontsize = 15,
+      fontface = "bold"
+    )
+  ),
+  kegg_grid,
+  grid::textGrob(
+    paste0(
+      "Non-empty sex-adjusted enrichment analyses only; ",
+      "directional DEG foreground FDR < 0.01; ",
+      "GO/KEGG BH-adjusted P < 0.05."
+    ),
+    gp = grid::gpar(
+      fontsize = 8
+    )
+  ),
+  ncol = 1,
+  heights = c(
+    0.45,
+    go_section_height,
+    0.45,
+    kegg_section_height,
+    0.35
+  )
+)
+
+# =============================================================================
+# 8. WRITE EXACTLY ONE PDF PAGE
+# =============================================================================
+
+if (capabilities("cairo")) {
+  grDevices::cairo_pdf(
+    filename = combined_pdf_path,
+    width = pdf_width_inches,
+    height = pdf_height_inches,
+    onefile = TRUE
+  )
+} else {
+  grDevices::pdf(
+    file = combined_pdf_path,
+    width = pdf_width_inches,
+    height = pdf_height_inches,
+    onefile = TRUE,
+    useDingbats = FALSE
+  )
+}
+
+grid::grid.newpage()
+grid::grid.draw(
+  figure_grob
+)
+grDevices::dev.off()
+
+# =============================================================================
+# 9. WRITE PANEL KEY AND PLOTTED-TERM TABLE
+# =============================================================================
+
+panel_key <- do.call(
+  rbind,
+  all_panel_records
+)
+
+write.table(
+  panel_key,
+  file = panel_key_path,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+plotted_terms <- do.call(
+  rbind,
+  all_plotted_term_records
+)
+
+preferred_columns <- c(
+  "Panel",
+  "Database",
+  "Contrast",
+  "Direction",
+  "Higher_in_group",
+  "Description",
+  "AdjustedP",
+  "NegLog10AdjustedP",
+  "Count",
+  "RichFactor",
+  "ContributingGenes"
+)
+
+plotted_terms <- plotted_terms[
+  ,
+  c(
+    intersect(
+      preferred_columns,
+      colnames(plotted_terms)
+    ),
+    setdiff(
+      colnames(plotted_terms),
+      preferred_columns
+    )
+  ),
+  drop = FALSE
+]
+
+write.table(
+  plotted_terms,
+  file = plotted_terms_path,
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  na = ""
+)
+
+# =============================================================================
+# 10. FINAL REPORT
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("SEX-ADJUSTED ONE-PAGE GO/KEGG FIGURE COMPLETE\n")
+cat("============================================================\n")
+cat("Analysis:", analysis_label, "\n")
+cat("PDF pages written: 1\n")
+cat("GO panels:", length(go_grobs), "\n")
+cat("KEGG panels:", length(kegg_grobs), "\n")
+cat(
+  "Total panels:",
+  length(go_grobs) + length(kegg_grobs),
+  "\n"
+)
+cat(
+  "Combined PDF:\n",
+  combined_pdf_path,
+  "\n",
+  sep = ""
+)
+cat(
+  "Panel key:\n",
+  panel_key_path,
+  "\n",
+  sep = ""
+)
+cat(
+  "Plotted terms:\n",
+  plotted_terms_path,
+  "\n",
+  sep = ""
+)
