@@ -1,0 +1,1562 @@
+#!/usr/bin/env Rscript
+
+###############################################################################
+# GO_KEGG_sex_adjusted_warm_cold_heatmap_clusters.R
+#
+# PURPOSE
+#   Run GO Biological Process and KEGG enrichment separately for the
+#   warm-enriched and cold-enriched row clusters from the SEX-ADJUSTED
+#   warm-versus-cold heatmap.
+#
+# IMPORTANT
+#   1. The script reads the outputs produced by:
+#        warm_vs_cold_heatmap_sex_adjusted.R
+#   2. It determines automatically which numeric row cluster is Warm and
+#      which is Cold from the row-cluster summary:
+#        Warm = largest WarmMinusCold
+#        Cold = smallest WarmMinusCold
+#   3. It uses the SEX-ADJUSTED full differential-expression table to build
+#      the tested-gene universe.
+#   4. As requested, heatmap rows without a valid annotated Gene_name are
+#      excluded from both the foreground and the eligible background.
+#      Therefore rows displayed only as Equ03.xxxxx are not submitted to
+#      GO or KEGG.
+###############################################################################
+
+# =============================================================================
+# 0. USER SETTINGS
+# =============================================================================
+
+base_dir <- "/Users/adrian/Desktop/EQU.03"
+
+# Folder created by the sex-adjusted heatmap script
+heatmap_dir <- file.path(
+  base_dir,
+  "warm_vs_cold_sex_adjusted"
+)
+
+cluster_assignment_path <- file.path(
+  heatmap_dir,
+  "FDR_lt_1e-2_row_cluster_assignments.txt"
+)
+
+cluster_summary_path <- file.path(
+  heatmap_dir,
+  "FDR_lt_1e-2_row_cluster_summary.txt"
+)
+
+heatmap_zscore_path <- file.path(
+  heatmap_dir,
+  "FDR_lt_1e-2_zscore_logCPM_matrix.txt"
+)
+
+full_de_results_path <- file.path(
+  heatmap_dir,
+  "FDR_lt_1e-2_warm_vs_cold_sex_adjusted_full_results.txt"
+)
+
+gene_annotations_path <- file.path(
+  base_dir,
+  "20251016_Equ03_CDS_Mmu_genes.txt"
+)
+
+output_root <- file.path(
+  heatmap_dir,
+  "GO_KEGG_FROM_SEX_ADJUSTED_WARM_COLD_CLUSTERS"
+)
+
+# Annotation column containing the displayed mouse-style gene symbols.
+gene_symbol_column <- "Gene_name"
+
+# Strict rule requested by the user:
+# TRUE = rows lacking an annotated gene symbol, including Equ03-only labels,
+#        are excluded from enrichment.
+exclude_equ03_only_rows <- TRUE
+
+# Enrichment settings
+pvalue_cutoff <- 0.05
+qvalue_cutoff <- 0.10
+top_terms_to_plot <- 20L
+
+# =============================================================================
+# 1. INSTALL AND LOAD PACKAGES
+# =============================================================================
+
+install_cran_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(
+      pkg,
+      repos = "https://cloud.r-project.org"
+    )
+  }
+}
+
+install_bioc_if_missing <- function(pkg) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages(
+      "BiocManager",
+      repos = "https://cloud.r-project.org"
+    )
+  }
+  
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(
+      pkg,
+      ask = FALSE,
+      update = FALSE
+    )
+  }
+}
+
+install_bioc_if_missing("clusterProfiler")
+install_bioc_if_missing("org.Mm.eg.db")
+install_bioc_if_missing("AnnotationDbi")
+
+install_cran_if_missing("dplyr")
+install_cran_if_missing("tidyr")
+install_cran_if_missing("ggplot2")
+install_cran_if_missing("ggsci")
+
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggsci)
+})
+
+dir.create(
+  output_root,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# =============================================================================
+# 2. HELPERS
+# =============================================================================
+
+is_valid_identifier <- function(x) {
+  x <- trimws(as.character(x))
+  
+  !is.na(x) &
+    x != "" &
+    !(toupper(x) %in% c(
+      "NA",
+      "N/A",
+      "NONE",
+      "NULL",
+      "UNKNOWN",
+      "UNANNOTATED",
+      "NO",
+      "FALSE",
+      "-",
+      ".",
+      "?"
+    ))
+}
+
+is_usable_gene_symbol <- function(x) {
+  x <- trimws(as.character(x))
+  
+  valid <- is_valid_identifier(x)
+  
+  if (exclude_equ03_only_rows) {
+    valid <- valid & !grepl(
+      "^Equ03\\.",
+      x,
+      ignore.case = TRUE
+    )
+  }
+  
+  valid
+}
+
+write_csv <- function(x, path) {
+  write.csv(
+    x,
+    file = path,
+    row.names = FALSE,
+    na = ""
+  )
+}
+
+expand_symbol_column <- function(
+    df,
+    symbol_column,
+    keep_cluster_label = FALSE) {
+  
+  required_columns <- c(
+    "GeneID",
+    symbol_column
+  )
+  
+  if (keep_cluster_label) {
+    required_columns <- c(
+      required_columns,
+      "RowCluster",
+      "ThermalCluster"
+    )
+  }
+  
+  missing_columns <- setdiff(
+    required_columns,
+    colnames(df)
+  )
+  
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing required columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+  
+  if (keep_cluster_label) {
+    out <- df %>%
+      dplyr::transmute(
+        GeneID = as.character(GeneID),
+        RowCluster = as.integer(RowCluster),
+        ThermalCluster = as.character(ThermalCluster),
+        InputSymbol = trimws(
+          as.character(.data[[symbol_column]])
+        )
+      )
+  } else {
+    out <- df %>%
+      dplyr::transmute(
+        GeneID = as.character(GeneID),
+        InputSymbol = trimws(
+          as.character(.data[[symbol_column]])
+        )
+      )
+  }
+  
+  out %>%
+    dplyr::filter(
+      is_usable_gene_symbol(InputSymbol)
+    ) %>%
+    tidyr::separate_rows(
+      InputSymbol,
+      sep = "\\s*[,;|]+\\s*"
+    ) %>%
+    dplyr::mutate(
+      InputSymbol = trimws(InputSymbol)
+    ) %>%
+    dplyr::filter(
+      is_usable_gene_symbol(InputSymbol)
+    ) %>%
+    dplyr::distinct()
+}
+
+map_mouse_symbols <- function(symbols) {
+  symbols <- unique(
+    trimws(
+      as.character(symbols)
+    )
+  )
+  
+  symbols <- symbols[
+    is_usable_gene_symbol(symbols)
+  ]
+  
+  empty_result <- data.frame(
+    InputSymbol = character(),
+    ENTREZID = character(),
+    MouseSymbol = character(),
+    MappingType = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  if (length(symbols) == 0) {
+    return(empty_result)
+  }
+  
+  direct_map <- suppressMessages(
+    AnnotationDbi::select(
+      org.Mm.eg.db,
+      keys = symbols,
+      keytype = "SYMBOL",
+      columns = c(
+        "ENTREZID",
+        "SYMBOL"
+      )
+    )
+  )
+  
+  if (is.null(direct_map) || nrow(direct_map) == 0) {
+    direct_result <- empty_result
+  } else {
+    direct_result <- direct_map %>%
+      dplyr::transmute(
+        InputSymbol = as.character(SYMBOL),
+        ENTREZID = as.character(ENTREZID),
+        MouseSymbol = as.character(SYMBOL),
+        MappingType = "SYMBOL"
+      ) %>%
+      dplyr::filter(
+        is_valid_identifier(InputSymbol),
+        is_valid_identifier(ENTREZID)
+      ) %>%
+      dplyr::distinct()
+  }
+  
+  directly_mapped_symbols <- unique(
+    direct_result$InputSymbol
+  )
+  
+  alias_candidates <- setdiff(
+    symbols,
+    directly_mapped_symbols
+  )
+  
+  if (length(alias_candidates) == 0) {
+    alias_result <- empty_result
+  } else {
+    alias_map <- suppressMessages(
+      AnnotationDbi::select(
+        org.Mm.eg.db,
+        keys = alias_candidates,
+        keytype = "ALIAS",
+        columns = c(
+          "ENTREZID",
+          "SYMBOL"
+        )
+      )
+    )
+    
+    if (is.null(alias_map) || nrow(alias_map) == 0) {
+      alias_result <- empty_result
+    } else {
+      alias_result <- alias_map %>%
+        dplyr::transmute(
+          InputSymbol = as.character(ALIAS),
+          ENTREZID = as.character(ENTREZID),
+          MouseSymbol = as.character(SYMBOL),
+          MappingType = "ALIAS"
+        ) %>%
+        dplyr::filter(
+          is_valid_identifier(InputSymbol),
+          is_valid_identifier(ENTREZID)
+        ) %>%
+        dplyr::distinct()
+    }
+  }
+  
+  dplyr::bind_rows(
+    direct_result,
+    alias_result
+  ) %>%
+    dplyr::distinct(
+      InputSymbol,
+      ENTREZID,
+      MouseSymbol,
+      .keep_all = TRUE
+    )
+}
+
+add_rich_factor <- function(df) {
+  if (nrow(df) == 0) {
+    return(df)
+  }
+  
+  df %>%
+    dplyr::mutate(
+      BackgroundTermGenes = as.numeric(
+        sub(
+          "/.*",
+          "",
+          BgRatio
+        )
+      ),
+      RichFactor = Count / BackgroundTermGenes
+    )
+}
+
+add_rich_group <- function(df) {
+  if (nrow(df) == 0) {
+    return(df)
+  }
+  
+  if (nrow(df) == 1) {
+    df$RichGroup <- factor(
+      "Low",
+      levels = c(
+        "Low",
+        "Medium",
+        "High"
+      )
+    )
+    
+    return(df)
+  }
+  
+  df %>%
+    dplyr::mutate(
+      RichGroup = factor(
+        c(
+          "Low",
+          "Medium",
+          "High"
+        )[
+          dplyr::ntile(
+            rank(
+              RichFactor,
+              ties.method = "first"
+            ),
+            3
+          )
+        ],
+        levels = c(
+          "Low",
+          "Medium",
+          "High"
+        )
+      )
+    )
+}
+
+# =============================================================================
+# 3. CHECK INPUT FILES
+# =============================================================================
+
+required_input_files <- c(
+  cluster_assignment_path,
+  cluster_summary_path,
+  heatmap_zscore_path,
+  full_de_results_path,
+  gene_annotations_path
+)
+
+missing_input_files <- required_input_files[
+  !file.exists(required_input_files)
+]
+
+if (length(missing_input_files) > 0) {
+  stop(
+    "The following required input files were not found:\n",
+    paste(
+      missing_input_files,
+      collapse = "\n"
+    )
+  )
+}
+
+# =============================================================================
+# 4. READ SEX-ADJUSTED HEATMAP OUTPUTS
+# =============================================================================
+
+cluster_df <- read.table(
+  cluster_assignment_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+if (!all(
+  c(
+    "GeneID",
+    "RowCluster"
+  ) %in% colnames(cluster_df)
+)) {
+  stop(
+    "The cluster-assignment file must contain GeneID and RowCluster."
+  )
+}
+
+cluster_df <- cluster_df %>%
+  dplyr::transmute(
+    GeneID = as.character(GeneID),
+    RowCluster = as.integer(RowCluster)
+  ) %>%
+  dplyr::distinct()
+
+cluster_summary <- read.table(
+  cluster_summary_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+required_summary_columns <- c(
+  "RowCluster",
+  "WarmMinusCold"
+)
+
+missing_summary_columns <- setdiff(
+  required_summary_columns,
+  colnames(cluster_summary)
+)
+
+if (length(missing_summary_columns) > 0) {
+  stop(
+    "The row-cluster summary is missing: ",
+    paste(
+      missing_summary_columns,
+      collapse = ", "
+    )
+  )
+}
+
+cluster_summary <- cluster_summary %>%
+  dplyr::mutate(
+    RowCluster = as.integer(RowCluster),
+    WarmMinusCold = as.numeric(WarmMinusCold)
+  ) %>%
+  dplyr::distinct(
+    RowCluster,
+    .keep_all = TRUE
+  )
+
+available_clusters <- sort(
+  unique(
+    cluster_df$RowCluster
+  )
+)
+
+if (length(available_clusters) != 2) {
+  stop(
+    "Expected exactly two row clusters, but found: ",
+    paste(
+      available_clusters,
+      collapse = ", "
+    )
+  )
+}
+
+if (!setequal(
+  available_clusters,
+  cluster_summary$RowCluster
+)) {
+  stop(
+    "The row-cluster assignment and row-cluster summary ",
+    "contain different cluster numbers."
+  )
+}
+
+warm_cluster_number <- cluster_summary$RowCluster[
+  which.max(
+    cluster_summary$WarmMinusCold
+  )
+]
+
+cold_cluster_number <- cluster_summary$RowCluster[
+  which.min(
+    cluster_summary$WarmMinusCold
+  )
+]
+
+if (identical(
+  warm_cluster_number,
+  cold_cluster_number
+)) {
+  stop(
+    "The Warm and Cold clusters could not be distinguished."
+  )
+}
+
+cluster_label_lookup <- data.frame(
+  RowCluster = c(
+    warm_cluster_number,
+    cold_cluster_number
+  ),
+  ThermalCluster = c(
+    "Warm",
+    "Cold"
+  ),
+  stringsAsFactors = FALSE
+)
+
+cluster_df <- cluster_df %>%
+  dplyr::left_join(
+    cluster_label_lookup,
+    by = "RowCluster"
+  )
+
+if (any(is.na(cluster_df$ThermalCluster))) {
+  stop(
+    "At least one row cluster could not be labelled Warm or Cold."
+  )
+}
+
+heatmap_zscore <- read.table(
+  heatmap_zscore_path,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+heatmap_gene_ids <- unique(
+  as.character(
+    rownames(heatmap_zscore)
+  )
+)
+
+cluster_gene_ids <- unique(
+  as.character(
+    cluster_df$GeneID
+  )
+)
+
+if (!setequal(
+  heatmap_gene_ids,
+  cluster_gene_ids
+)) {
+  stop(
+    "The sex-adjusted heatmap matrix and cluster-assignment file ",
+    "do not contain exactly the same genes."
+  )
+}
+
+multi_cluster_genes <- cluster_df %>%
+  dplyr::count(
+    GeneID,
+    name = "NClusters"
+  ) %>%
+  dplyr::filter(
+    NClusters > 1
+  )
+
+if (nrow(multi_cluster_genes) > 0) {
+  stop(
+    "At least one heatmap gene belongs to more than one cluster."
+  )
+}
+
+cat("\nSEX-ADJUSTED HEATMAP CLUSTERS\n")
+cat(
+  "Numeric warm-enriched cluster:",
+  warm_cluster_number,
+  "\n"
+)
+cat(
+  "Numeric cold-enriched cluster:",
+  cold_cluster_number,
+  "\n"
+)
+print(
+  cluster_summary[
+    order(
+      cluster_summary$WarmMinusCold,
+      decreasing = TRUE
+    ),
+    ,
+    drop = FALSE
+  ],
+  row.names = FALSE
+)
+
+# =============================================================================
+# 5. READ ANNOTATIONS AND SEX-ADJUSTED FULL DE RESULTS
+# =============================================================================
+
+gene_annotations <- read.table(
+  gene_annotations_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+if (ncol(gene_annotations) == 0) {
+  stop(
+    "The annotation file contains no columns."
+  )
+}
+
+colnames(gene_annotations)[1] <- "GeneID"
+
+gene_annotations <- gene_annotations %>%
+  dplyr::mutate(
+    GeneID = as.character(GeneID)
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    .keep_all = TRUE
+  )
+
+if (!gene_symbol_column %in% colnames(gene_annotations)) {
+  stop(
+    "The annotation file does not contain the requested symbol column: ",
+    gene_symbol_column,
+    "\nAvailable columns:\n",
+    paste(
+      colnames(gene_annotations),
+      collapse = ", "
+    )
+  )
+}
+
+gene_symbol_lookup <- gene_annotations %>%
+  dplyr::transmute(
+    GeneID = as.character(GeneID),
+    GeneName = trimws(
+      as.character(
+        .data[[gene_symbol_column]]
+      )
+    ),
+    HasUsableGeneSymbol = is_usable_gene_symbol(
+      .data[[gene_symbol_column]]
+    )
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    .keep_all = TRUE
+  )
+
+full_de_df <- read.table(
+  full_de_results_path,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+)
+
+if (!"GeneID" %in% colnames(full_de_df)) {
+  stop(
+    "The sex-adjusted full DE-results file does not contain GeneID."
+  )
+}
+
+full_de_df <- full_de_df %>%
+  dplyr::mutate(
+    GeneID = as.character(GeneID)
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    .keep_all = TRUE
+  )
+
+heatmap_missing_from_full_results <- setdiff(
+  heatmap_gene_ids,
+  full_de_df$GeneID
+)
+
+if (length(heatmap_missing_from_full_results) > 0) {
+  stop(
+    "Some heatmap genes are absent from the sex-adjusted ",
+    "full DE-results table."
+  )
+}
+
+# =============================================================================
+# 6. BUILD THE ELIGIBLE TESTED-GENE UNIVERSE
+# =============================================================================
+
+universe_source <- full_de_df %>%
+  dplyr::select(
+    GeneID
+  ) %>%
+  dplyr::left_join(
+    gene_symbol_lookup,
+    by = "GeneID"
+  )
+
+universe_long <- expand_symbol_column(
+  universe_source,
+  symbol_column = "GeneName",
+  keep_cluster_label = FALSE
+)
+
+universe_symbol_map <- map_mouse_symbols(
+  universe_long$InputSymbol
+)
+
+universe_gene_map <- universe_long %>%
+  dplyr::inner_join(
+    universe_symbol_map,
+    by = "InputSymbol"
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    InputSymbol,
+    MouseSymbol,
+    ENTREZID,
+    MappingType
+  )
+
+universe_entrez <- sort(
+  unique(
+    universe_gene_map$ENTREZID
+  )
+)
+
+if (length(universe_entrez) == 0) {
+  stop(
+    "No tested genes with usable annotated symbols mapped ",
+    "to mouse Entrez IDs."
+  )
+}
+
+write_csv(
+  universe_gene_map,
+  file.path(
+    output_root,
+    "sex_adjusted_tested_gene_universe_mouse_mapping.csv"
+  )
+)
+
+write_csv(
+  data.frame(
+    ENTREZID = universe_entrez,
+    stringsAsFactors = FALSE
+  ),
+  file.path(
+    output_root,
+    "sex_adjusted_tested_gene_universe_EntrezIDs.csv"
+  )
+)
+
+cat(
+  "\nEligible sex-adjusted universe:",
+  length(universe_entrez),
+  "unique mouse Entrez IDs\n"
+)
+
+# =============================================================================
+# 7. MAP THE EXACT WARM AND COLD HEATMAP CLUSTERS
+# =============================================================================
+
+heatmap_cluster_source <- cluster_df %>%
+  dplyr::left_join(
+    gene_symbol_lookup,
+    by = "GeneID"
+  )
+
+heatmap_cluster_long <- expand_symbol_column(
+  heatmap_cluster_source,
+  symbol_column = "GeneName",
+  keep_cluster_label = TRUE
+)
+
+heatmap_symbol_map <- map_mouse_symbols(
+  heatmap_cluster_long$InputSymbol
+)
+
+cluster_gene_map_before_universe <- heatmap_cluster_long %>%
+  dplyr::inner_join(
+    heatmap_symbol_map,
+    by = "InputSymbol"
+  ) %>%
+  dplyr::distinct(
+    GeneID,
+    GeneName = InputSymbol,
+    RowCluster,
+    ThermalCluster,
+    MouseSymbol,
+    ENTREZID,
+    MappingType
+  )
+
+mapped_outside_universe <- cluster_gene_map_before_universe %>%
+  dplyr::filter(
+    !ENTREZID %in% universe_entrez
+  )
+
+write_csv(
+  mapped_outside_universe,
+  file.path(
+    output_root,
+    "AUDIT_mapped_heatmap_genes_outside_universe.csv"
+  )
+)
+
+if (nrow(mapped_outside_universe) > 0) {
+  stop(
+    "Some mapped heatmap genes are absent from the eligible ",
+    "sex-adjusted universe."
+  )
+}
+
+cluster_gene_map <- cluster_gene_map_before_universe %>%
+  dplyr::filter(
+    ENTREZID %in% universe_entrez
+  ) %>%
+  dplyr::distinct()
+
+# =============================================================================
+# 8. AUDIT EVERY HEATMAP ROW
+# =============================================================================
+
+valid_symbol_status <- heatmap_cluster_source %>%
+  dplyr::transmute(
+    GeneID,
+    RowCluster,
+    ThermalCluster,
+    GeneName,
+    HasUsableGeneSymbol = is_usable_gene_symbol(
+      GeneName
+    )
+  )
+
+mapped_status <- cluster_gene_map_before_universe %>%
+  dplyr::distinct(
+    GeneID,
+    RowCluster,
+    ThermalCluster
+  ) %>%
+  dplyr::mutate(
+    MappedToMouseEntrez = TRUE
+  )
+
+used_status <- cluster_gene_map %>%
+  dplyr::distinct(
+    GeneID,
+    RowCluster,
+    ThermalCluster
+  ) %>%
+  dplyr::mutate(
+    UsedForEnrichment = TRUE
+  )
+
+heatmap_gene_flow_audit <- valid_symbol_status %>%
+  dplyr::left_join(
+    mapped_status,
+    by = c(
+      "GeneID",
+      "RowCluster",
+      "ThermalCluster"
+    )
+  ) %>%
+  dplyr::left_join(
+    used_status,
+    by = c(
+      "GeneID",
+      "RowCluster",
+      "ThermalCluster"
+    )
+  ) %>%
+  dplyr::mutate(
+    MappedToMouseEntrez = tidyr::replace_na(
+      MappedToMouseEntrez,
+      FALSE
+    ),
+    UsedForEnrichment = tidyr::replace_na(
+      UsedForEnrichment,
+      FALSE
+    ),
+    DisplayLabel = dplyr::if_else(
+      HasUsableGeneSymbol,
+      GeneName,
+      GeneID
+    ),
+    Status = dplyr::case_when(
+      UsedForEnrichment ~
+        "Used for GO/KEGG",
+      
+      !HasUsableGeneSymbol ~
+        "Excluded: no annotated Gene_name (Equ03-only row)",
+      
+      HasUsableGeneSymbol & !MappedToMouseEntrez ~
+        "Excluded: Gene_name did not map to mouse Entrez",
+      
+      MappedToMouseEntrez & !UsedForEnrichment ~
+        "ERROR: mapped gene absent from universe",
+      
+      TRUE ~
+        "Unknown"
+    )
+  ) %>%
+  dplyr::arrange(
+    factor(
+      ThermalCluster,
+      levels = c(
+        "Warm",
+        "Cold"
+      )
+    ),
+    Status,
+    DisplayLabel
+  )
+
+write_csv(
+  heatmap_gene_flow_audit,
+  file.path(
+    output_root,
+    "AUDIT_every_sex_adjusted_heatmap_gene_to_enrichment.csv"
+  )
+)
+
+cluster_input_counts <- heatmap_gene_flow_audit %>%
+  dplyr::group_by(
+    ThermalCluster,
+    RowCluster
+  ) %>%
+  dplyr::summarise(
+    HeatmapRows = dplyr::n_distinct(GeneID),
+    RowsWithAnnotatedGeneName = dplyr::n_distinct(
+      GeneID[HasUsableGeneSymbol]
+    ),
+    RowsUsedForEnrichment = dplyr::n_distinct(
+      GeneID[UsedForEnrichment]
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::left_join(
+    cluster_gene_map %>%
+      dplyr::group_by(
+        ThermalCluster,
+        RowCluster
+      ) %>%
+      dplyr::summarise(
+        UniqueMouseEntrezIDs = dplyr::n_distinct(
+          ENTREZID
+        ),
+        .groups = "drop"
+      ),
+    by = c(
+      "ThermalCluster",
+      "RowCluster"
+    )
+  ) %>%
+  dplyr::mutate(
+    UniqueMouseEntrezIDs = tidyr::replace_na(
+      UniqueMouseEntrezIDs,
+      0L
+    ),
+    ExcludedRows = HeatmapRows - RowsUsedForEnrichment
+  ) %>%
+  dplyr::arrange(
+    factor(
+      ThermalCluster,
+      levels = c(
+        "Warm",
+        "Cold"
+      )
+    )
+  )
+
+write_csv(
+  cluster_input_counts,
+  file.path(
+    output_root,
+    "AUDIT_warm_cold_cluster_input_counts.csv"
+  )
+)
+
+write_csv(
+  cluster_gene_map,
+  file.path(
+    output_root,
+    "EXACT_warm_cold_usable_genes_for_GO_KEGG.csv"
+  )
+)
+
+cat("\nWARM/COLD FOREGROUND AUDIT\n")
+print(
+  cluster_input_counts,
+  row.names = FALSE
+)
+
+# =============================================================================
+# 9. PLOT SETTINGS
+# =============================================================================
+
+three_cols <- ggsci::pal_npg(
+  "nrc"
+)(3)
+
+clean_theme <- ggplot2::theme_classic() +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      size = 14,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.title.x = ggplot2::element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.title.y = ggplot2::element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.text.x = ggplot2::element_text(
+      size = 10
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = 10
+    ),
+    legend.title = ggplot2::element_text(
+      size = 10,
+      face = "bold"
+    ),
+    legend.text = ggplot2::element_text(
+      size = 9
+    )
+  )
+
+# =============================================================================
+# 10. RUN GO AND KEGG FOR ONE THERMAL CLUSTER
+# =============================================================================
+
+run_thermal_cluster_enrichment <- function(
+    thermal_cluster,
+    cluster_gene_map,
+    heatmap_gene_flow_audit,
+    universe_entrez,
+    output_root,
+    pvalue_cutoff,
+    qvalue_cutoff,
+    top_terms_to_plot) {
+  
+  cluster_slug <- tolower(
+    thermal_cluster
+  )
+  
+  cluster_dir <- file.path(
+    output_root,
+    paste0(
+      cluster_slug,
+      "_cluster"
+    )
+  )
+  
+  dir.create(
+    cluster_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  all_heatmap_rows_here <- heatmap_gene_flow_audit %>%
+    dplyr::filter(
+      ThermalCluster == thermal_cluster
+    ) %>%
+    dplyr::arrange(
+      DisplayLabel,
+      GeneID
+    )
+  
+  usable_rows_here <- cluster_gene_map %>%
+    dplyr::filter(
+      ThermalCluster == thermal_cluster
+    ) %>%
+    dplyr::arrange(
+      MouseSymbol,
+      ENTREZID,
+      GeneName,
+      GeneID
+    )
+  
+  genes_here <- sort(
+    unique(
+      usable_rows_here$ENTREZID
+    )
+  )
+  
+  write_csv(
+    all_heatmap_rows_here,
+    file.path(
+      cluster_dir,
+      paste0(
+        cluster_slug,
+        "_ALL_heatmap_rows_with_mapping_status.csv"
+      )
+    )
+  )
+  
+  writeLines(
+    unique(
+      all_heatmap_rows_here$DisplayLabel
+    ),
+    con = file.path(
+      cluster_dir,
+      paste0(
+        cluster_slug,
+        "_ALL_heatmap_labels_one_per_line.txt"
+      )
+    )
+  )
+  
+  write_csv(
+    usable_rows_here,
+    file.path(
+      cluster_dir,
+      paste0(
+        cluster_slug,
+        "_EXACT_usable_genes_for_GO_KEGG.csv"
+      )
+    )
+  )
+  
+  write_csv(
+    data.frame(
+      ENTREZID = genes_here,
+      stringsAsFactors = FALSE
+    ),
+    file.path(
+      cluster_dir,
+      paste0(
+        cluster_slug,
+        "_EXACT_GO_KEGG_foreground_EntrezIDs.csv"
+      )
+    )
+  )
+  
+  writeLines(
+    genes_here,
+    con = file.path(
+      cluster_dir,
+      paste0(
+        cluster_slug,
+        "_EXACT_GO_KEGG_foreground_EntrezIDs_one_per_line.txt"
+      )
+    )
+  )
+  
+  cat("\n============================================================\n")
+  cat(
+    toupper(thermal_cluster),
+    "-ENRICHED HEATMAP CLUSTER\n",
+    sep = ""
+  )
+  cat(
+    "All heatmap rows:",
+    dplyr::n_distinct(
+      all_heatmap_rows_here$GeneID
+    ),
+    "\n"
+  )
+  cat(
+    "Rows used for enrichment:",
+    dplyr::n_distinct(
+      usable_rows_here$GeneID
+    ),
+    "\n"
+  )
+  cat(
+    "Unique mouse Entrez IDs:",
+    length(genes_here),
+    "\n"
+  )
+  
+  if (length(genes_here) == 0) {
+    warning(
+      thermal_cluster,
+      " cluster has no usable mapped genes. Enrichment skipped."
+    )
+    
+    return(NULL)
+  }
+  
+  if (!all(
+    genes_here %in% universe_entrez
+  )) {
+    stop(
+      thermal_cluster,
+      " foreground contains Entrez IDs outside the universe."
+    )
+  }
+  
+  ego <- clusterProfiler::enrichGO(
+    gene = genes_here,
+    universe = universe_entrez,
+    OrgDb = org.Mm.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = pvalue_cutoff,
+    qvalueCutoff = qvalue_cutoff,
+    readable = TRUE
+  )
+  
+  ego_df <- add_rich_factor(
+    as.data.frame(ego)
+  )
+  
+  ekegg <- clusterProfiler::enrichKEGG(
+    gene = genes_here,
+    universe = universe_entrez,
+    organism = "mmu",
+    keyType = "ncbi-geneid",
+    pvalueCutoff = pvalue_cutoff,
+    pAdjustMethod = "BH",
+    qvalueCutoff = qvalue_cutoff
+  )
+  
+  if (nrow(
+    as.data.frame(ekegg)
+  ) > 0) {
+    ekegg <- clusterProfiler::setReadable(
+      ekegg,
+      OrgDb = org.Mm.eg.db,
+      keyType = "ENTREZID"
+    )
+  }
+  
+  ekegg_df <- add_rich_factor(
+    as.data.frame(ekegg)
+  )
+  
+  write_csv(
+    ego_df,
+    file.path(
+      cluster_dir,
+      paste0(
+        cluster_slug,
+        "_GO_BP_enrichment.csv"
+      )
+    )
+  )
+  
+  write_csv(
+    ekegg_df,
+    file.path(
+      cluster_dir,
+      paste0(
+        cluster_slug,
+        "_KEGG_mouse_enrichment.csv"
+      )
+    )
+  )
+  
+  if (nrow(ego_df) > 0) {
+    top_go <- ego_df %>%
+      dplyr::arrange(
+        dplyr::desc(RichFactor)
+      ) %>%
+      utils::head(
+        top_terms_to_plot
+      ) %>%
+      add_rich_group()
+    
+    go_plot <- ggplot2::ggplot(
+      top_go,
+      ggplot2::aes(
+        x = RichFactor,
+        y = reorder(
+          Description,
+          RichFactor
+        ),
+        color = RichGroup,
+        size = Count
+      )
+    ) +
+      ggplot2::geom_point(
+        alpha = 0.9
+      ) +
+      ggplot2::scale_color_manual(
+        values = three_cols,
+        drop = FALSE
+      ) +
+      ggplot2::labs(
+        title = paste0(
+          thermal_cluster,
+          "-enriched cluster: GO Biological Process"
+        ),
+        x = "Rich Factor",
+        y = "GO term",
+        color = "Rich Factor",
+        size = "Gene Count"
+      ) +
+      clean_theme
+    
+    ggplot2::ggsave(
+      filename = file.path(
+        cluster_dir,
+        paste0(
+          cluster_slug,
+          "_GO_RichFactor_dotplot.pdf"
+        )
+      ),
+      plot = go_plot,
+      width = 8,
+      height = 6
+    )
+  } else {
+    cat(
+      thermal_cluster,
+      " cluster: no significant GO BP terms.\n",
+      sep = ""
+    )
+  }
+  
+  if (nrow(ekegg_df) > 0) {
+    top_kegg <- ekegg_df %>%
+      dplyr::arrange(
+        dplyr::desc(RichFactor)
+      ) %>%
+      utils::head(
+        top_terms_to_plot
+      ) %>%
+      add_rich_group()
+    
+    kegg_plot <- ggplot2::ggplot(
+      top_kegg,
+      ggplot2::aes(
+        x = RichFactor,
+        y = reorder(
+          Description,
+          RichFactor
+        ),
+        fill = RichGroup
+      )
+    ) +
+      ggplot2::geom_col(
+        width = 0.75
+      ) +
+      ggplot2::scale_fill_manual(
+        values = three_cols,
+        drop = FALSE
+      ) +
+      ggplot2::labs(
+        title = paste0(
+          thermal_cluster,
+          "-enriched cluster: KEGG pathways"
+        ),
+        x = "Rich Factor",
+        y = "KEGG pathway",
+        fill = "Rich Factor"
+      ) +
+      clean_theme
+    
+    ggplot2::ggsave(
+      filename = file.path(
+        cluster_dir,
+        paste0(
+          cluster_slug,
+          "_KEGG_RichFactor_barplot.pdf"
+        )
+      ),
+      plot = kegg_plot,
+      width = 8,
+      height = 6
+    )
+  } else {
+    cat(
+      thermal_cluster,
+      " cluster: no significant KEGG pathways.\n",
+      sep = ""
+    )
+  }
+  
+  list(
+    ThermalCluster = thermal_cluster,
+    foreground_mapping = usable_rows_here,
+    foreground_entrez = genes_here,
+    GO = ego,
+    GO_table = ego_df,
+    KEGG = ekegg,
+    KEGG_table = ekegg_df
+  )
+}
+
+# =============================================================================
+# 11. RUN WARM AND COLD ENRICHMENT
+# =============================================================================
+
+thermal_clusters_to_analyse <- c(
+  "Warm",
+  "Cold"
+)
+
+enrichment_results <- lapply(
+  thermal_clusters_to_analyse,
+  function(thermal_cluster) {
+    run_thermal_cluster_enrichment(
+      thermal_cluster = thermal_cluster,
+      cluster_gene_map = cluster_gene_map,
+      heatmap_gene_flow_audit = heatmap_gene_flow_audit,
+      universe_entrez = universe_entrez,
+      output_root = output_root,
+      pvalue_cutoff = pvalue_cutoff,
+      qvalue_cutoff = qvalue_cutoff,
+      top_terms_to_plot = top_terms_to_plot
+    )
+  }
+)
+
+names(enrichment_results) <- thermal_clusters_to_analyse
+
+# =============================================================================
+# 12. SAVE OBJECTS AND SESSION INFORMATION
+# =============================================================================
+
+saveRDS(
+  enrichment_results,
+  file = file.path(
+    output_root,
+    "sex_adjusted_warm_cold_GO_KEGG_objects.rds"
+  )
+)
+
+writeLines(
+  capture.output(
+    sessionInfo()
+  ),
+  con = file.path(
+    output_root,
+    "sessionInfo.txt"
+  )
+)
+
+# =============================================================================
+# 13. FINAL REPORT
+# =============================================================================
+
+cat("\n============================================================\n")
+cat("DONE\n")
+cat("============================================================\n")
+cat(
+  "Analysis source: sex-adjusted warm-versus-cold heatmap\n"
+)
+cat(
+  "Sex-adjusted full DE table:\n",
+  full_de_results_path,
+  "\n\n",
+  sep = ""
+)
+cat(
+  "Warm numeric row cluster:",
+  warm_cluster_number,
+  "\n"
+)
+cat(
+  "Cold numeric row cluster:",
+  cold_cluster_number,
+  "\n"
+)
+cat(
+  "Eligible universe:",
+  length(universe_entrez),
+  "mouse Entrez IDs\n"
+)
+cat(
+  "Equ03-only rows excluded:",
+  exclude_equ03_only_rows,
+  "\n"
+)
+cat("\nCluster-specific input counts:\n")
+print(
+  cluster_input_counts,
+  row.names = FALSE
+)
+cat(
+  "\nOutput directory:\n",
+  output_root,
+  "\n",
+  sep = ""
+)
+cat(
+  "\nMost important audit file:\n",
+  file.path(
+    output_root,
+    "AUDIT_every_sex_adjusted_heatmap_gene_to_enrichment.csv"
+  ),
+  "\n",
+  sep = ""
+)
