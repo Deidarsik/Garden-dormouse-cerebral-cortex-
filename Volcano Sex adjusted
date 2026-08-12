@@ -540,17 +540,20 @@ write.table(
 )
 
 #############################
-# Step 9: Function to define the same contrasts
+# Step 9: Define contrasts in chronological direction
 #############################
 
 make_contrast_matrix <- function(design) {
   makeContrasts(
-    SE_vs_TE = SE - TE,
-    TE_vs_TL = TE - TL,
-    TL_vs_AE = TL - AE,
-    AE_vs_AL = AE - AL,
-    AL_vs_TE = AL - TE,
-    AL_vs_SE = AL - SE,
+    # Contrasts are oriented in chronological/biological direction:
+    # positive logFC = increase from the first displayed state to the second
+    # negative logFC = decrease from the first displayed state to the second
+    SE_vs_TE = TE - SE,
+    TE_vs_TL = TL - TE,
+    TL_vs_AE = AE - TL,
+    AE_vs_AL = AL - AE,
+    AL_vs_TE = TE - AL,
+    AL_vs_SE = SE - AL,
     levels = design
   )
 }
@@ -964,13 +967,13 @@ make_volcano_pdf <- function(
     subtitle_text <- paste0(
       "<span style='color:",
       color_values["Downregulated"],
-      "'>Down: ",
+      "'>&#8595; ",
       down_count,
       "</span>",
       "  ",
       "<span style='color:",
       color_values["Upregulated"],
-      "'>Up: ",
+      "'>&#8593; ",
       up_count,
       "</span>"
     )
@@ -1230,12 +1233,12 @@ collect_significant_target_ids <- function(
     results_list,
     fdr_cutoff
 ) {
-
+  
   target_ids <- unlist(
     lapply(
       results_list,
       function(result_table) {
-
+        
         result_table %>%
           dplyr::filter(
             FDR < fdr_cutoff
@@ -1247,7 +1250,7 @@ collect_significant_target_ids <- function(
     ),
     use.names = FALSE
   )
-
+  
   unique(
     target_ids[
       !is.na(target_ids) &
@@ -1582,7 +1585,7 @@ unique_sex_adjusted_counts <- vapply(
         use.names = FALSE
       )
     )
-
+    
     sum(
       !sex_adjusted_gene_sets[[i]] %in%
         genes_in_other_contrasts
@@ -1602,7 +1605,7 @@ ortholog_counts <- vapply(
     target_gene <- trimws(
       as.character(x$Target_gene)
     )
-
+    
     sum(
       !is.na(target_gene) &
         target_gene != ""
@@ -1659,19 +1662,19 @@ ortholog_display <- sprintf(
 table1_matrix <- rbind(
   "Sex-adjusted total DEGs" =
     sex_adjusted_total,
-
+  
   "Upregulated, sex-adjusted" =
     sex_adjusted_up,
-
+  
   "Downregulated, sex-adjusted" =
     sex_adjusted_down,
-
+  
   "Unique sex-adjusted DEGs" =
     unique_sex_adjusted_counts,
-
+  
   "Assigned 1:1 mouse orthologs" =
     ortholog_display,
-
+  
   "Genes tested" =
     genes_tested
 )
@@ -1736,3 +1739,4 @@ cat("FDR cutoff:", fdr_cutoff, "\n\n")
 
 cat("All results were generated from the sex-adjusted model:\n")
 cat(sex_adjusted_output_dir, "\n")
+
