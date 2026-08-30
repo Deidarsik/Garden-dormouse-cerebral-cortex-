@@ -1,0 +1,228 @@
+#!/usr/bin/env Rscript
+
+###############################################################################
+# ortholog_percentage_by_direction.R
+#
+# Splits the per-contrast 1:1 mouse ortholog percentage by direction of
+# regulation (up vs down), addressing the reviewer comment that a single
+# pooled percentage per contrast may hide a difference between induced and
+# repressed genes.
+#
+# REQUIRES
+#   sex_adjusted_analysis$results_list  (same object used for Table 2)
+#
+# IMPORTANT - ORTHOLOG FLAG
+#   Set ortholog_column below to the column in your results tables that marks
+#   a 1:1 Mus musculus ortholog assignment, so that these percentages come
+#   from exactly the same source as the pooled percentages already in the
+#   manuscript. If no such column exists, the script falls back to "a valid
+#   mouse gene name is present", which is NOT necessarily identical to the
+#   biomaRt/BLAST 1:1 assignment used elsewhere. Check this before reporting.
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr)
+})
+
+# ---------------------------------------------------------------------------
+# 0. SETTINGS
+# ---------------------------------------------------------------------------
+
+output_root <- file.path(
+  "/Users/adrian/Desktop/EQU.03",
+  "gene_stats_filtered_robust_QL_FDR_0.01"
+)
+
+output_dir <- file.path(
+  output_root,
+  "05_ortholog_percentage_by_direction"
+)
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+fdr_cutoff <- 0.01
+
+# Set to the name of your explicit 1:1 ortholog column, or leave as NA to use
+# the gene-name fallback described in the header.
+ortholog_column <- NA_character_
+
+# ---------------------------------------------------------------------------
+# 1. HELPERS (same conventions as the Table 2 script)
+# ---------------------------------------------------------------------------
+
+is_valid_gene_name <- function(x) {
+  x <- trimws(as.character(x))
+  !is.na(x) &
+    x != "" &
+    !toupper(x) %in% c("NA", "N/A", "NONE", "NULL", "UNKNOWN",
+                       "UNANNOTATED", "-", ".", "?")
+}
+
+find_gene_name_column <- function(result_table) {
+  candidates <- c("Gene_name", "Gene_name.x", "Gene_name.y",
+                  "Mmu_gene_name", "Mmu_Gene_name", "Gene_label",
+                  "Target_gene")
+  available <- candidates[candidates %in% colnames(result_table)]
+  if (length(available) == 0) return(NA_character_)
+  available[1]
+}
+
+has_ortholog_flag <- function(result_table) {
+  if (!is.na(ortholog_column)) {
+    if (!ortholog_column %in% colnames(result_table)) {
+      stop("ortholog_column '", ortholog_column, "' not found in the results table.")
+    }
+    col <- result_table[[ortholog_column]]
+    if (is.logical(col)) return(col)
+    return(is_valid_gene_name(col))
+  }
+  gene_col <- find_gene_name_column(result_table)
+  if (is.na(gene_col)) {
+    stop("No gene-name column found and no ortholog_column set.")
+  }
+  is_valid_gene_name(result_table[[gene_col]])
+}
+
+# ---------------------------------------------------------------------------
+# 2. PER-CONTRAST TABULATION
+# ---------------------------------------------------------------------------
+
+summarise_one_contrast <- function(result_table, contrast_name) {
+  
+  required <- c("GeneID", "logFC", "FDR")
+  missing <- setdiff(required, colnames(result_table))
+  if (length(missing)) {
+    stop("Contrast ", contrast_name, " is missing column(s): ",
+         paste(missing, collapse = ", "))
+  }
+  
+  df <- result_table
+  df$has_ortholog <- has_ortholog_flag(df)
+  
+  df <- df %>%
+    dplyr::filter(!is.na(FDR), FDR < fdr_cutoff, !is.na(logFC), logFC != 0) %>%
+    dplyr::distinct(GeneID, .keep_all = TRUE) %>%
+    dplyr::mutate(
+      Direction = dplyr::if_else(logFC > 0, "Up", "Down")
+    )
+  
+  if (nrow(df) == 0) {
+    return(data.frame(
+      Contrast = contrast_name,
+      n_DEG = 0L, n_up = 0L, n_down = 0L,
+      n_ortholog_up = 0L, n_ortholog_down = 0L,
+      pct_ortholog_up = NA_real_, pct_ortholog_down = NA_real_,
+      pct_ortholog_pooled = NA_real_,
+      difference_up_minus_down = NA_real_,
+      fisher_p = NA_real_,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  n_up   <- sum(df$Direction == "Up")
+  n_down <- sum(df$Direction == "Down")
+  o_up   <- sum(df$Direction == "Up"   &  df$has_ortholog)
+  o_down <- sum(df$Direction == "Down" &  df$has_ortholog)
+  
+  pct <- function(a, b) if (b > 0) round(100 * a / b, 1) else NA_real_
+  
+  # 2x2: direction by ortholog status. Two-sided Fisher exact test.
+  fisher_p <- NA_real_
+  if (n_up > 0 && n_down > 0) {
+    tab <- matrix(
+      c(o_up, n_up - o_up, o_down, n_down - o_down),
+      nrow = 2,
+      dimnames = list(c("ortholog", "no_ortholog"), c("Up", "Down"))
+    )
+    fisher_p <- tryCatch(fisher.test(tab)$p.value, error = function(e) NA_real_)
+  }
+  
+  data.frame(
+    Contrast = contrast_name,
+    n_DEG = nrow(df),
+    n_up = n_up,
+    n_down = n_down,
+    n_ortholog_up = o_up,
+    n_ortholog_down = o_down,
+    pct_ortholog_up = pct(o_up, n_up),
+    pct_ortholog_down = pct(o_down, n_down),
+    pct_ortholog_pooled = pct(o_up + o_down, n_up + n_down),
+    difference_up_minus_down = pct(o_up, n_up) - pct(o_down, n_down),
+    fisher_p = fisher_p,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------------------------------------------------------------------------
+# 3. RUN OVER ALL CONTRASTS
+# ---------------------------------------------------------------------------
+
+if (!exists("sex_adjusted_analysis", inherits = TRUE)) {
+  stop("The object 'sex_adjusted_analysis' does not exist. Run the ",
+       "sex-adjusted edgeR analysis first in the same R session.")
+}
+
+results_list <- sex_adjusted_analysis$results_list
+
+summary_table <- dplyr::bind_rows(
+  lapply(names(results_list), function(nm) {
+    summarise_one_contrast(results_list[[nm]], nm)
+  })
+)
+
+# Multiple testing across contrasts, since the same question is asked of each.
+summary_table$fisher_padj <- p.adjust(summary_table$fisher_p, method = "BH")
+
+summary_table <- summary_table[order(summary_table$fisher_p), ]
+
+write.table(
+  summary_table,
+  file = file.path(output_dir, "ortholog_percentage_by_direction.txt"),
+  sep = "\t", quote = FALSE, row.names = FALSE, na = ""
+)
+
+# ---------------------------------------------------------------------------
+# 4. WORD-LAYOUT VERSION
+# ---------------------------------------------------------------------------
+
+word_layout <- data.frame(
+  Metric = c(
+    "DEGs, n (up / down)",
+    "1:1 mouse ortholog, upregulated, n (%)",
+    "1:1 mouse ortholog, downregulated, n (%)",
+    "Fisher exact P, up vs down"
+  ),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+for (i in seq_len(nrow(summary_table))) {
+  word_layout[[summary_table$Contrast[i]]] <- c(
+    paste0(summary_table$n_DEG[i], " (",
+           summary_table$n_up[i], " / ", summary_table$n_down[i], ")"),
+    paste0(summary_table$n_ortholog_up[i], " (",
+           summary_table$pct_ortholog_up[i], "%)"),
+    paste0(summary_table$n_ortholog_down[i], " (",
+           summary_table$pct_ortholog_down[i], "%)"),
+    format.pval(summary_table$fisher_p[i], digits = 2, eps = 1e-4)
+  )
+}
+
+write.table(
+  word_layout,
+  file = file.path(output_dir, "ortholog_percentage_by_direction_Word_layout.txt"),
+  sep = "\t", quote = FALSE, row.names = FALSE, na = ""
+)
+
+# ---------------------------------------------------------------------------
+# 5. REPORT
+# ---------------------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("ORTHOLOG PERCENTAGE BY DIRECTION OF REGULATION\n")
+cat("============================================================\n")
+print(summary_table, row.names = FALSE)
+cat("\nOrtholog flag source: ",
+    if (is.na(ortholog_column)) "gene-name fallback (VERIFY)" else ortholog_column,
+    "\n", sep = "")
+cat("Output directory:\n", output_dir, "\n", sep = "")
