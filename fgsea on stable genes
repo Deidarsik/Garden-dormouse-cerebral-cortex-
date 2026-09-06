@@ -1,7 +1,9 @@
 #!/usr/bin/env Rscript
 # =============================================================================
-# Between-stage expression variability: GO:BP enrichment at the stable and
-# variable ends of a sampling-corrected, mean-adjusted variance ranking.
+# GO:BP enrichment at the relatively low and high ends of a configurable
+# between-stage expression ranking. Supported primary ranking statistics are
+# "stage_F" and "corrected_variance"; the currently selected statistic is
+# "stage_F" (set by primary_ranking_statistic in the CONFIGURATION section).
 #
 # Corrections applied relative to the previous version:
 #   M1  sampling correction uses the UNMODERATED residual variance (fit$sigma^2)
@@ -91,6 +93,7 @@ primary_ranking_statistic <- "stage_F"
 min_pathway_size <- 15
 max_pathway_size <- 500
 fdr_cutoff       <- 0.01
+
 n_perm_simple    <- 10000
 fgsea_eps        <- 1e-50   # p-value floor; -log10 therefore caps at 50
 top_n_plot       <- 15
@@ -723,6 +726,20 @@ fit_eb        <- eBayes(fit, trend = FALSE, robust = TRUE)
 s2_post_stage <- as.numeric(fit_eb$s2.post)   # D4: distinct name
 s2_unmod      <- as.numeric(fit$sigma)^2
 
+# Overall stage-effect moderated F-statistic. This is computed unconditionally
+# because it may be the primary ranking statistic.
+cm_anova <- makeContrasts(
+  contrasts = paste0(stage_coef_names[-1], "-", stage_coef_names[1]),
+  levels = design
+)
+fit_anova <- eBayes(
+  contrasts.fit(fit, cm_anova),
+  trend = FALSE,
+  robust = TRUE
+)
+stage_F   <- as.numeric(fit_anova$F)
+stage_F_p <- as.numeric(fit_anova$F.p.value)
+
 s2_for_correction <- switch(
   sampling_variance_estimator,
   unmoderated = s2_unmod,
@@ -886,9 +903,43 @@ between_stage_var_adj      <- if (studentize_primary_statistic) {
   between_stage_var_meanadj
 }
 
-# Retained for the S1/S2 sensitivity analyses.
-adj_between   <- adjust_for_mean(between_stage_var, mean_logCPM)
-adj_total     <- adjust_for_mean(total_var, mean_logCPM)
+primary_stat_full <- switch(
+  primary_ranking_statistic,
+  corrected_variance = between_stage_var_adj,
+  stage_F            = stage_F,
+  stop("primary_ranking_statistic must be 'corrected_variance' or 'stage_F'.")
+)
+stat_label <- switch(
+  primary_ranking_statistic,
+  corrected_variance = "sampling-corrected, mean-adjusted between-stage variance",
+  stage_F            = "moderated F statistic for the stage term"
+)
+
+# adj_between exists only for the raw-between-variance diagnostic row in md_tab;
+# it is independent of whether S2 itself is run. Keep a safe NA fallback so the
+# diagnostic table still builds if this local diagnostic is disabled.
+run_raw_between_mean_dependence_diagnostic <- TRUE
+adj_between <- if (run_raw_between_mean_dependence_diagnostic) {
+  adjust_for_mean(between_stage_var, mean_logCPM)
+} else {
+  list(
+    offset = NA_real_,
+    log_stat = rep(NA_real_, length(between_stage_var)),
+    fitted = rep(NA_real_, length(between_stage_var)),
+    residual = rep(NA_real_, length(between_stage_var))
+  )
+}
+
+adj_total <- if (run_sensitivity_total_variance) {
+  adjust_for_mean(total_var, mean_logCPM)
+} else {
+  list(
+    offset = NA_real_,
+    log_stat = rep(NA_real_, length(total_var)),
+    fitted = rep(NA_real_, length(total_var)),
+    residual = rep(NA_real_, length(total_var))
+  )
+}
 total_var_adj <- adj_total$residual
 
 # --- diagnostics --------------------------------------------------------------
@@ -923,9 +974,12 @@ mean_dependence_check <- function(stat, mean_expr, label) {
       # Heteroscedasticity diagnostic: spread in the lowest expression decile
       # relative to the highest. Should be near 1 after studentization.
       dec_sd <- tapply(stat_ok, dec, sd, na.rm = TRUE)
-      dec_sd <- dec_sd[is.finite(dec_sd)]
-      if (length(dec_sd) >= 2 && dec_sd[length(dec_sd)] > 0) {
-        low_decile_spread_ratio <- as.numeric(dec_sd[1] / dec_sd[length(dec_sd)])
+      lo_name <- "1"
+      hi_name <- as.character(length(brk) - 1L)
+      lo <- if (lo_name %in% names(dec_sd)) dec_sd[[lo_name]] else NA_real_
+      hi <- if (hi_name %in% names(dec_sd)) dec_sd[[hi_name]] else NA_real_
+      if (is.finite(lo) && is.finite(hi) && hi > 0) {
+        low_decile_spread_ratio <- as.numeric(lo / hi)
       }
     }
   }
@@ -948,8 +1002,10 @@ md_tab <- rbind(
                         "sampling-corrected between-stage variance (unadjusted)"),
   mean_dependence_check(between_stage_var_meanadj, mean_logCPM,
                         "sampling-corrected, mean-adjusted (pre-studentization)"),
-  mean_dependence_check(between_stage_var_adj, mean_logCPM,
+  mean_dependence_check(primary_stat_full, mean_logCPM,
                         "PRIMARY statistic"),
+  mean_dependence_check(between_stage_var_adj, mean_logCPM,
+                        "corrected variance, studentized (reference)"),
   mean_dependence_check(adj_total$log_stat, mean_logCPM,
                         "log2 total variance (raw)"),
   mean_dependence_check(total_var_adj, mean_logCPM,
@@ -989,7 +1045,7 @@ diag_df <- data.frame(
   mean_logCPM = mean_logCPM,
   corrected   = between_stage_var_corrected,
   fitted      = adj_corrected$fitted,
-  primary     = between_stage_var_adj
+  primary     = primary_stat_full
 )
 diag_line <- diag_df[order(diag_df$mean_logCPM), ]
 
@@ -1005,7 +1061,6 @@ p_before <- ggplot(diag_df, aes(mean_logCPM, corrected)) +
 
 p_after <- ggplot(diag_df, aes(mean_logCPM, primary)) +
   geom_point(alpha = 0.15, size = 0.5) +
-  geom_hline(yintercept = 0, linetype = "dashed") +
   geom_smooth(method = "loess", span = loess_span, se = FALSE, colour = "firebrick") +
   theme_classic(base_size = 12) +
   labs(title = "Mean logCPM versus the primary statistic",
@@ -1013,7 +1068,10 @@ p_after <- ggplot(diag_df, aes(mean_logCPM, primary)) +
                          "; low/high decile SD ratio = ",
                          primary_md$low_high_decile_sd_ratio),
        x = "Mean logCPM",
-       y = if (studentize_primary_statistic) "Studentized loess residual" else "Loess residual")
+       y = stat_label)
+if (primary_ranking_statistic == "corrected_variance") {
+  p_after <- p_after + geom_hline(yintercept = 0, linetype = "dashed")
+}
 
 ggsave(file.path(outdir, "qc_mean_between_variance_before_adjustment.pdf"),
        p_before, width = 6.5, height = 5)
@@ -1028,9 +1086,6 @@ ggsave(file.path(outdir, "qc_mean_between_variance_after_adjustment.pdf"),
 # run_sensitivity_equivalence = FALSE.
 max_contrast <- max_contrast_ub <- max_contrast_lb <-
   rep(NA_real_, length(gene_symbols))
-
-stage_F   <- rep(NA_real_, length(gene_symbols))
-stage_F_p <- rep(NA_real_, length(gene_symbols))
 
 # These are single summary statistics across genes, not per-gene quantities.
 stage_F_spearman   <- NA_real_
@@ -1151,29 +1206,6 @@ if (run_sensitivity_equivalence) {
   
   
   # ---------------------------------------------------------------------------
-  # Overall stage-effect moderated F-statistic
-  # ---------------------------------------------------------------------------
-  
-  cm_anova <- makeContrasts(
-    contrasts = paste0(
-      stage_coef_names[-1],
-      "-",
-      stage_coef_names[1]
-    ),
-    levels = design
-  )
-  
-  fit_anova <- eBayes(
-    contrasts.fit(fit, cm_anova),
-    trend = FALSE,
-    robust = TRUE
-  )
-  
-  stage_F   <- as.numeric(fit_anova$F)
-  stage_F_p <- as.numeric(fit_anova$F.p.value)
-  
-  
-  # ---------------------------------------------------------------------------
   # Spearman correlation:
   # stage F-statistic versus mean expression across genes
   # ---------------------------------------------------------------------------
@@ -1231,142 +1263,10 @@ gene_stats <- data.frame(
   total_var_adjusted          = total_var_adj,
   between_stage_var_raw       = between_stage_var,
   sampling_var_estimate       = sampling_var,
-  
-  # Filled immediately below.
-  sampling_var_moderated      = rep(
-    NA_real_,
-    length(gene_symbols)
-  ),
-  
-  between_stage_var_corrected = between_stage_var_corrected,
-  between_stage_var_meanadj   = between_stage_var_meanadj,
-  between_stage_var_adjusted  = between_stage_var_adj,
-  
-  residual_var_unmoderated    = s2_unmod,
-  residual_var_moderated      = s2_post_stage,
-  
-  max_contrast_log2           = max_contrast,
-  max_contrast_ub             = max_contrast_ub,
-  max_contrast_lb             = max_contrast_lb,
-  
-  stage_F                     = stage_F,
-  stage_F_pvalue              = stage_F_p,
-  
-  stringsAsFactors = FALSE
-)
-
-
-# Moderated-variance version of the sampling contribution.
-gene_stats$sampling_var_moderated <-
-  compute_sampling_var(
-    design,
-    w_mat,
-    s2_post_stage,
-    A_quad,
-    k_stages
-  )
-
-
-# ---------------------------------------------------------------------------
-# Add adjusted stage means
-# ---------------------------------------------------------------------------
-
-stage_emm_out <- as.data.frame(stage_emm)
-
-colnames(stage_emm_out) <-
-  paste0(
-    "stage_mean_",
-    colnames(stage_emm_out)
-  )
-
-gene_stats <- cbind(
-  gene_stats,
-  stage_emm_out
-)
-
-
-# ---------------------------------------------------------------------------
-# Additional exploratory quantities
-# ---------------------------------------------------------------------------
-
-if (run_sensitivity_equivalence) {
-  
-  gene_stats$stage_F_qvalue <-
-    p.adjust(
-      gene_stats$stage_F_pvalue,
-      method = "BH"
-    )
-  
-  gene_stats$compatible_with_stability_exploratory <-
-    is.finite(gene_stats$max_contrast_ub) &
-    gene_stats$max_contrast_ub < equivalence_bound_log2
-}
-
-
-# Flag configured sex-linked genes.
-gene_stats$is_sex_linked <-
-  gene_stats$Gene_name %in% sex_linked_symbols
-
-
-# ---------------------------------------------------------------------------
-# Define the primary enrichment universe
-# ---------------------------------------------------------------------------
-
-usable <-
-  is.finite(gene_stats$between_stage_var_adjusted) &
-  is.finite(gene_stats$mean_logCPM) &
-  is.finite(gene_stats$between_stage_var_raw)
-
-if (any(!usable)) {
-  message(
-    "Dropping ",
-    sum(!usable),
-    " gene(s) without a usable primary statistic."
-  )
-}
-
-gene_stats <- gene_stats[
-  usable,
-  ,
-  drop = FALSE
-]
-
-stopifnot(
-  !anyDuplicated(gene_stats$Gene_name)
-)
-
-universe <- gene_stats$Gene_name
-
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
-
-write_out(
-  gene_stats,
-  "per_gene_primary_stability_statistics.csv"
-)
-
-report(
-  "Genes in the enrichment universe: ",
-  length(universe)
-)
-
-# =============================================================================
-# 7. PER-GENE STATISTICS TABLE AND THE TESTED UNIVERSE
-# =============================================================================
-
-gene_stats <- data.frame(
-  Gene_name                   = gene_symbols,
-  mean_logCPM                 = mean_logCPM,
-  total_var_raw               = total_var,
-  total_var_adjusted          = total_var_adj,
-  between_stage_var_raw       = between_stage_var,
-  sampling_var_estimate       = sampling_var,
   sampling_var_moderated      = s2_post_stage * NA_real_,  # filled below
   between_stage_var_corrected = between_stage_var_corrected,
   between_stage_var_meanadj   = between_stage_var_meanadj,
-  between_stage_var_adjusted  = between_stage_var_adj,     # PRIMARY STATISTIC
+  between_stage_var_adjusted  = between_stage_var_adj,     # corrected-variance candidate
   residual_var_unmoderated    = s2_unmod,
   residual_var_moderated      = s2_post_stage,
   max_contrast_log2           = max_contrast,
@@ -1386,13 +1286,20 @@ gene_stats <- cbind(gene_stats, stage_emm_out)
 if (run_sensitivity_equivalence) {
   gene_stats$stage_F_qvalue <- p.adjust(stage_F_p, method = "BH")
   gene_stats$compatible_with_stability_exploratory <-
+    is.finite(gene_stats$max_contrast_ub) &
     gene_stats$max_contrast_ub < equivalence_bound_log2
 }
 gene_stats$is_sex_linked <- gene_stats$Gene_name %in% sex_linked_symbols
 
-usable <- is.finite(gene_stats$between_stage_var_adjusted) &
+primary_col <- switch(
+  primary_ranking_statistic,
+  corrected_variance = "between_stage_var_adjusted",
+  stage_F            = "stage_F",
+  stop("primary_ranking_statistic must be 'corrected_variance' or 'stage_F'.")
+)
+usable <- is.finite(gene_stats[[primary_col]]) &
   is.finite(gene_stats$mean_logCPM) &
-  !is.na(gene_stats$between_stage_var_raw)
+  is.finite(gene_stats$between_stage_var_raw)
 if (any(!usable)) {
   message("Dropping ", sum(!usable), " gene(s) without a usable primary statistic.")
 }
@@ -1580,8 +1487,7 @@ primary_stat <- switch(
   stop("primary_ranking_statistic must be 'corrected_variance' or 'stage_F'.")
 )
 if (any(!is.finite(primary_stat))) {
-  stop("The primary ranking statistic contains non-finite values. With ",
-       "'stage_F', run_sensitivity_equivalence must be TRUE.")
+  stop("The primary ranking statistic contains non-finite values after usability filtering.")
 }
 report("Primary ranking statistic: ", primary_ranking_statistic)
 
@@ -1615,6 +1521,9 @@ rank_table <- function(ranks) {
     Gene_name = names(ranks),
     rank_position = seq_along(ranks),
     priority_score = as.numeric(ranks),
+    primary_statistic = primary_stat[idx],
+    statistic_name = primary_ranking_statistic,
+    stage_F                     = gene_stats$stage_F[idx],
     between_stage_var_adjusted  = gene_stats$between_stage_var_adjusted[idx],
     between_stage_var_corrected = gene_stats$between_stage_var_corrected[idx],
     between_stage_var_raw       = gene_stats$between_stage_var_raw[idx],
@@ -1640,12 +1549,12 @@ write_out(sl_tab, "qc_sex_linked_gene_ranks.csv")
 
 fg_stable <- run_one_sided_fgsea(
   ranks_stable, pathways_tested,
-  "Primary: low-to-high adjusted between-stage variance (stable end)",
+  paste0("Primary: low-to-high ", stat_label, " (stable end)"),
   seed = master_seed + 101
 )
 fg_variable <- run_one_sided_fgsea(
   ranks_variable, pathways_tested,
-  "Primary: high-to-low adjusted between-stage variance (variable end)",
+  paste0("Primary: high-to-low ", stat_label, " (variable end)"),
   seed = master_seed + 102
 )
 fg_stable$direction   <- "stable_end"
@@ -1796,16 +1705,18 @@ if (run_sex_gene_exclusion_sensitivity) {
   }
   
   ranks_sex_excluded_stable <- make_priority_ranking(
-    sex_excluded_stats$between_stage_var_adjusted, universe_sex_excluded,
+    sex_excluded_stats[[primary_col]], universe_sex_excluded,
     low_at_top = TRUE, tie_seed = master_seed + 401)
   ranks_sex_excluded_variable <- reverse_ranking(ranks_sex_excluded_stable)
   
   sex_sens_stable <- run_one_sided_fgsea(
     ranks_sex_excluded_stable, pathways_sex_excluded,
-    "Sensitivity S4: sex-linked symbols excluded, stable end", seed = master_seed + 411)
+    paste0("Sensitivity S4: sex-linked symbols excluded, relatively low ",
+           stat_label, " (stable end)"), seed = master_seed + 411)
   sex_sens_variable <- run_one_sided_fgsea(
     ranks_sex_excluded_variable, pathways_sex_excluded,
-    "Sensitivity S4: sex-linked symbols excluded, variable end", seed = master_seed + 412)
+    paste0("Sensitivity S4: sex-linked symbols excluded, relatively high ",
+           stat_label, " (variable end)"), seed = master_seed + 412)
   sex_sens_stable$direction   <- "stable_end"
   sex_sens_variable$direction <- "variable_end"
   
@@ -1843,8 +1754,8 @@ if (run_sensitivity_camerapr) {
                                pathway_indices, inter_gene_cor = 0.01)
   cam_variable <- run_camerapr(ranks_variable[universe], universe,
                                pathway_indices, inter_gene_cor = 0.01)
-  cam_stable$analysis   <- "cameraPR sensitivity: relatively low adjusted between-stage variance"
-  cam_variable$analysis <- "cameraPR sensitivity: relatively high adjusted between-stage variance"
+  cam_stable$analysis   <- paste0("cameraPR sensitivity: relatively low ", stat_label)
+  cam_variable$analysis <- paste0("cameraPR sensitivity: relatively high ", stat_label)
   cam_stable$direction   <- "stable_end"
   cam_variable$direction <- "variable_end"
   
@@ -2071,6 +1982,10 @@ if (run_permutation_check) {
     gene_stats$mean_logCPM
   )
   
+  n_obs_genes <- length(primary_stat)
+  report("Genes in observed ranking: ", n_obs_genes,
+         " | genes after filterByExpr: ", nrow(dge))
+  
   one_permutation <- function(seed_i) {
     set.seed(seed_i)
     meta_p <- meta
@@ -2087,13 +2002,8 @@ if (run_permutation_check) {
     
     sc <- match(paste0("Stage", stage_levels), colnames(d_p))
     if (anyNA(sc)) return(NULL)
-    cc <- setdiff(seq_len(ncol(d_p)), sc)
-    C_p <- matrix(0, length(stage_levels), ncol(d_p))
-    C_p[cbind(seq_along(stage_levels), sc)] <- 1
-    if (length(cc)) {
-      C_p[, cc] <- matrix(colMeans(d_p[, cc, drop = FALSE]),
-                          nrow = length(stage_levels), ncol = length(cc), byrow = TRUE)
-    }
+    in_observed_universe <- rownames(v_p$E) %in% universe
+    
     if (primary_ranking_statistic == "stage_F") {
       cm_p <- matrix(0, nrow = ncol(d_p), ncol = length(stage_levels) - 1)
       for (j in seq_len(length(stage_levels) - 1)) {
@@ -2104,9 +2014,21 @@ if (run_permutation_check) {
       stat_p <- as.numeric(eb_p$F)
       s2_p   <- as.numeric(fit_p$sigma)^2
       mean_p <- rowMeans(v_p$E)
-      ok     <- is.finite(stat_p) & is.finite(mean_p)
-      if (sum(ok) < 100) return(NULL)
+      ok     <- in_observed_universe & is.finite(stat_p) & is.finite(mean_p)
+      n_perm_genes <- sum(ok)
+      if (n_perm_genes != n_obs_genes) {
+        return(NULL)
+      }
+      if (n_perm_genes < 100) return(NULL)
       return(rank_end_metrics(stat_p[ok], s2_p[ok], mean_p[ok]))
+    }
+    
+    cc <- setdiff(seq_len(ncol(d_p)), sc)
+    C_p <- matrix(0, length(stage_levels), ncol(d_p))
+    C_p[cbind(seq_along(stage_levels), sc)] <- 1
+    if (length(cc)) {
+      C_p[, cc] <- matrix(colMeans(d_p[, cc, drop = FALSE]),
+                          nrow = length(stage_levels), ncol = length(cc), byrow = TRUE)
     }
     
     m_p    <- fit_p$coefficients %*% t(C_p)
@@ -2119,8 +2041,12 @@ if (run_permutation_check) {
     
     corr_p <- bsv_p - samp_p
     mean_p <- rowMeans(v_p$E)
-    ok     <- is.finite(corr_p) & is.finite(mean_p)
-    if (sum(ok) < 100) return(NULL)
+    ok     <- in_observed_universe & is.finite(corr_p) & is.finite(mean_p)
+    n_perm_genes <- sum(ok)
+    if (n_perm_genes != n_obs_genes) {
+      return(NULL)
+    }
+    if (n_perm_genes < 100) return(NULL)
     
     stat_p <- primary_statistic_from_corrected(corr_p[ok], mean_p[ok])
     rank_end_metrics(stat_p, s2_p[ok], mean_p[ok])
@@ -2135,12 +2061,16 @@ if (run_permutation_check) {
     stop("All permutations failed. Check the permuted design for rank deficiency.")
   }
   
+  n_failed_perm <- n_permutations - length(perm_list)
+  if (n_failed_perm > 0) {
+    warning(n_failed_perm, " of ", n_permutations,
+            " permutations returned no metrics. Possible causes: rank deficiency, ",
+            "gene-count mismatch, or too few finite values.")
+  }
+  
   perm_mat <- do.call(rbind, perm_list)
   n_ok <- nrow(perm_mat)
   report("Successful permutations: ", n_ok, " of ", n_permutations)
-  
-  obs_mat <- matrix(observed_metrics, nrow = n_ok,
-                    ncol = length(observed_metrics), byrow = TRUE)
   
   n_valid_perm <- colSums(is.finite(perm_mat))
   
@@ -2224,29 +2154,31 @@ df_variable_plot <- prep_plot_df(collapsed_variable, top_n_plot)
 
 p_stable <- single_panel(
   df_stable_plot,
-  "GO terms enriched among genes with relatively low between-stage variance")
+  paste0("GO terms enriched among genes with relatively low ", stat_label))
 p_variable <- single_panel(
   df_variable_plot,
-  "GO terms enriched among genes with relatively high between-stage variance")
+  paste0("GO terms enriched among genes with relatively high ", stat_label))
 
 ggsave(file.path(outdir, "figure_primary_stable_neglog10FDR.pdf"),
        p_stable, width = 9, height = 5.5)
 ggsave(file.path(outdir, "figure_primary_variable_neglog10FDR.pdf"),
        p_variable, width = 9, height = 5.5)
 
+stable_panel_label   <- paste0("Relatively low ", stat_label)
+variable_panel_label <- paste0("Relatively high ", stat_label)
+
 comb <- rbind(
   if (nrow(df_stable_plot)) transform(
     df_stable_plot[, c("pathway", "size", "neglog10_fdr")],
-    panel = "Relatively low between-stage variance") else NULL,
+    panel = stable_panel_label) else NULL,
   if (nrow(df_variable_plot)) transform(
     df_variable_plot[, c("pathway", "size", "neglog10_fdr")],
-    panel = "Relatively high between-stage variance") else NULL
+    panel = variable_panel_label) else NULL
 )
 
 if (!is.null(comb) && nrow(comb)) {
   comb$panel <- factor(comb$panel,
-                       levels = c("Relatively low between-stage variance",
-                                  "Relatively high between-stage variance"))
+                       levels = c(stable_panel_label, variable_panel_label))
   comb$plot_key <- paste(clean_go_name(comb$pathway), comb$panel, sep = "___")
   comb <- comb[order(comb$panel, comb$neglog10_fdr), ]
   comb$plot_key <- factor(comb$plot_key, levels = unique(comb$plot_key))
@@ -2259,9 +2191,10 @@ if (!is.null(comb) && nrow(comb)) {
     scale_y_discrete(labels = function(x) sub("___.*$", "", x)) +
     scale_size_continuous(name = "Genes in term") +
     theme_classic(base_size = 10) +
-    labs(title = paste("GO biological process terms at the two ends of the",
-                       "sampling-corrected between-stage variance ranking"),
-         subtitle = paste0("Two one-sided fgsea analyses on a ranking and its exact reverse; ",
+    labs(title = paste0("GO biological process terms at the two ends of the ",
+                        stat_label, " ranking"),
+         subtitle = paste0("Two one-sided fgsea analyses on the ", stat_label,
+                           " ranking and its exact reverse; ",
                            "Benjamini-Hochberg adjusted P calculated jointly over both."),
          x = expression(-log[10]*"(joint primary adjusted P)"), y = NULL)
 } else {
@@ -2275,24 +2208,33 @@ ggsave(file.path(outdir, "figure_primary_combined.pdf"), p_comb, width = 9.5, he
 
 hdr("10. Provenance")
 
+prov_stat <- if (primary_ranking_statistic == "stage_F") {
+  c(
+    "PRIMARY STATISTIC",
+    "  empirical Bayes moderated F for the stage term (limma eBayes, robust)",
+    "  scale-free by construction: no sampling correction, no loess",
+    "  adjustment, no studentization applied",
+    paste("  exact ties in the primary statistic:", n_exact_ties)
+  )
+} else {
+  c(
+    "PRIMARY STATISTIC",
+    "  1. variance of covariate-adjusted stage means (denominator k-1)",
+    "  2. minus tr(P Sigma)/(k-1); negatives RETAINED",
+    paste("     sigma^2 estimator:", sampling_variance_estimator),
+    "  3. loess residual on the NATURAL scale against mean logCPM",
+    paste("  4. studentized:", studentize_primary_statistic),
+    paste("  loess span:", loess_span),
+    paste("  exact ties in the primary statistic:", n_exact_ties)
+  )
+}
+
 prov <- c(
   paste("Run date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
   paste("Master seed:", master_seed),
   paste("Primary tie-break seed:", tie_seed_primary),
   "",
-  "PRIMARY STATISTIC",
-  "  1. variance of covariate-adjusted stage means (unweighted, denominator k-1)",
-  "  2. minus tr(P Sigma)/(k-1), with P the k x k centering matrix and",
-  "     Sigma = sigma^2 * C (X'WX)^-1 C' the covariance of the estimated stage",
-  "     means under the voom-weighted fit; negatives are RETAINED",
-  paste("     sigma^2 estimator:", sampling_variance_estimator),
-  "  3. loess residual on the NATURAL scale against mean logCPM",
-  paste("  4. studentized by a locally estimated scale:", studentize_primary_statistic),
-  paste("  loess span:", loess_span),
-  paste("  median sampling contribution:", signif(median(sampling_var), 6)),
-  paste("  median raw between-stage variance:", signif(median(between_stage_var), 6)),
-  paste("  genes with negative corrected variance:", sum(between_stage_var_corrected < 0)),
-  paste("  exact ties in the primary statistic:", n_exact_ties),
+  prov_stat,
   "",
   paste("Design formula:", design_terms),
   paste("Design rank:", design_rank, "of", ncol(design), "columns"),
@@ -2352,7 +2294,7 @@ expected_files <- c(
   "qc_sample_stage_sex_table.csv", "qc_design_matrix.csv",
   "qc_ortholog_mapping_summary.csv", "qc_duplicate_mouse_symbol_mapping.csv",
   "qc_pathway_coverage.csv", "qc_sex_linked_gene_ranks.csv",
-  "qc_mean_dependence_check.csv",
+  "qc_mean_dependence_check.csv", "qc_primary_statistic_dependence.csv",
   "per_gene_primary_stability_statistics.csv",
   "ranking_primary_stable_first.csv", "ranking_primary_variable_first.csv",
   "fgsea_primary_stable_all.csv", "fgsea_primary_variable_all.csv",
@@ -2389,8 +2331,6 @@ if (run_permutation_check)
                       "permutation_raw_metrics.csv")
 
 # --- final internal-consistency checks ---------------------------------------
-
-#stage_F = primary_statistic_from_corrected(gene_stats$stage_F, gene_stats$mean_logCPM),
 
 if (!identical(sort(names(ranks_stable)), sort(names(ranks_variable)))) {
   stop("Primary stable and variable rankings do not contain identical genes.")
@@ -2438,8 +2378,11 @@ hdr("Summary")
 report("Samples: ", nrow(meta), " across ", length(stage_levels), " stages")
 report("Genes in the enrichment universe: ", length(universe))
 report("Testable GO:BP terms: ", length(pathways_tested))
-report("Sampling-variance estimator: ", sampling_variance_estimator)
-report("Primary statistic studentized: ", studentize_primary_statistic)
+report("Primary ranking statistic: ", primary_ranking_statistic, " | ", stat_label)
+if (primary_ranking_statistic == "corrected_variance") {
+  report("Sampling-variance estimator: ", sampling_variance_estimator)
+  report("Primary statistic studentized: ", studentize_primary_statistic)
+}
 report("Stable end: ", n_sig_stable, " significant, ", nrow(collapsed_stable),
        " after redundancy reduction")
 report("Variable end: ", n_sig_variable, " significant, ", nrow(collapsed_variable),
