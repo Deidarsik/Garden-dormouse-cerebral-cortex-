@@ -3,6 +3,23 @@
 # =============================================================================
 # GO AND KEGG ENRICHMENT OF MOUSE-ORTHOLOG GENE LIST FROM THE OPPOSITE REGULATION TABLE
 # =============================================================================
+# Corrections in this version:
+# - added Sex to the edgeR design (~ 0 + Group + Sex), with metadata validation,
+#   full-rank checking, and explicit contrast-construction validation;
+# - updated sex-adjusted expected reversal counts (46 total; 34 torpor-upregulated;
+#   12 torpor-downregulated) while preserving strict_expected_counts as a switch;
+# - changed GO/KEGG thresholds to 1% and explicitly filters final tables on
+#   finite p.adjust < 0.01 before CSV output, plotting, and summary counts;
+# - renamed reversal classes to torpor-upregulated and torpor-downregulated and
+#   removed hard-coded gene counts from output filenames;
+# - added one-sided Fisher overlap tests for enrichment of each reversal class,
+#   with BH correction across the two class tests;
+# - preserved the per-gene audit table, explicit tested Entrez universe checks,
+#   input validation, RDS output, and sessionInfo().
+#
+# ASSUMPTION: the metadata sex column is named exactly "Sex" (case-sensitive).
+# ASSUMPTION for Fisher tests: class-specific expected overlaps are calculated
+# from the observed directional significant-set marginals. See Section 8.
 
 # =============================================================================
 # 0. USER SETTINGS
@@ -34,8 +51,8 @@ output_root <- file.path(
 fdr_cutoff <- 0.01
 
 # Enrichment thresholds
-pvalue_cutoff <- 0.05
-qvalue_cutoff <- 0.10
+pvalue_cutoff <- 0.01
+qvalue_cutoff <- 0.01
 top_terms_to_plot <- 20L
 go_ontology <- "BP"
 
@@ -50,9 +67,9 @@ mouse_key_type <- "ENSEMBL"
 strict_expected_counts <- TRUE
 
 expected_filtered_genes <- 17768L
-expected_shared_reversal_genes <- 135L
-expected_dominant_genes <- 105L
-expected_inverse_genes <- 30L
+expected_shared_reversal_genes <- 46L
+expected_torpor_upregulated_genes <- 34L
+expected_torpor_downregulated_genes <- 12L
 
 # The mapped Entrez universe can change slightly with org.Mm.eg.db versions,
 # so a mismatch here generates a warning rather than stopping.
@@ -277,6 +294,25 @@ add_rich_factor <- function(df) {
     )
 }
 
+filter_enrichment_by_adjusted_p <- function(df, label) {
+  if (nrow(df) == 0) {
+    return(df)
+  }
+  
+  if (!"p.adjust" %in% colnames(df)) {
+    stop(
+      label,
+      " enrichment table is missing the required p.adjust column."
+    )
+  }
+  
+  df %>%
+    dplyr::filter(
+      is.finite(p.adjust),
+      p.adjust < 0.01
+    )
+}
+
 add_rich_group <- function(df) {
   if (
     nrow(df) == 0 ||
@@ -491,7 +527,7 @@ metadata <- read.table(
   comment.char = ""
 )
 
-required_metadata_columns <- c("Sample", "Group")
+required_metadata_columns <- c("Sample", "Group", "Sex")
 missing_metadata_columns <- setdiff(
   required_metadata_columns,
   colnames(metadata)
@@ -506,6 +542,20 @@ if (length(missing_metadata_columns) > 0) {
 
 metadata$Sample <- trimws(as.character(metadata$Sample))
 metadata$Group <- trimws(as.character(metadata$Group))
+metadata$Sex <- trimws(as.character(metadata$Sex))
+
+if (any(is.na(metadata$Sex) | metadata$Sex == "")) {
+  stop("The metadata Sex column contains missing or empty values.")
+}
+
+metadata$Sex <- factor(metadata$Sex)
+
+if (nlevels(metadata$Sex) < 2) {
+  stop(
+    "The metadata Sex column must contain at least two levels; found ",
+    nlevels(metadata$Sex), "."
+  )
+}
 
 if (anyDuplicated(metadata$Sample)) {
   stop("The metadata contains duplicated sample names.")
@@ -561,6 +611,8 @@ if (!identical(
 
 cat("\nSAMPLE COMPOSITION\n")
 print(table(metadata$Group))
+cat("\nSEX COMPOSITION BY GROUP\n")
+print(table(metadata$Group, metadata$Sex))
 
 
 # =============================================================================
@@ -608,7 +660,7 @@ if (!mouse_ortholog_col %in% colnames(gene_annotations)) {
 
 
 # =============================================================================
-# 6. PRIMARY FILTERED ROBUST SEX-UNADJUSTED edgeR ANALYSIS
+# 6. PRIMARY FILTERED ROBUST SEX-ADJUSTED edgeR ANALYSIS
 # =============================================================================
 
 dge <- edgeR::DGEList(
@@ -650,7 +702,7 @@ if (
 }
 
 design <- model.matrix(
-  ~ 0 + Group,
+  ~ 0 + Group + Sex,
   data = metadata
 )
 
@@ -661,13 +713,42 @@ colnames(design) <- sub(
 )
 
 if (qr(design)$rank < ncol(design)) {
-  stop("The unadjusted design matrix is not full rank.")
+  stop(
+    "The sex-adjusted design matrix (~ 0 + Group + Sex) is not full rank. ",
+    "Check whether Sex is confounded with Group or whether metadata levels are invalid."
+  )
 }
 
-contrast_matrix <- limma::makeContrasts(
-  TE_vs_TL = TE - TL,
-  TL_vs_AE = TL - AE,
-  levels = design
+required_group_coefficients <- c("TE", "TL", "AE")
+missing_group_coefficients <- setdiff(
+  required_group_coefficients,
+  colnames(design)
+)
+
+if (length(missing_group_coefficients) > 0) {
+  stop(
+    "The sex-adjusted design is missing coefficients required for the contrasts: ",
+    paste(missing_group_coefficients, collapse = ", "),
+    ". Design columns are: ",
+    paste(colnames(design), collapse = ", ")
+  )
+}
+
+contrast_matrix <- tryCatch(
+  limma::makeContrasts(
+    TE_vs_TL = TE - TL,
+    TL_vs_AE = TL - AE,
+    levels = design
+  ),
+  error = function(e) {
+    stop(
+      "Failed to construct TE_vs_TL and TL_vs_AE contrasts from the ",
+      "sex-adjusted design. Design columns: ",
+      paste(colnames(design), collapse = ", "),
+      ". Original error: ",
+      conditionMessage(e)
+    )
+  }
 )
 
 dge <- edgeR::estimateDisp(
@@ -765,10 +846,10 @@ shared_significant <- paired_results %>%
   dplyr::mutate(
     ReversalClass = dplyr::case_when(
       logFC_TE_TL < 0 & logFC_TL_AE > 0 ~
-        "Dominant_increased_TE_to_TL_then_decreased_TL_to_AE",
+        "torpor_upregulated_increased_TE_to_TL_then_decreased_TL_to_AE",
       
       logFC_TE_TL > 0 & logFC_TL_AE < 0 ~
-        "Inverse_decreased_TE_to_TL_then_increased_TL_to_AE",
+        "torpor_downregulated_decreased_TE_to_TL_then_increased_TL_to_AE",
       
       TRUE ~
         "Same_direction_or_zero"
@@ -780,16 +861,16 @@ opposite_direction <- shared_significant %>%
     ReversalClass != "Same_direction_or_zero"
   )
 
-dominant_class <- opposite_direction %>%
+torpor_upregulated_class <- opposite_direction %>%
   dplyr::filter(
     ReversalClass ==
-      "Dominant_increased_TE_to_TL_then_decreased_TL_to_AE"
+      "torpor_upregulated_increased_TE_to_TL_then_decreased_TL_to_AE"
   )
 
-inverse_class <- opposite_direction %>%
+torpor_downregulated_class <- opposite_direction %>%
   dplyr::filter(
     ReversalClass ==
-      "Inverse_decreased_TE_to_TL_then_increased_TL_to_AE"
+      "torpor_downregulated_decreased_TE_to_TL_then_increased_TL_to_AE"
   )
 
 cat("\nREVERSAL COUNTS\n")
@@ -804,13 +885,13 @@ cat(
   "\n"
 )
 cat(
-  "Dominant increase-then-decrease class:",
-  nrow(dominant_class),
+  "Torpor-upregulated increase-then-decrease class:",
+  nrow(torpor_upregulated_class),
   "\n"
 )
 cat(
-  "Inverse decrease-then-increase class:",
-  nrow(inverse_class),
+  "Torpor-downregulated decrease-then-increase class:",
+  nrow(torpor_downregulated_class),
   "\n"
 )
 
@@ -818,15 +899,15 @@ if (strict_expected_counts) {
   observed_counts <- c(
     shared = nrow(shared_significant),
     opposite = nrow(opposite_direction),
-    dominant = nrow(dominant_class),
-    inverse = nrow(inverse_class)
+    torpor_upregulated = nrow(torpor_upregulated_class),
+    torpor_downregulated = nrow(torpor_downregulated_class)
   )
   
   expected_counts <- c(
     shared = expected_shared_reversal_genes,
     opposite = expected_shared_reversal_genes,
-    dominant = expected_dominant_genes,
-    inverse = expected_inverse_genes
+    torpor_upregulated = expected_torpor_upregulated_genes,
+    torpor_downregulated = expected_torpor_downregulated_genes
   )
   
   if (!identical(
@@ -834,7 +915,8 @@ if (strict_expected_counts) {
     unname(expected_counts)
   )) {
     stop(
-      "Reversal counts do not match the expected manuscript analysis.\n",
+      "Reversal counts do not match the expected sex-adjusted manuscript analysis ",
+      "(46 shared/opposite, 34 torpor-upregulated, 12 torpor-downregulated).\n",
       "Observed: ",
       paste(
         names(observed_counts),
@@ -877,7 +959,7 @@ write.csv(
   opposite_annotated,
   file = file.path(
     output_root,
-    "ALL_135_opposite_direction_genes_with_class_and_logFC.csv"
+    "ALL_opposite_direction_genes_with_class_and_logFC.csv"
   ),
   row.names = FALSE
 )
@@ -886,11 +968,11 @@ write.csv(
   opposite_annotated %>%
     dplyr::filter(
       ReversalClass ==
-        "Dominant_increased_TE_to_TL_then_decreased_TL_to_AE"
+        "torpor_upregulated_increased_TE_to_TL_then_decreased_TL_to_AE"
     ),
   file = file.path(
     output_root,
-    "DOMINANT_105_increased_TE_to_TL_then_decreased_TL_to_AE.csv"
+    "torpor_upregulated_increased_TE_to_TL_then_decreased_TL_to_AE.csv"
   ),
   row.names = FALSE
 )
@@ -899,18 +981,187 @@ write.csv(
   opposite_annotated %>%
     dplyr::filter(
       ReversalClass ==
-        "Inverse_decreased_TE_to_TL_then_increased_TL_to_AE"
+        "torpor_downregulated_decreased_TE_to_TL_then_increased_TL_to_AE"
     ),
   file = file.path(
     output_root,
-    "INVERSE_30_decreased_TE_to_TL_then_increased_TL_to_AE.csv"
+    "torpor_downregulated_decreased_TE_to_TL_then_increased_TL_to_AE.csv"
   ),
   row.names = FALSE
 )
 
 
 # =============================================================================
-# 8. BUILD THE EXPLICIT FILTERED/TESTED MOUSE-ORTHOLOG UNIVERSE
+# 8. FISHER ENRICHMENT TESTS FOR THE TWO REVERSAL CLASSES
+# =============================================================================
+
+# ASSUMPTION / NULL MODEL:
+# The prompt's approximation n_sig_TE_TL * n_sig_TL_AE * 0.5 / n_tested
+# gives the same expected count for both reversal classes and therefore cannot
+# reproduce different class-specific expectations such as 3.15 and 1.68.
+# Instead, each class is tested as enrichment of the overlap between its two
+# relevant directional significant sets, conditional on their observed margins:
+#
+#   torpor-upregulated expected =
+#     n(TE_vs_TL significant, logFC < 0) *
+#     n(TL_vs_AE significant, logFC > 0) / n_tested
+#
+#   torpor-downregulated expected =
+#     n(TE_vs_TL significant, logFC > 0) *
+#     n(TL_vs_AE significant, logFC < 0) / n_tested
+#
+# This is the standard independence expectation corresponding to Fisher's exact
+# test and preserves any imbalance in the direction of significant changes.
+
+n_tested_fisher <- nrow(paired_results)
+
+if (n_tested_fisher != genes_after_filtering) {
+  stop(
+    "Fisher-test background mismatch: paired_results contains ",
+    n_tested_fisher,
+    " genes but the filtered/tested edgeR set contains ",
+    genes_after_filtering,
+    "."
+  )
+}
+
+sig_te_tl_up_torpor <- paired_results %>%
+  dplyr::filter(
+    FDR_TE_TL < fdr_cutoff,
+    logFC_TE_TL < 0
+  ) %>%
+  dplyr::pull(GeneID) %>%
+  unique()
+
+sig_tl_ae_down_from_torpor <- paired_results %>%
+  dplyr::filter(
+    FDR_TL_AE < fdr_cutoff,
+    logFC_TL_AE > 0
+  ) %>%
+  dplyr::pull(GeneID) %>%
+  unique()
+
+sig_te_tl_down_torpor <- paired_results %>%
+  dplyr::filter(
+    FDR_TE_TL < fdr_cutoff,
+    logFC_TE_TL > 0
+  ) %>%
+  dplyr::pull(GeneID) %>%
+  unique()
+
+sig_tl_ae_up_from_torpor <- paired_results %>%
+  dplyr::filter(
+    FDR_TL_AE < fdr_cutoff,
+    logFC_TL_AE < 0
+  ) %>%
+  dplyr::pull(GeneID) %>%
+  unique()
+
+run_directional_overlap_fisher <- function(
+    class_name,
+    set_te_tl,
+    set_tl_ae,
+    observed_class_count,
+    n_tested
+) {
+  n_te_tl <- length(set_te_tl)
+  n_tl_ae <- length(set_tl_ae)
+  observed_overlap <- length(intersect(set_te_tl, set_tl_ae))
+  expected_overlap <- n_te_tl * n_tl_ae / n_tested
+  
+  if (observed_overlap != observed_class_count) {
+    stop(
+      "Fisher-test observed overlap for ",
+      class_name,
+      " is ",
+      observed_overlap,
+      " but the derived reversal class contains ",
+      observed_class_count,
+      " genes."
+    )
+  }
+  
+  contingency <- matrix(
+    c(
+      observed_overlap,
+      n_te_tl - observed_overlap,
+      n_tl_ae - observed_overlap,
+      n_tested - n_te_tl - n_tl_ae + observed_overlap
+    ),
+    nrow = 2,
+    byrow = TRUE,
+    dimnames = list(
+      TE_TL_directional_significant = c("Yes", "No"),
+      TL_AE_directional_significant = c("Yes", "No")
+    )
+  )
+  
+  if (any(contingency < 0)) {
+    stop(
+      "Invalid Fisher contingency table for ",
+      class_name,
+      ": negative cell count encountered."
+    )
+  }
+  
+  fisher_result <- stats::fisher.test(
+    contingency,
+    alternative = "greater"
+  )
+  
+  data.frame(
+    ReversalClass = class_name,
+    n_tested = n_tested,
+    n_directional_significant_TE_TL = n_te_tl,
+    n_directional_significant_TL_AE = n_tl_ae,
+    Observed_count = observed_overlap,
+    Expected_count_under_independence = expected_overlap,
+    Fisher_odds_ratio = unname(fisher_result$estimate),
+    Fisher_p_value = fisher_result$p.value,
+    stringsAsFactors = FALSE
+  )
+}
+
+fisher_enrichment_results <- dplyr::bind_rows(
+  run_directional_overlap_fisher(
+    class_name =
+      "torpor_upregulated_increased_TE_to_TL_then_decreased_TL_to_AE",
+    set_te_tl = sig_te_tl_up_torpor,
+    set_tl_ae = sig_tl_ae_down_from_torpor,
+    observed_class_count = nrow(torpor_upregulated_class),
+    n_tested = n_tested_fisher
+  ),
+  run_directional_overlap_fisher(
+    class_name =
+      "torpor_downregulated_decreased_TE_to_TL_then_increased_TL_to_AE",
+    set_te_tl = sig_te_tl_down_torpor,
+    set_tl_ae = sig_tl_ae_up_from_torpor,
+    observed_class_count = nrow(torpor_downregulated_class),
+    n_tested = n_tested_fisher
+  )
+) %>%
+  dplyr::mutate(
+    Fisher_BH_adjusted_p_value = stats::p.adjust(
+      Fisher_p_value,
+      method = "BH"
+    )
+  )
+
+write.csv(
+  fisher_enrichment_results,
+  file = file.path(
+    output_root,
+    "reversal_class_Fisher_enrichment_tests.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("\nREVERSAL-CLASS FISHER ENRICHMENT TESTS\n")
+print(fisher_enrichment_results, row.names = FALSE, digits = 6)
+
+
+# =============================================================================
+# 9. BUILD THE EXPLICIT FILTERED/TESTED MOUSE-ORTHOLOG UNIVERSE
 # =============================================================================
 
 tested_gene_annotations <- data.frame(
@@ -1006,7 +1257,7 @@ writeLines(
 
 
 # =============================================================================
-# 9. PLOT STYLE
+# 10. PLOT STYLE
 # =============================================================================
 
 three_cols <- ggsci::pal_npg("nrc")(3)
@@ -1037,7 +1288,7 @@ clean_theme <- ggplot2::theme_classic() +
 
 
 # =============================================================================
-# 10. RUN ENRICHMENT FOR ONE EXACT REVERSAL CLASS
+# 11. RUN ENRICHMENT FOR ONE EXACT REVERSAL CLASS
 # =============================================================================
 
 run_reversal_class_enrichment <- function(
@@ -1302,6 +1553,13 @@ run_reversal_class_enrichment <- function(
       )
     }
     
+    # Explicit manuscript threshold: do not rely solely on clusterProfiler's
+    # internal pvalueCutoff/qvalueCutoff behaviour.
+    go_df <- filter_enrichment_by_adjusted_p(
+      go_df,
+      label = "GO BP"
+    )
+    
     kegg_df <- if (is.null(kegg_object)) {
       empty_enrichment_table()
     } else {
@@ -1309,6 +1567,12 @@ run_reversal_class_enrichment <- function(
         as.data.frame(kegg_object)
       )
     }
+    
+    # Explicit manuscript threshold: retain only finite adjusted p-values < 0.01.
+    kegg_df <- filter_enrichment_by_adjusted_p(
+      kegg_df,
+      label = "KEGG"
+    )
   }
   
   write.csv(
@@ -1489,28 +1753,28 @@ run_reversal_class_enrichment <- function(
 
 
 # =============================================================================
-# 11. RUN THE TWO REVERSAL CLASSES SEPARATELY
+# 12. RUN THE TWO REVERSAL CLASSES SEPARATELY
 # =============================================================================
 
-dominant_result <- run_reversal_class_enrichment(
-  class_table = dominant_class,
+torpor_upregulated_result <- run_reversal_class_enrichment(
+  class_table = torpor_upregulated_class,
   class_key =
-    "dominant_increased_TE_to_TL_then_decreased_TL_to_AE",
+    "torpor_upregulated_increased_TE_to_TL_then_decreased_TL_to_AE",
   class_title =
-    "Increased TE to TL, then decreased TL to AE"
+    "Torpor-upregulated: increased TE to TL, then decreased TL to AE"
 )
 
-inverse_result <- run_reversal_class_enrichment(
-  class_table = inverse_class,
+torpor_downregulated_result <- run_reversal_class_enrichment(
+  class_table = torpor_downregulated_class,
   class_key =
-    "inverse_decreased_TE_to_TL_then_increased_TL_to_AE",
+    "torpor_downregulated_decreased_TE_to_TL_then_increased_TL_to_AE",
   class_title =
-    "Decreased TE to TL, then increased TL to AE"
+    "Torpor-downregulated: decreased TE to TL, then increased TL to AE"
 )
 
 enrichment_summary <- dplyr::bind_rows(
-  dominant_result$summary,
-  inverse_result$summary
+  torpor_upregulated_result$summary,
+  torpor_downregulated_result$summary
 )
 
 write.csv(
@@ -1535,11 +1799,12 @@ write.table(
 
 saveRDS(
   list(
-    dominant = dominant_result,
-    inverse = inverse_result,
+    torpor_upregulated = torpor_upregulated_result,
+    torpor_downregulated = torpor_downregulated_result,
     paired_results = paired_results,
     shared_significant = shared_significant,
     opposite_direction = opposite_direction,
+    fisher_enrichment_results = fisher_enrichment_results,
     universe_gene_map = universe_gene_map,
     universe_entrez = universe_entrez
   ),
@@ -1559,7 +1824,7 @@ writeLines(
 
 
 # =============================================================================
-# 12. FINAL REPORT
+# 13. FINAL REPORT
 # =============================================================================
 
 cat("\n============================================================\n")
@@ -1572,13 +1837,13 @@ cat(
   "\n"
 )
 cat(
-  "Dominant class:",
-  nrow(dominant_class),
+  "Torpor-upregulated class:",
+  nrow(torpor_upregulated_class),
   "genes\n"
 )
 cat(
-  "Inverse class:",
-  nrow(inverse_class),
+  "Torpor-downregulated class:",
+  nrow(torpor_downregulated_class),
   "genes\n"
 )
 cat(
@@ -1592,10 +1857,10 @@ cat("\nOutput directory:\n")
 cat(output_root, "\n")
 
 cat(
-  "\nFor the manuscript's dominant reversal enrichment, use the files in:\n",
+  "\nFor the manuscript's torpor-upregulated reversal enrichment, use the files in:\n",
   file.path(
     output_root,
-    "dominant_increased_TE_to_TL_then_decreased_TL_to_AE"
+    "torpor_upregulated_increased_TE_to_TL_then_decreased_TL_to_AE"
   ),
   "\n",
   sep = ""
