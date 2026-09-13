@@ -1,3 +1,37 @@
+#!/usr/bin/env Rscript
+
+# =============================================================================
+# CORRECTED COMBINED DEG, VOLCANO, TABLE 1, AND GO/KEGG ANALYSIS
+# =============================================================================
+# Changes in this version:
+# - sex-adjusted edgeR results are the manuscript-facing DEG and enrichment results;
+# - the unadjusted model is retained only as an optional comparison controlled by
+#   run_unadjusted_comparison, and optional unadjusted enrichment is controlled
+#   separately by include_unadjusted_enrichment_comparison;
+# - all DEG, GO/KEGG, and multiple-testing significance thresholds reported for
+#   the manuscript are FDR/BH-adjusted P < 0.01;
+# - Table 1 is rebuilt entirely from sex-adjusted DEGs, including contrast-specific
+#   unique DEGs and total/up/down mouse-ortholog counts and percentages;
+# - two-sided Fisher tests compare mouse-ortholog proportions between upregulated
+#   and downregulated DEGs in each contrast, followed by BH correction;
+# - explicit manuscript DEG-count summaries distinguish DEG calls, distinct DEGs,
+#   contrast-specific unique DEGs, multi-contrast DEGs, and warm-cold-boundary DEGs;
+# - Ensembl biomaRt and KEGG queries use retry logic; complete Ensembl query failure
+#   stops the analysis, while KEGG query failure is explicitly recorded in outputs;
+# - the tested-gene sets from the sex-adjusted and unadjusted models are verified
+#   to be identical whenever the unadjusted comparison is run;
+# - the existing volcano styling, enrichment audit trail, explicit mapped universe,
+#   automatic mouse-identifier selection, RDS output, and sessionInfo() are retained.
+#
+# ASSUMPTION -- "unique DEG": a contrast-specific unique DEG is significant at
+# FDR < 0.01 in exactly one of the six sex-adjusted contrasts. "Distinct DEGs"
+# instead means the union of all genes significant in at least one contrast.
+#
+# ASSUMPTION -- 1:1 orthologs: a non-empty Target_gene is counted as an assigned
+# 1:1 mouse ortholog only if Target_gene contains exclusively validated 1:1 mouse
+# ortholog assignments. The script prints a runtime warning about this assumption.
+# =============================================================================
+
 #############################
 # Step 0: Paths and settings
 #############################
@@ -11,6 +45,47 @@ sex_column <- "Sex"
 
 group_levels <- c("SE", "TE", "TL", "AE", "AL")
 fdr_cutoff  <- 0.01
+
+# Reproducibility for any present or future stochastic operation.
+set.seed(20260913)
+
+# The manuscript uses the sex-adjusted model. The unadjusted model can be run as
+# a separate comparison, but it is never used to construct manuscript Table 1
+# or the default/reported GO/KEGG outputs.
+run_unadjusted_comparison <- TRUE
+include_unadjusted_enrichment_comparison <- FALSE
+
+run_biotype_annotation <- TRUE
+# Network retry settings used by Ensembl biomaRt and KEGG queries.
+network_retry_attempts <- 3L
+network_retry_pause_seconds <- 2
+network_timeout_seconds <- 300
+
+# Six manuscript contrasts, in reporting order.
+contrast_order <- c(
+  "SE_vs_TE",
+  "TE_vs_TL",
+  "TL_vs_AE",
+  "AE_vs_AL",
+  "AL_vs_TE",
+  "AL_vs_SE"
+)
+
+contrast_labels <- c(
+  "SE-TE",
+  "TE-TL",
+  "TL-AE",
+  "AE-AL",
+  "AL-TE",
+  "AL-SE"
+)
+
+# CONTRAST-DIRECTION CONVENTION USED THROUGHOUT THE SCRIPT:
+# Every contrast is first phase minus second phase. Therefore:
+#   logFC < 0 = expression is higher in the second phase
+#             = increased from first phase to second phase;
+#   logFC > 0 = expression is higher in the first phase
+#             = decreased from first phase to second phase.
 
 # Use one formatted cutoff label for every threshold-dependent output name.
 fdr_label <- format(
@@ -1270,23 +1345,31 @@ make_volcano_pdf <- function(
 
 
 #############################
-# Step 12: Run filtered unadjusted analysis
+# Step 12: Optionally run filtered unadjusted comparison analysis
 #############################
 
-unadjusted_analysis <- run_edger_model(
-  dge_input = dge_filtered,
-  design = design_unadjusted,
-  analysis_name = "Filtered_robust_unadjusted",
-  output_dir = unadjusted_output_dir,
-  gene_annotations = gene_annotations,
-  fdr_cutoff = fdr_cutoff
-)
+unadjusted_analysis <- NULL
 
-make_volcano_pdf(
-  results_list = unadjusted_analysis$results_list,
-  volcano_pdf_path = unadjusted_volcano_pdf_path,
-  fdr_cutoff = fdr_cutoff
-)
+if (isTRUE(run_unadjusted_comparison)) {
+  unadjusted_analysis <- run_edger_model(
+    dge_input = dge_filtered,
+    design = design_unadjusted,
+    analysis_name = "Filtered_robust_unadjusted",
+    output_dir = unadjusted_output_dir,
+    gene_annotations = gene_annotations,
+    fdr_cutoff = fdr_cutoff
+  )
+  
+  make_volcano_pdf(
+    results_list = unadjusted_analysis$results_list,
+    volcano_pdf_path = unadjusted_volcano_pdf_path,
+    fdr_cutoff = fdr_cutoff
+  )
+} else {
+  cat(
+    "\nUnadjusted comparison disabled (run_unadjusted_comparison = FALSE).\n"
+  )
+}
 
 
 #############################
@@ -1310,8 +1393,10 @@ make_volcano_pdf(
 
 
 #############################
-# Step 14: Collect significant Target_gene IDs from both analyses
+# Step 14: Collect significant Target_gene IDs (sex-adjusted + optional comparison)
 #############################
+
+if (isTRUE(run_biotype_annotation)) {
 
 collect_significant_target_ids <- function(
     results_list,
@@ -1343,10 +1428,14 @@ collect_significant_target_ids <- function(
   )
 }
 
-unadjusted_target_ids <- collect_significant_target_ids(
-  unadjusted_analysis$results_list,
-  fdr_cutoff
-)
+unadjusted_target_ids <- if (!is.null(unadjusted_analysis)) {
+  collect_significant_target_ids(
+    unadjusted_analysis$results_list,
+    fdr_cutoff
+  )
+} else {
+  character(0)
+}
 
 sex_adjusted_target_ids <- collect_significant_target_ids(
   sex_adjusted_analysis$results_list,
@@ -1383,7 +1472,6 @@ safe_query_biomart <- function(
     dataset_name,
     gene_ids
 ) {
-  
   if (length(gene_ids) == 0) {
     return(
       data.frame(
@@ -1394,52 +1482,95 @@ safe_query_biomart <- function(
     )
   }
   
-  tryCatch(
-    {
-      
-      dataset_mart <- useMart(
-        biomart = "ensembl",
-        dataset = dataset_name,
-        host = "https://www.ensembl.org"
-      )
-      
-      queried_info <- getBM(
-        attributes = c(
-          "ensembl_gene_id",
-          "gene_biotype"
-        ),
-        filters = "ensembl_gene_id",
-        values = gene_ids,
-        mart = dataset_mart
-      )
-      
-      colnames(queried_info) <- c(
-        "Target_gene",
-        "queried_gene_biotype"
-      )
-      
-      queried_info %>%
-        dplyr::distinct(
-          Target_gene,
-          .keep_all = TRUE
+  # Three total attempts by default: the default Ensembl endpoint first,
+  # followed by two useEnsembl mirrors. This avoids silently turning a network
+  # outage into an "all unannotated" biological result.
+  endpoint_schedule <- c("default", "useast", "asia")
+  last_errors <- character(0)
+  
+  old_timeout <- getOption("timeout")
+  options(timeout = max(network_timeout_seconds, old_timeout))
+  on.exit(options(timeout = old_timeout), add = TRUE)
+  
+  for (attempt in seq_len(network_retry_attempts)) {
+    endpoint <- endpoint_schedule[
+      ((attempt - 1L) %% length(endpoint_schedule)) + 1L
+    ]
+    
+    message(
+      "Ensembl query attempt ", attempt, "/", network_retry_attempts,
+      " for ", dataset_name, " via ", endpoint, "."
+    )
+    
+    query_result <- tryCatch(
+      {
+        dataset_mart <- if (identical(endpoint, "default")) {
+          biomaRt::useEnsembl(
+            biomart = "genes",
+            dataset = dataset_name
+          )
+        } else {
+          biomaRt::useEnsembl(
+            biomart = "genes",
+            dataset = dataset_name,
+            mirror = endpoint
+          )
+        }
+        
+        queried_info <- biomaRt::getBM(
+          attributes = c(
+            "ensembl_gene_id",
+            "gene_biotype"
+          ),
+          filters = "ensembl_gene_id",
+          values = gene_ids,
+          mart = dataset_mart
         )
-      
-    },
-    error = function(e) {
-      
-      message(
-        "Could not query dataset ",
-        dataset_name,
-        ": ",
-        conditionMessage(e)
-      )
-      
-      data.frame(
-        Target_gene = character(0),
-        queried_gene_biotype = character(0),
-        stringsAsFactors = FALSE
-      )
+        
+        colnames(queried_info) <- c(
+          "Target_gene",
+          "queried_gene_biotype"
+        )
+        
+        queried_info %>%
+          dplyr::distinct(
+            Target_gene,
+            .keep_all = TRUE
+          )
+      },
+      error = function(e) {
+        structure(
+          list(message = conditionMessage(e)),
+          class = "biomart_query_error"
+        )
+      }
+    )
+    
+    if (!inherits(query_result, "biomart_query_error")) {
+      return(query_result)
     }
+    
+    last_errors <- c(
+      last_errors,
+      paste0(
+        "attempt ", attempt, " (", endpoint, "): ",
+        query_result$message
+      )
+    )
+    
+    message(
+      "Ensembl attempt failed: ", query_result$message
+    )
+    
+    if (attempt < network_retry_attempts) {
+      Sys.sleep(network_retry_pause_seconds)
+    }
+  }
+  
+  stop(
+    "All Ensembl biomaRt attempts failed for dataset ", dataset_name,
+    ". The analysis is stopping rather than classifying all genes as ",
+    "unannotated. Errors: ", paste(last_errors, collapse = " | ")
   )
 }
 
@@ -1462,16 +1593,11 @@ gene_info <- dplyr::bind_rows(
     .keep_all = TRUE
   )
 
-if (nrow(gene_info) == 0) {
-  warning(
-    "No gene-biotype information was returned by Ensembl. ",
-    "All significant genes will be classified as unannotated."
-  )
-  
-  gene_info <- data.frame(
-    Target_gene = all_target_ids,
-    queried_gene_biotype = NA_character_,
-    stringsAsFactors = FALSE
+if (length(all_target_ids) > 0 && nrow(gene_info) == 0) {
+  stop(
+    "Ensembl queries completed but returned no biotype records for any ",
+    "requested Target_gene IDs. Refusing to continue with an all-unannotated ",
+    "classification; verify the identifiers and Ensembl datasets."
   )
 }
 
@@ -1607,13 +1733,17 @@ make_biotype_summary <- function(
 # Step 17: Create separate biotype summaries
 #############################
 
-unadjusted_biotype_summary <- make_biotype_summary(
-  results_list = unadjusted_analysis$results_list,
-  gene_info = gene_info,
-  analysis_name = "Filtered_robust_unadjusted",
-  output_dir = unadjusted_output_dir,
-  fdr_cutoff = fdr_cutoff
-)
+unadjusted_biotype_summary <- NULL
+
+if (!is.null(unadjusted_analysis)) {
+  unadjusted_biotype_summary <- make_biotype_summary(
+    results_list = unadjusted_analysis$results_list,
+    gene_info = gene_info,
+    analysis_name = "Filtered_robust_unadjusted",
+    output_dir = unadjusted_output_dir,
+    fdr_cutoff = fdr_cutoff
+  )
+}
 
 sex_adjusted_biotype_summary <- make_biotype_summary(
   results_list = sex_adjusted_analysis$results_list,
@@ -1623,1748 +1753,9 @@ sex_adjusted_biotype_summary <- make_biotype_summary(
   fdr_cutoff = fdr_cutoff
 )
 
-
-#############################
-# Step 18: Compare filtered unadjusted and sex-adjusted DEG sets
-#############################
-
-comparison_summary_list <- list()
-
-common_contrasts <- intersect(
-  names(unadjusted_analysis$results_list),
-  names(sex_adjusted_analysis$results_list)
-)
-
-for (contrast_name in common_contrasts) {
-  
-  unadjusted_table <- unadjusted_analysis$results_list[[contrast_name]]
-  sex_adjusted_table <- sex_adjusted_analysis$results_list[[contrast_name]]
-  
-  unadjusted_significant_ids <- unique(
-    unadjusted_table$GeneID[
-      unadjusted_table$FDR < fdr_cutoff
-    ]
-  )
-  
-  sex_adjusted_significant_ids <- unique(
-    sex_adjusted_table$GeneID[
-      sex_adjusted_table$FDR < fdr_cutoff
-    ]
-  )
-  
-  significant_in_both <- intersect(
-    unadjusted_significant_ids,
-    sex_adjusted_significant_ids
-  )
-  
-  lost_after_sex_adjustment <- setdiff(
-    unadjusted_significant_ids,
-    sex_adjusted_significant_ids
-  )
-  
-  gained_after_sex_adjustment <- setdiff(
-    sex_adjusted_significant_ids,
-    unadjusted_significant_ids
-  )
-  
-  comparison_summary_list[[contrast_name]] <- data.frame(
-    Contrast = contrast_name,
-    Filtered_robust_unadjusted_DEGs = length(
-      unadjusted_significant_ids
-    ),
-    Filtered_robust_sex_adjusted_DEGs = length(
-      sex_adjusted_significant_ids
-    ),
-    Significant_in_both = length(
-      significant_in_both
-    ),
-    Lost_after_sex_adjustment = length(
-      lost_after_sex_adjustment
-    ),
-    Gained_after_sex_adjustment = length(
-      gained_after_sex_adjustment
-    ),
-    stringsAsFactors = FALSE
-  )
-  
-  write.table(
-    significant_in_both,
-    file = file.path(
-      comparison_output_dir,
-      paste0(
-        contrast_name,
-        "_significant_in_both_FDR_lt_",
-        fdr_label,
-        ".txt"
-      )
-    ),
-    quote = FALSE,
-    row.names = FALSE,
-    col.names = FALSE
-  )
-  
-  write.table(
-    lost_after_sex_adjustment,
-    file = file.path(
-      comparison_output_dir,
-      paste0(
-        contrast_name,
-        "_lost_after_sex_adjustment_FDR_lt_",
-        fdr_label,
-        ".txt"
-      )
-    ),
-    quote = FALSE,
-    row.names = FALSE,
-    col.names = FALSE
-  )
-  
-  write.table(
-    gained_after_sex_adjustment,
-    file = file.path(
-      comparison_output_dir,
-      paste0(
-        contrast_name,
-        "_gained_after_sex_adjustment_FDR_lt_",
-        fdr_label,
-        ".txt"
-      )
-    ),
-    quote = FALSE,
-    row.names = FALSE,
-    col.names = FALSE
-  )
-}
-
-comparison_summary <- dplyr::bind_rows(
-  comparison_summary_list
-)
-
-write.table(
-  comparison_summary,
-  file = file.path(
-    comparison_output_dir,
-    paste0(
-      "unadjusted_vs_sex_adjusted_DEG_summary_FDR_lt_",
-      fdr_label,
-      ".txt"
-    )
-  ),
-  sep = "\t",
-  quote = FALSE,
-  row.names = FALSE
-)
-
-cat("\n")
-cat("============================================================\n")
-cat("FILTERED ROBUST UNADJUSTED VERSUS SEX-ADJUSTED SUMMARY\n")
-cat("============================================================\n")
-print(comparison_summary)
-
-#############################
-# Step 18B: Construct corrected manuscript Table 1
-#############################
-
-contrast_order <- c(
-  "SE_vs_TE",
-  "TE_vs_TL",
-  "TL_vs_AE",
-  "AE_vs_AL",
-  "AL_vs_TE",
-  "AL_vs_SE"
-)
-
-contrast_labels <- c(
-  "SE-TE",
-  "TE-TL",
-  "TL-AE",
-  "AE-AL",
-  "AL-TE",
-  "AL-SE"
-)
-
-get_significant_table <- function(
-    results_list,
-    contrast_name,
-    fdr_cutoff
-) {
-  results_list[[contrast_name]] %>%
-    dplyr::filter(
-      FDR < fdr_cutoff
-    ) %>%
-    dplyr::distinct(
-      GeneID,
-      .keep_all = TRUE
-    )
-}
-
-# Significant tables for both models
-unadjusted_significant_tables <- setNames(
-  lapply(
-    contrast_order,
-    function(contrast_name) {
-      get_significant_table(
-        results_list = unadjusted_analysis$results_list,
-        contrast_name = contrast_name,
-        fdr_cutoff = fdr_cutoff
-      )
-    }
-  ),
-  contrast_order
-)
-
-sex_adjusted_significant_tables <- setNames(
-  lapply(
-    contrast_order,
-    function(contrast_name) {
-      get_significant_table(
-        results_list = sex_adjusted_analysis$results_list,
-        contrast_name = contrast_name,
-        fdr_cutoff = fdr_cutoff
-      )
-    }
-  ),
-  contrast_order
-)
-
-# Gene-ID sets for overlap calculations
-unadjusted_gene_sets <- lapply(
-  unadjusted_significant_tables,
-  function(x) {
-    unique(x$GeneID)
-  }
-)
-
-sex_adjusted_gene_sets <- lapply(
-  sex_adjusted_significant_tables,
-  function(x) {
-    unique(x$GeneID)
-  }
-)
-
-# DEGs occurring in only one of the six unadjusted contrasts
-unique_unadjusted_counts <- vapply(
-  seq_along(unadjusted_gene_sets),
-  function(i) {
-    genes_in_other_contrasts <- unique(
-      unlist(
-        unadjusted_gene_sets[-i],
-        use.names = FALSE
-      )
-    )
-    
-    sum(
-      !unadjusted_gene_sets[[i]] %in%
-        genes_in_other_contrasts
-    )
-  },
-  FUN.VALUE = integer(1)
-)
-
-# Count non-empty Target_gene assignments.
-#
-# IMPORTANT:
-# This is a 1:1 mouse-ortholog count only if Target_gene in your
-# annotation file contains exclusively validated 1:1 mouse orthologs.
-ortholog_counts <- vapply(
-  unadjusted_significant_tables,
-  function(x) {
-    target_gene <- trimws(
-      as.character(x$Target_gene)
-    )
-    
-    sum(
-      !is.na(target_gene) &
-        target_gene != ""
-    )
-  },
-  FUN.VALUE = integer(1)
-)
-
-# Helper for extracting summary columns in the correct order
-extract_summary_values <- function(
-    summary_df,
-    value_column
-) {
-  summary_df[
-    match(
-      contrast_order,
-      summary_df$Contrast
-    ),
-    value_column
-  ]
-}
-
-unadjusted_total <- extract_summary_values(
-  unadjusted_analysis$deg_summary,
-  "Total_DEGs"
-)
-
-sex_adjusted_total <- extract_summary_values(
-  sex_adjusted_analysis$deg_summary,
-  "Total_DEGs"
-)
-
-unadjusted_up <- extract_summary_values(
-  unadjusted_analysis$deg_summary,
-  "Upregulated"
-)
-
-unadjusted_down <- extract_summary_values(
-  unadjusted_analysis$deg_summary,
-  "Downregulated"
-)
-
-significant_in_both <- extract_summary_values(
-  comparison_summary,
-  "Significant_in_both"
-)
-
-lost_after_adjustment <- extract_summary_values(
-  comparison_summary,
-  "Lost_after_sex_adjustment"
-)
-
-gained_after_adjustment <- extract_summary_values(
-  comparison_summary,
-  "Gained_after_sex_adjustment"
-)
-
-ortholog_percentages <- ifelse(
-  unadjusted_total > 0,
-  100 * ortholog_counts / unadjusted_total,
-  0
-)
-
-ortholog_display <- sprintf(
-  "%d (%.1f%%)",
-  ortholog_counts,
-  ortholog_percentages
-)
-
-table1_matrix <- rbind(
-  "Unadjusted total DEGs" =
-    unadjusted_total,
-  
-  "Sex-adjusted total DEGs" =
-    sex_adjusted_total,
-  
-  "Upregulated, unadjusted" =
-    unadjusted_up,
-  
-  "Downregulated, unadjusted" =
-    unadjusted_down,
-  
-  "Significant in both models" =
-    significant_in_both,
-  
-  "Lost after sex adjustment" =
-    lost_after_adjustment,
-  
-  "Gained after sex adjustment" =
-    gained_after_adjustment,
-  
-  "Unique unadjusted DEGs" =
-    unique_unadjusted_counts,
-  
-  "Assigned 1:1 mouse orthologs" =
-    ortholog_display
-)
-
-colnames(table1_matrix) <- contrast_labels
-
-table1_df <- data.frame(
-  Feature = rownames(table1_matrix),
-  table1_matrix,
-  row.names = NULL,
-  check.names = FALSE,
-  stringsAsFactors = FALSE
-)
-
-cat("\nCorrected manuscript Table 1:\n")
-print(
-  table1_df,
-  row.names = FALSE
-)
-
-write.table(
-  table1_df,
-  file = file.path(
-    comparison_output_dir,
-    paste0(
-      "corrected_manuscript_Table_1_FDR_lt_",
-      fdr_label,
-      ".txt"
-    )
-  ),
-  sep = "\t",
-  quote = FALSE,
-  row.names = FALSE
-)
-
-#############################
-# Step 19: Save session information
-#############################
-
-capture.output(
-  sessionInfo(),
-  file = file.path(
-    output_root_path,
-    "R_sessionInfo.txt"
-  )
-)
-
-
-#############################
-# Step 20: Final message
-#############################
-
-cat("\n")
-cat("============================================================\n")
-cat("ANALYSIS COMPLETE\n")
-cat("============================================================\n")
-
-cat("Genes before filtering:", genes_before_filtering, "\n")
-cat("Genes retained:", genes_after_filtering, "\n")
-cat("FDR cutoff:", fdr_cutoff, "\n\n")
-
-cat("Filtered robust unadjusted results:\n")
-cat(unadjusted_output_dir, "\n\n")
-
-cat("Filtered robust sex-adjusted results:\n")
-cat(sex_adjusted_output_dir, "\n\n")
-
-cat("Comparison results:\n")
-cat(comparison_output_dir, "\n")
-
-# =============================================================================
-# CONTINUE DIRECTLY WITH GO/KEGG ENRICHMENT
-# The volcano section above creates:
-#   unadjusted_analysis
-#   gene_annotations
-#   output_root_path
-# =============================================================================
-
-# =============================================================================
-# 0. USER SETTINGS
-# =============================================================================
-
-# GO/KEGG is deliberately restricted to the filtered robust
-# SEX-UNADJUSTED primary analysis. The sex-adjusted model is not used as an
-# enrichment foreground anywhere in this section.
-analyses_to_enrich <- c("unadjusted")
-
-# DEG threshold. This should match the volcano script.
-enrichment_fdr_cutoff <- 0.01
-
-# Enrichment thresholds, retained from the example GO/KEGG script.
-pvalue_cutoff <- 0.05
-qvalue_cutoff <- 0.10
-
-# Number of terms shown in each plot.
-top_terms_to_plot <- 20L
-
-# GO ontology. The example uses Biological Process.
-go_ontology <- "BP"
-
-# Optional manual identifier choice.
-# Leave both NULL to select automatically the recognised annotation column
-# that maps the largest number of tested genes to mouse Entrez IDs.
-#
-# Examples:
-# manual_mouse_ortholog_col <- "Target_gene"
-# manual_mouse_key_type <- "ENSEMBL"
-#
-# manual_mouse_ortholog_col <- "Mmu_gene_name"
-# manual_mouse_key_type <- "SYMBOL"
-#
-# manual_mouse_ortholog_col <- "ENTREZID"
-# manual_mouse_key_type <- "ENTREZID"
-manual_mouse_ortholog_col <- NULL
-manual_mouse_key_type <- NULL
-
-# The output folder is defined only after the required objects from the
-# volcano script have been verified below.
-
-# =============================================================================
-# 1. INSTALL AND LOAD PACKAGES
-# =============================================================================
-
-install_cran_if_missing <- function(pkg) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    install.packages(pkg, repos = "https://cloud.r-project.org")
-  }
-}
-
-install_bioc_if_missing <- function(pkg) {
-  if (!requireNamespace("BiocManager", quietly = TRUE)) {
-    install.packages("BiocManager", repos = "https://cloud.r-project.org")
-  }
-  
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    BiocManager::install(pkg, ask = FALSE, update = FALSE)
-  }
-}
-
-install_bioc_if_missing("clusterProfiler")
-install_bioc_if_missing("org.Mm.eg.db")
-install_bioc_if_missing("AnnotationDbi")
-
-install_cran_if_missing("dplyr")
-install_cran_if_missing("tidyr")
-install_cran_if_missing("ggplot2")
-install_cran_if_missing("ggsci")
-
-suppressPackageStartupMessages({
-  library(clusterProfiler)
-  library(org.Mm.eg.db)
-  library(AnnotationDbi)
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-  library(ggsci)
-})
-
-# =============================================================================
-# 2. VERIFY REQUIRED OBJECTS FROM THE VOLCANO SCRIPT
-# =============================================================================
-
-required_objects <- c(
-  "unadjusted_analysis",
-  "gene_annotations",
-  "output_root_path"
-)
-
-missing_objects <- required_objects[
-  !vapply(
-    required_objects,
-    exists,
-    logical(1),
-    inherits = TRUE
-  )
-]
-
-if (length(missing_objects) > 0) {
-  stop(
-    "This is an append-only enrichment section. Run the complete volcano ",
-    "script first in the same R session, and then source this file without ",
-    "clearing the workspace. Missing objects: ",
-    paste(missing_objects, collapse = ", ")
-  )
-}
-
-if (!is.list(unadjusted_analysis$results_list)) {
-  stop("unadjusted_analysis$results_list is missing or is not a list.")
-}
-
-# No sex-adjusted result object is required or used for enrichment.
-
-if (!"GeneID" %in% colnames(gene_annotations)) {
-  colnames(gene_annotations)[1] <- "GeneID"
-}
-
-gene_annotations <- gene_annotations %>%
-  dplyr::mutate(GeneID = trimws(as.character(GeneID))) %>%
-  dplyr::filter(!is.na(GeneID), GeneID != "") %>%
-  dplyr::distinct(GeneID, .keep_all = TRUE)
-
-
-# Create the enrichment output folder only now, after output_root_path has
-# been confirmed to exist.
-enrichment_output_root <- file.path(
-  output_root_path,
-  paste0(
-    "04_GO_KEGG_transition_direction_by_contrast_FDR_",
-    format(enrichment_fdr_cutoff, scientific = FALSE, trim = TRUE)
-  )
-)
-
-dir.create(
-  enrichment_output_root,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-allowed_analyses <- "unadjusted"
-invalid_analyses <- setdiff(analyses_to_enrich, allowed_analyses)
-
-if (length(invalid_analyses) > 0) {
-  stop(
-    "Invalid analyses_to_enrich values: ",
-    paste(invalid_analyses, collapse = ", "),
-    ". Allowed values are: ",
-    paste(allowed_analyses, collapse = ", ")
-  )
-}
-
-analysis_registry <- list(
-  unadjusted = list(
-    label = "Filtered_robust_unadjusted",
-    results_list = unadjusted_analysis$results_list
-  )
-)
-
-analysis_registry <- analysis_registry[analyses_to_enrich]
-
-# Confirm that every result table has the required edgeR columns.
-for (analysis_key in names(analysis_registry)) {
-  for (contrast_name in names(analysis_registry[[analysis_key]]$results_list)) {
-    tab <- analysis_registry[[analysis_key]]$results_list[[contrast_name]]
-    required_result_columns <- c("GeneID", "logFC", "FDR")
-    missing_result_columns <- setdiff(required_result_columns, colnames(tab))
-    
-    if (length(missing_result_columns) > 0) {
-      stop(
-        "Missing required columns in ", analysis_key, "/", contrast_name,
-        ": ", paste(missing_result_columns, collapse = ", ")
-      )
-    }
-  }
-}
-
-# =============================================================================
-# 3. IDENTIFIER AND ENRICHMENT HELPERS
-# =============================================================================
-
-is_valid_identifier <- function(x) {
-  x <- trimws(as.character(x))
-  
-  !is.na(x) &
-    x != "" &
-    !(x %in% c(
-      "-", ".", "NA", "na", "N/A", "n/a",
-      "None", "none", "NULL", "null",
-      "No", "no", "FALSE", "False", "false", "?"
-    ))
-}
-
-find_column_case_insensitive <- function(df, requested_name) {
-  hit <- which(tolower(colnames(df)) == tolower(requested_name))
-  
-  if (length(hit) == 0) {
-    return(NA_character_)
-  }
-  
-  colnames(df)[hit[1]]
-}
-
-normalise_mouse_identifier <- function(x, key_type) {
-  x <- trimws(as.character(x))
-  
-  # Remove Ensembl version suffixes, for example ENSMUSG... .12.
-  if (identical(key_type, "ENSEMBL")) {
-    x <- sub("\\.[0-9]+$", "", x)
-  }
-  
-  x
-}
-
-expand_identifier_column <- function(df, identifier_col) {
-  if (!"GeneID" %in% colnames(df)) {
-    stop("expand_identifier_column(): GeneID column is missing.")
-  }
-  
-  if (!identifier_col %in% colnames(df)) {
-    stop(
-      "Identifier column not found: ", identifier_col,
-      ". Available columns: ",
-      paste(colnames(df), collapse = ", ")
-    )
-  }
-  
-  df %>%
-    dplyr::transmute(
-      GeneID = as.character(GeneID),
-      MouseInputOriginal = as.character(.data[[identifier_col]])
-    ) %>%
-    dplyr::filter(is_valid_identifier(MouseInputOriginal)) %>%
-    tidyr::separate_rows(
-      MouseInputOriginal,
-      sep = "\\s*[,;|]+\\s*"
-    ) %>%
-    dplyr::mutate(
-      MouseInputOriginal = trimws(MouseInputOriginal)
-    ) %>%
-    dplyr::filter(is_valid_identifier(MouseInputOriginal)) %>%
-    dplyr::distinct()
-}
-
-map_mouse_identifiers <- function(identifier_table, from_type) {
-  empty_result <- data.frame(
-    MouseInputOriginal = character(),
-    MouseInput = character(),
-    ENTREZID = character(),
-    MouseSymbol = character(),
-    stringsAsFactors = FALSE
-  )
-  
-  if (nrow(identifier_table) == 0) {
-    return(empty_result)
-  }
-  
-  supported_keytypes <- AnnotationDbi::keytypes(org.Mm.eg.db)
-  
-  if (!from_type %in% supported_keytypes) {
-    stop(
-      "Key type '", from_type,
-      "' is not supported by org.Mm.eg.db.\nSupported key types include:\n",
-      paste(supported_keytypes, collapse = ", ")
-    )
-  }
-  
-  lookup <- identifier_table %>%
-    dplyr::transmute(
-      MouseInputOriginal,
-      MouseInput = normalise_mouse_identifier(
-        MouseInputOriginal,
-        from_type
-      )
-    ) %>%
-    dplyr::filter(is_valid_identifier(MouseInput)) %>%
-    dplyr::distinct()
-  
-  if (nrow(lookup) == 0) {
-    return(empty_result)
-  }
-  
-  mapped <- tryCatch(
-    suppressMessages(
-      AnnotationDbi::select(
-        org.Mm.eg.db,
-        keys = unique(lookup$MouseInput),
-        keytype = from_type,
-        columns = unique(c("ENTREZID", "SYMBOL"))
-      )
-    ),
-    error = function(e) {
-      warning(
-        "Mouse identifier mapping failed for key type ",
-        from_type,
-        ": ",
-        conditionMessage(e)
-      )
-      NULL
-    }
-  )
-  
-  if (is.null(mapped) || nrow(mapped) == 0) {
-    return(empty_result)
-  }
-  
-  mapped_df <- data.frame(
-    MouseInput = as.character(mapped[[from_type]]),
-    ENTREZID = as.character(mapped$ENTREZID),
-    MouseSymbol = as.character(mapped$SYMBOL),
-    stringsAsFactors = FALSE
-  ) %>%
-    dplyr::filter(
-      is_valid_identifier(MouseInput),
-      is_valid_identifier(ENTREZID)
-    ) %>%
-    dplyr::distinct()
-  
-  lookup %>%
-    dplyr::inner_join(mapped_df, by = "MouseInput") %>%
-    dplyr::distinct()
-}
-
-add_rich_factor <- function(df) {
-  if (nrow(df) == 0) {
-    return(df)
-  }
-  
-  required_cols <- c("Count", "BgRatio")
-  
-  if (!all(required_cols %in% colnames(df))) {
-    return(df)
-  }
-  
-  df %>%
-    dplyr::mutate(
-      BackgroundTermGenes = as.numeric(sub("/.*", "", BgRatio)),
-      RichFactor = Count / BackgroundTermGenes
-    )
-}
-
-add_rich_group <- function(df) {
-  if (nrow(df) == 0 || !"RichFactor" %in% colnames(df)) {
-    return(df)
-  }
-  
-  rich_breaks <- stats::quantile(
-    df$RichFactor,
-    probs = c(0, 1 / 3, 2 / 3, 1),
-    na.rm = TRUE
-  )
-  
-  if (length(unique(rich_breaks)) == 4) {
-    return(
-      df %>%
-        dplyr::mutate(
-          RichGroup = cut(
-            RichFactor,
-            breaks = rich_breaks,
-            include.lowest = TRUE,
-            labels = c("Low", "Medium", "High")
-          )
-        )
-    )
-  }
-  
-  distinct_values <- sort(unique(df$RichFactor))
-  
-  if (length(distinct_values) == 1) {
-    df$RichGroup <- factor(
-      rep("Low", nrow(df)),
-      levels = c("Low", "Medium", "High")
-    )
-  } else if (length(distinct_values) == 2) {
-    df$RichGroup <- factor(
-      ifelse(
-        df$RichFactor == min(distinct_values),
-        "Low",
-        "High"
-      ),
-      levels = c("Low", "Medium", "High")
-    )
-  } else {
-    df$RichGroup <- factor(
-      c("Low", "Medium", "High")[
-        dplyr::ntile(
-          rank(df$RichFactor, ties.method = "first"),
-          3
-        )
-      ],
-      levels = c("Low", "Medium", "High")
-    )
-  }
-  
-  df
-}
-
-empty_enrichment_table <- function() {
-  data.frame(
-    ID = character(),
-    Description = character(),
-    GeneRatio = character(),
-    BgRatio = character(),
-    pvalue = numeric(),
-    p.adjust = numeric(),
-    qvalue = numeric(),
-    geneID = character(),
-    Count = integer(),
-    BackgroundTermGenes = numeric(),
-    RichFactor = numeric(),
-    stringsAsFactors = FALSE
-  )
-}
-
-safe_enrich_go <- function(genes, universe) {
-  tryCatch(
-    clusterProfiler::enrichGO(
-      gene = genes,
-      universe = universe,
-      OrgDb = org.Mm.eg.db,
-      keyType = "ENTREZID",
-      ont = go_ontology,
-      pAdjustMethod = "BH",
-      pvalueCutoff = pvalue_cutoff,
-      qvalueCutoff = qvalue_cutoff,
-      readable = TRUE
-    ),
-    error = function(e) {
-      warning("GO enrichment failed: ", conditionMessage(e))
-      NULL
-    }
-  )
-}
-
-safe_enrich_kegg <- function(genes, universe) {
-  kegg_object <- tryCatch(
-    clusterProfiler::enrichKEGG(
-      gene = genes,
-      universe = universe,
-      organism = "mmu",
-      keyType = "ncbi-geneid",
-      pvalueCutoff = pvalue_cutoff,
-      pAdjustMethod = "BH",
-      qvalueCutoff = qvalue_cutoff
-    ),
-    error = function(e) {
-      warning("KEGG enrichment failed: ", conditionMessage(e))
-      NULL
-    }
-  )
-  
-  if (is.null(kegg_object)) {
-    return(NULL)
-  }
-  
-  if (nrow(as.data.frame(kegg_object)) > 0) {
-    kegg_object <- tryCatch(
-      clusterProfiler::setReadable(
-        kegg_object,
-        OrgDb = org.Mm.eg.db,
-        keyType = "ENTREZID"
-      ),
-      error = function(e) {
-        warning(
-          "KEGG enrichment completed, but setReadable() failed: ",
-          conditionMessage(e)
-        )
-        kegg_object
-      }
-    )
-  }
-  
-  kegg_object
-}
-
-# =============================================================================
-# 4. CHOOSE THE MOUSE ORTHOLOG IDENTIFIER COLUMN
-# =============================================================================
-
-candidate_specs <- data.frame(
-  RequestedColumn = c(
-    "ENTREZID",
-    "Target_gene",
-    "Mmu_gene_name",
-    "Mmu_Gene_name",
-    "Mmu_symbol",
-    "Mmu_Symbol",
-    "Mouse_gene_name",
-    "Mouse_Gene_name",
-    "Mouse_symbol",
-    "Mouse_Symbol",
-    "SYMBOL"
-  ),
-  KeyType = c(
-    "ENTREZID",
-    "ENSEMBL",
-    "SYMBOL",
-    "SYMBOL",
-    "SYMBOL",
-    "SYMBOL",
-    "SYMBOL",
-    "SYMBOL",
-    "SYMBOL",
-    "SYMBOL",
-    "SYMBOL"
-  ),
-  Priority = seq_len(11),
-  stringsAsFactors = FALSE
-)
-
-candidate_specs$ActualColumn <- vapply(
-  candidate_specs$RequestedColumn,
-  function(x) find_column_case_insensitive(gene_annotations, x),
-  character(1)
-)
-
-candidate_specs <- candidate_specs %>%
-  dplyr::filter(!is.na(ActualColumn)) %>%
-  dplyr::distinct(ActualColumn, .keep_all = TRUE)
-
-# All contrasts in a model contain the same tested genes. Use the first
-# unadjusted contrast to define the tested original-gene set for mapping.
-first_unadjusted_table <- unadjusted_analysis$results_list[[1]]
-
-tested_gene_annotation_base <- first_unadjusted_table %>%
-  dplyr::transmute(GeneID = as.character(GeneID)) %>%
-  dplyr::distinct() %>%
-  dplyr::left_join(gene_annotations, by = "GeneID")
-
-if (!is.null(manual_mouse_ortholog_col)) {
-  selected_mouse_col <- find_column_case_insensitive(
-    gene_annotations,
-    manual_mouse_ortholog_col
-  )
-  
-  if (is.na(selected_mouse_col)) {
-    stop(
-      "Manual mouse ortholog column not found: ",
-      manual_mouse_ortholog_col,
-      "\nAvailable annotation columns:\n",
-      paste(colnames(gene_annotations), collapse = ", ")
-    )
-  }
-  
-  if (is.null(manual_mouse_key_type)) {
-    recognised_row <- candidate_specs %>%
-      dplyr::filter(tolower(ActualColumn) == tolower(selected_mouse_col))
-    
-    if (nrow(recognised_row) == 0) {
-      stop(
-        "A manual mouse ortholog column was supplied without its key type. ",
-        "Set manual_mouse_key_type to ENSEMBL, SYMBOL, or ENTREZID."
-      )
-    }
-    
-    selected_key_type <- recognised_row$KeyType[1]
-  } else {
-    selected_key_type <- manual_mouse_key_type
-  }
-  
-  candidate_selection_table <- data.frame(
-    ActualColumn = selected_mouse_col,
-    KeyType = selected_key_type,
-    Priority = NA_integer_,
-    TestedGenesWithValidInput = NA_integer_,
-    TestedGenesMappedToEntrez = NA_integer_,
-    UniqueMouseEntrez = NA_integer_,
-    stringsAsFactors = FALSE
-  )
-  
 } else {
-  if (nrow(candidate_specs) == 0) {
-    stop(
-      "No recognised mouse ortholog identifier columns were found.\n",
-      "Available annotation columns:\n",
-      paste(colnames(gene_annotations), collapse = ", "),
-      "\nSet manual_mouse_ortholog_col and manual_mouse_key_type near the top."
-    )
-  }
-  
-  candidate_evaluations <- lapply(
-    seq_len(nrow(candidate_specs)),
-    function(i) {
-      col_here <- candidate_specs$ActualColumn[i]
-      key_here <- candidate_specs$KeyType[i]
-      
-      long_here <- expand_identifier_column(
-        tested_gene_annotation_base,
-        identifier_col = col_here
-      )
-      
-      map_here <- map_mouse_identifiers(
-        identifier_table = long_here,
-        from_type = key_here
-      )
-      
-      mapped_genes_here <- long_here %>%
-        dplyr::inner_join(
-          map_here,
-          by = "MouseInputOriginal",
-          relationship = "many-to-many"
-        )
-      
-      data.frame(
-        ActualColumn = col_here,
-        KeyType = key_here,
-        Priority = candidate_specs$Priority[i],
-        TestedGenesWithValidInput = dplyr::n_distinct(long_here$GeneID),
-        TestedGenesMappedToEntrez = dplyr::n_distinct(mapped_genes_here$GeneID),
-        UniqueMouseEntrez = dplyr::n_distinct(mapped_genes_here$ENTREZID),
-        stringsAsFactors = FALSE
-      )
-    }
-  )
-  
-  candidate_selection_table <- dplyr::bind_rows(candidate_evaluations) %>%
-    dplyr::arrange(
-      dplyr::desc(TestedGenesMappedToEntrez),
-      dplyr::desc(UniqueMouseEntrez),
-      Priority
-    )
-  
-  if (
-    nrow(candidate_selection_table) == 0 ||
-    max(candidate_selection_table$TestedGenesMappedToEntrez) == 0
-  ) {
-    stop(
-      "None of the recognised annotation columns mapped any tested genes ",
-      "to mouse Entrez IDs."
-    )
-  }
-  
-  selected_mouse_col <- candidate_selection_table$ActualColumn[1]
-  selected_key_type <- candidate_selection_table$KeyType[1]
+  cat("\nBiotype annotation skipped (run_biotype_annotation = FALSE).\n")
+  gene_info <- NULL
+  unadjusted_biotype_summary <- NULL
+  sex_adjusted_biotype_summary <- NULL
 }
-
-write.csv(
-  candidate_selection_table,
-  file = file.path(
-    enrichment_output_root,
-    "mouse_identifier_column_selection.csv"
-  ),
-  row.names = FALSE
-)
-
-cat("\nMOUSE IDENTIFIER SELECTION\n")
-cat("Selected annotation column:", selected_mouse_col, "\n")
-cat("Selected org.Mm.eg.db key type:", selected_key_type, "\n")
-
-# =============================================================================
-# 5. BUILD THE FILTERED/TESTED MOUSE-ORTHOLOG UNIVERSE
-# =============================================================================
-
-universe_long <- expand_identifier_column(
-  tested_gene_annotation_base,
-  identifier_col = selected_mouse_col
-)
-
-universe_id_map <- map_mouse_identifiers(
-  identifier_table = universe_long,
-  from_type = selected_key_type
-)
-
-universe_gene_map <- universe_long %>%
-  dplyr::inner_join(
-    universe_id_map,
-    by = "MouseInputOriginal",
-    relationship = "many-to-many"
-  ) %>%
-  dplyr::distinct(
-    GeneID,
-    MouseInputOriginal,
-    MouseInput,
-    ENTREZID,
-    MouseSymbol
-  )
-
-universe_entrez <- sort(unique(universe_gene_map$ENTREZID))
-
-if (length(universe_entrez) == 0) {
-  stop("No low-expression-filtered/tested genes mapped to mouse Entrez IDs.")
-}
-
-write.csv(
-  universe_gene_map,
-  file = file.path(
-    enrichment_output_root,
-    "tested_gene_mouse_ortholog_universe_mapping.csv"
-  ),
-  row.names = FALSE
-)
-
-write.csv(
-  data.frame(ENTREZID = universe_entrez),
-  file = file.path(
-    enrichment_output_root,
-    "tested_gene_mouse_ortholog_universe_EntrezIDs.csv"
-  ),
-  row.names = FALSE
-)
-
-writeLines(
-  universe_entrez,
-  con = file.path(
-    enrichment_output_root,
-    "tested_gene_mouse_ortholog_universe_EntrezIDs_one_per_line.txt"
-  )
-)
-
-cat(
-  "Mapped filtered/tested background universe:",
-  length(universe_entrez),
-  "unique mouse Entrez IDs\n"
-)
-
-# =============================================================================
-# 6. PLOT SETTINGS — SAME STYLE AS THE EXAMPLE SCRIPT
-# =============================================================================
-
-three_cols <- ggsci::pal_npg("nrc")(3)
-
-clean_theme <- ggplot2::theme_classic() +
-  ggplot2::theme(
-    plot.title = ggplot2::element_text(
-      size = 14,
-      face = "bold",
-      hjust = 0.5
-    ),
-    axis.title.x = ggplot2::element_text(
-      size = 12,
-      face = "bold"
-    ),
-    axis.title.y = ggplot2::element_text(
-      size = 12,
-      face = "bold"
-    ),
-    axis.text.x = ggplot2::element_text(size = 10),
-    axis.text.y = ggplot2::element_text(size = 10),
-    legend.title = ggplot2::element_text(
-      size = 10,
-      face = "bold"
-    ),
-    legend.text = ggplot2::element_text(size = 9)
-  )
-
-# =============================================================================
-# 7. RUN ONE CONTRAST × DIRECTION ENRICHMENT
-# =============================================================================
-
-run_direction_enrichment <- function(
-    analysis_label,
-    contrast_name,
-    direction,
-    result_table,
-    selected_mouse_col,
-    selected_key_type,
-    gene_annotations,
-    universe_entrez,
-    output_root) {
-  
-  if (!direction %in% c(
-    "Increased_in_second_phase",
-    "Decreased_in_second_phase"
-  )) {
-    stop(
-      "Direction must be Increased_in_second_phase or ",
-      "Decreased_in_second_phase."
-    )
-  }
-  
-  # Contrasts are defined as first phase minus second phase:
-  #   logFC < 0 = higher in the second phase
-  #             = increased from first phase to second phase
-  #   logFC > 0 = higher in the first phase
-  #             = decreased from first phase to second phase
-  direction_folder <- ifelse(
-    direction == "Increased_in_second_phase",
-    "increased_in_second_phase",
-    "decreased_in_second_phase"
-  )
-  
-  direction_title <- ifelse(
-    direction == "Increased_in_second_phase",
-    "increased in second phase",
-    "decreased in second phase"
-  )
-  
-  contrast_label <- gsub("_vs_", "-", contrast_name)
-  
-  output_dir <- file.path(
-    output_root,
-    analysis_label,
-    contrast_name,
-    direction_folder
-  )
-  
-  dir.create(
-    output_dir,
-    recursive = TRUE,
-    showWarnings = FALSE
-  )
-  
-  result_core <- result_table %>%
-    dplyr::select(
-      dplyr::any_of(
-        c(
-          "GeneID", "logFC", "logCPM", "F", "PValue", "FDR"
-        )
-      )
-    ) %>%
-    dplyr::mutate(GeneID = as.character(GeneID)) %>%
-    dplyr::distinct(GeneID, .keep_all = TRUE)
-  
-  annotation_columns <- unique(
-    c(
-      "GeneID",
-      selected_mouse_col,
-      intersect(
-        c("Gene_name", "Mmu_gene_name", "Mmu_Gene_name"),
-        colnames(gene_annotations)
-      )
-    )
-  )
-  
-  annotated_results <- result_core %>%
-    dplyr::left_join(
-      gene_annotations %>%
-        dplyr::select(dplyr::all_of(annotation_columns)),
-      by = "GeneID"
-    )
-  
-  if (nrow(annotated_results) != nrow(result_core)) {
-    stop(
-      "Annotation joining changed the row count for ",
-      analysis_label, "/", contrast_name, "."
-    )
-  }
-  
-  significant_here <- annotated_results %>%
-    dplyr::filter(
-      FDR < enrichment_fdr_cutoff,
-      if (direction == "Increased_in_second_phase") {
-        logFC < 0
-      } else {
-        logFC > 0
-      }
-    ) %>%
-    dplyr::distinct(GeneID, .keep_all = TRUE)
-  
-  # Save all direction-specific FDR-significant original genes before mapping.
-  write.csv(
-    significant_here,
-    file = file.path(
-      output_dir,
-      paste0(
-        contrast_name,
-        "_",
-        direction_folder,
-        "_ALL_DEGs_before_mouse_mapping.csv"
-      )
-    ),
-    row.names = FALSE
-  )
-  
-  significant_long <- expand_identifier_column(
-    significant_here,
-    identifier_col = selected_mouse_col
-  )
-  
-  significant_id_map <- map_mouse_identifiers(
-    identifier_table = significant_long,
-    from_type = selected_key_type
-  )
-  
-  mapped_foreground <- significant_long %>%
-    dplyr::inner_join(
-      significant_id_map,
-      by = "MouseInputOriginal",
-      relationship = "many-to-many"
-    ) %>%
-    dplyr::filter(ENTREZID %in% universe_entrez) %>%
-    dplyr::left_join(
-      significant_here %>%
-        dplyr::select(
-          dplyr::any_of(
-            c(
-              "GeneID", "logFC", "logCPM", "F", "PValue", "FDR",
-              "Gene_name", "Mmu_gene_name", "Mmu_Gene_name",
-              selected_mouse_col
-            )
-          )
-        ),
-      by = "GeneID"
-    ) %>%
-    dplyr::distinct()
-  
-  # One-row-per-original-gene audit of all inclusion/exclusion decisions.
-  valid_input_status <- significant_long %>%
-    dplyr::distinct(GeneID) %>%
-    dplyr::mutate(HasValidMouseInput = TRUE)
-  
-  mapped_status <- significant_long %>%
-    dplyr::inner_join(
-      significant_id_map,
-      by = "MouseInputOriginal",
-      relationship = "many-to-many"
-    ) %>%
-    dplyr::distinct(GeneID) %>%
-    dplyr::mutate(MappedToMouseEntrez = TRUE)
-  
-  used_status <- mapped_foreground %>%
-    dplyr::distinct(GeneID) %>%
-    dplyr::mutate(UsedForEnrichment = TRUE)
-  
-  gene_flow_audit <- significant_here %>%
-    dplyr::left_join(valid_input_status, by = "GeneID") %>%
-    dplyr::left_join(mapped_status, by = "GeneID") %>%
-    dplyr::left_join(used_status, by = "GeneID") %>%
-    dplyr::mutate(
-      HasValidMouseInput = tidyr::replace_na(HasValidMouseInput, FALSE),
-      MappedToMouseEntrez = tidyr::replace_na(MappedToMouseEntrez, FALSE),
-      UsedForEnrichment = tidyr::replace_na(UsedForEnrichment, FALSE),
-      Status = dplyr::case_when(
-        UsedForEnrichment ~ "Used for GO/KEGG",
-        !HasValidMouseInput ~
-          "Excluded: no valid mouse ortholog identifier",
-        HasValidMouseInput & !MappedToMouseEntrez ~
-          "Excluded: mouse identifier did not map to Entrez",
-        MappedToMouseEntrez & !UsedForEnrichment ~
-          "Excluded: mapped mouse Entrez absent from tested universe",
-        TRUE ~ "Unknown"
-      )
-    ) %>%
-    dplyr::arrange(Status, FDR, GeneID)
-  
-  write.csv(
-    gene_flow_audit,
-    file = file.path(
-      output_dir,
-      paste0(
-        contrast_name,
-        "_",
-        direction_folder,
-        "_AUDIT_every_DEG_to_enrichment.csv"
-      )
-    ),
-    row.names = FALSE
-  )
-  
-  mapped_foreground <- mapped_foreground %>%
-    dplyr::arrange(MouseSymbol, ENTREZID, FDR, GeneID)
-  
-  write.csv(
-    mapped_foreground,
-    file = file.path(
-      output_dir,
-      paste0(
-        contrast_name,
-        "_",
-        direction_folder,
-        "_EXACT_usable_mouse_ortholog_genes.csv"
-      )
-    ),
-    row.names = FALSE
-  )
-  
-  foreground_entrez <- sort(unique(mapped_foreground$ENTREZID))
-  
-  write.csv(
-    data.frame(ENTREZID = foreground_entrez),
-    file = file.path(
-      output_dir,
-      paste0(
-        contrast_name,
-        "_",
-        direction_folder,
-        "_EXACT_GO_KEGG_foreground_EntrezIDs.csv"
-      )
-    ),
-    row.names = FALSE
-  )
-  
-  writeLines(
-    foreground_entrez,
-    con = file.path(
-      output_dir,
-      paste0(
-        contrast_name,
-        "_",
-        direction_folder,
-        "_EXACT_GO_KEGG_foreground_EntrezIDs_one_per_line.txt"
-      )
-    )
-  )
-  
-  cat("\n============================================================\n")
-  cat(analysis_label, "\n")
-  cat(contrast_name, "-", direction, "\n")
-  cat(
-    "FDR-significant original genes:",
-    nrow(significant_here),
-    "\n"
-  )
-  cat(
-    "Original genes mapped and used:",
-    dplyr::n_distinct(mapped_foreground$GeneID),
-    "\n"
-  )
-  cat(
-    "Unique mouse Entrez IDs submitted:",
-    length(foreground_entrez),
-    "\n"
-  )
-  
-  # Always create output tables, even when there are no usable genes.
-  if (length(foreground_entrez) == 0) {
-    go_df <- empty_enrichment_table()
-    kegg_df <- empty_enrichment_table()
-    go_object <- NULL
-    kegg_object <- NULL
-  } else {
-    if (!all(foreground_entrez %in% universe_entrez)) {
-      stop(
-        analysis_label, "/", contrast_name, "/", direction,
-        " contains foreground IDs outside the tested universe."
-      )
-    }
-    
-    go_object <- safe_enrich_go(
-      genes = foreground_entrez,
-      universe = universe_entrez
-    )
-    
-    kegg_object <- safe_enrich_kegg(
-      genes = foreground_entrez,
-      universe = universe_entrez
-    )
-    
-    go_df <- if (is.null(go_object)) {
-      empty_enrichment_table()
-    } else {
-      add_rich_factor(as.data.frame(go_object))
-    }
-    
-    kegg_df <- if (is.null(kegg_object)) {
-      empty_enrichment_table()
-    } else {
-      add_rich_factor(as.data.frame(kegg_object))
-    }
-  }
-  
-  write.csv(
-    go_df,
-    file = file.path(
-      output_dir,
-      paste0(
-        contrast_name,
-        "_",
-        direction_folder,
-        "_GO_BP_enrichment.csv"
-      )
-    ),
-    row.names = FALSE
-  )
-  
-  write.csv(
-    kegg_df,
-    file = file.path(
-      output_dir,
-      paste0(
-        contrast_name,
-        "_",
-        direction_folder,
-        "_KEGG_mouse_enrichment.csv"
-      )
-    ),
-    row.names = FALSE
-  )
-  
-  # GO RichFactor dotplot — same visual structure as the example.
-  if (nrow(go_df) > 0 && "RichFactor" %in% colnames(go_df)) {
-    top_go <- go_df %>%
-      dplyr::arrange(dplyr::desc(RichFactor)) %>%
-      utils::head(top_terms_to_plot) %>%
-      add_rich_group()
-    
-    go_plot <- ggplot2::ggplot(
-      top_go,
-      ggplot2::aes(
-        x = RichFactor,
-        y = reorder(Description, RichFactor),
-        color = RichGroup,
-        size = Count
-      )
-    ) +
-      ggplot2::geom_point(alpha = 0.9) +
-      ggplot2::scale_color_manual(values = three_cols) +
-      ggplot2::labs(
-        title = paste0(
-          contrast_label,
-          " ",
-          direction_title,
-          ": GO Biological Process"
-        ),
-        x = "Rich Factor",
-        y = "GO term",
-        color = "Rich Factor",
-        size = "Gene Count"
-      ) +
-      clean_theme
-    
-    ggplot2::ggsave(
-      filename = file.path(
-        output_dir,
-        paste0(
-          contrast_name,
-          "_",
-          direction_folder,
-          "_GO_RichFactor_dotplot.pdf"
-        )
-      ),
-      plot = go_plot,
-      width = 8,
-      height = 6
-    )
-  } else {
-    cat(
-      contrast_name, " ", direction_title,
-      ": no significant GO BP terms.\n",
-      sep = ""
-    )
-  }
-  
-  # KEGG RichFactor barplot — same visual structure as the example.
-  if (nrow(kegg_df) > 0 && "RichFactor" %in% colnames(kegg_df)) {
-    top_kegg <- kegg_df %>%
-      dplyr::arrange(dplyr::desc(RichFactor)) %>%
-      utils::head(top_terms_to_plot) %>%
-      add_rich_group()
-    
-    kegg_plot <- ggplot2::ggplot(
-      top_kegg,
-      ggplot2::aes(
-        x = RichFactor,
-        y = reorder(Description, RichFactor),
-        fill = RichGroup
-      )
-    ) +
-      ggplot2::geom_col(width = 0.75) +
-      ggplot2::scale_fill_manual(values = three_cols) +
-      ggplot2::labs(
-        title = paste0(
-          contrast_label,
-          " ",
-          direction_title,
-          ": KEGG pathways"
-        ),
-        x = "Rich Factor",
-        y = "KEGG pathway",
-        fill = "Rich Factor"
-      ) +
-      clean_theme
-    
-    ggplot2::ggsave(
-      filename = file.path(
-        output_dir,
-        paste0(
-          contrast_name,
-          "_",
-          direction_folder,
-          "_KEGG_RichFactor_barplot.pdf"
-        )
-      ),
-      plot = kegg_plot,
-      width = 8,
-      height = 6
-    )
-  } else {
-    cat(
-      contrast_name, " ", direction_title,
-      ": no significant KEGG pathways.\n",
-      sep = ""
-    )
-  }
-  
-  summary_row <- data.frame(
-    Analysis = analysis_label,
-    Contrast = contrast_name,
-    Direction = direction,
-    FDR_cutoff = enrichment_fdr_cutoff,
-    Significant_original_genes = nrow(significant_here),
-    Original_genes_with_valid_mouse_input =
-      dplyr::n_distinct(significant_long$GeneID),
-    Original_genes_mapped_and_used =
-      dplyr::n_distinct(mapped_foreground$GeneID),
-    Unique_mouse_Entrez_foreground = length(foreground_entrez),
-    Tested_mouse_Entrez_universe = length(universe_entrez),
-    Significant_GO_BP_terms = nrow(go_df),
-    Significant_KEGG_terms = nrow(kegg_df),
-    stringsAsFactors = FALSE
-  )
-  
-  list(
-    summary = summary_row,
-    all_significant_original_genes = significant_here,
-    audit = gene_flow_audit,
-    exact_mapped_foreground = mapped_foreground,
-    foreground_entrez = foreground_entrez,
-    GO_object = go_object,
-    GO_table = go_df,
-    KEGG_object = kegg_object,
-    KEGG_table = kegg_df
-  )
-}
-
-# =============================================================================
-# 8. RUN ALL REQUESTED ANALYSES, CONTRASTS, AND DIRECTIONS
-# =============================================================================
-
-all_enrichment_results <- list()
-summary_rows <- list()
-summary_counter <- 1L
-
-for (analysis_key in names(analysis_registry)) {
-  analysis_label <- analysis_registry[[analysis_key]]$label
-  results_list <- analysis_registry[[analysis_key]]$results_list
-  
-  all_enrichment_results[[analysis_key]] <- list()
-  
-  for (contrast_name in names(results_list)) {
-    all_enrichment_results[[analysis_key]][[contrast_name]] <- list()
-    
-    for (direction in c(
-      "Increased_in_second_phase",
-      "Decreased_in_second_phase"
-    )) {
-      result_here <- run_direction_enrichment(
-        analysis_label = analysis_label,
-        contrast_name = contrast_name,
-        direction = direction,
-        result_table = results_list[[contrast_name]],
-        selected_mouse_col = selected_mouse_col,
-        selected_key_type = selected_key_type,
-        gene_annotations = gene_annotations,
-        universe_entrez = universe_entrez,
-        output_root = enrichment_output_root
-      )
-      
-      direction_key <- ifelse(
-        direction == "Increased_in_second_phase",
-        "increased_in_second_phase",
-        "decreased_in_second_phase"
-      )
-      
-      all_enrichment_results[[analysis_key]][[contrast_name]][[direction_key]] <-
-        result_here
-      
-      summary_rows[[summary_counter]] <- result_here$summary
-      summary_counter <- summary_counter + 1L
-    }
-  }
-}
-
-enrichment_summary <- dplyr::bind_rows(summary_rows)
-
-write.csv(
-  enrichment_summary,
-  file = file.path(
-    enrichment_output_root,
-    "GO_KEGG_transition_direction_all_contrasts_summary.csv"
-  ),
-  row.names = FALSE
-)
-
-write.table(
-  enrichment_summary,
-  file = file.path(
-    enrichment_output_root,
-    "GO_KEGG_transition_direction_all_contrasts_summary.txt"
-  ),
-  sep = "\t",
-  quote = FALSE,
-  row.names = FALSE
-)
-
-saveRDS(
-  all_enrichment_results,
-  file = file.path(
-    enrichment_output_root,
-    "GO_KEGG_transition_direction_all_contrasts_objects.rds"
-  )
-)
-
-writeLines(
-  capture.output(sessionInfo()),
-  con = file.path(
-    enrichment_output_root,
-    "sessionInfo.txt"
-  )
-)
-
-# =============================================================================
-# 9. FINAL REPORT
-# =============================================================================
-
-cat("\n============================================================\n")
-cat("GO/KEGG TRANSITION-DIRECTION ENRICHMENT COMPLETE\n")
-cat("============================================================\n")
-cat("Analyses run:", paste(names(analysis_registry), collapse = ", "), "\n")
-cat("DEG threshold: FDR <", enrichment_fdr_cutoff, "\n")
-cat("Additional logFC threshold: none\n")
-cat("GO ontology:", go_ontology, "\n")
-cat("Selected mouse annotation column:", selected_mouse_col, "\n")
-cat("Selected mouse identifier key type:", selected_key_type, "\n")
-cat("Tested mouse Entrez universe:", length(universe_entrez), "\n")
-cat("\nSummary:\n")
-print(enrichment_summary, row.names = FALSE)
-cat("\nOutput directory:\n", enrichment_output_root, "\n", sep = "")
-cat(
-  "\nImportant: Equ03 IDs appear only in audit/traceability files. ",
-  "Only mouse Entrez IDs were supplied to GO and KEGG.\n",
-  sep = ""
-)
