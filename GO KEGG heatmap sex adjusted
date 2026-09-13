@@ -3,6 +3,14 @@
 ###############################################################################
 # GO_KEGG_sex_adjusted_warm_cold_heatmap_clusters.R
 #
+# CHANGES IN THIS VERSION
+#   - Uses one enrichment threshold: Benjamini-Hochberg adjusted P < 0.01.
+#   - Passes the same 0.01 cutoff to clusterProfiler pvalueCutoff and
+#     qvalueCutoff, then explicitly filters reported tables on p.adjust < 0.01.
+#   - Writes valid empty enrichment CSVs and skips plots when no terms survive.
+#   - Adds a top-level Warm/Cold x GO:BP/KEGG enrichment outcome summary.
+#   - The 0.01 enrichment threshold matches the rest of the manuscript.
+#
 # PURPOSE
 #   Run GO Biological Process and KEGG enrichment separately for the
 #   warm-enriched and cold-enriched row clusters from the SEX-ADJUSTED
@@ -74,8 +82,8 @@ gene_symbol_column <- "Gene_name"
 exclude_equ03_only_rows <- TRUE
 
 # Enrichment settings
-pvalue_cutoff <- 0.05
-qvalue_cutoff <- 0.10
+# The manuscript reports Benjamini-Hochberg adjusted P < 0.01 throughout.
+enrichment_padj_cutoff <- 0.01
 top_terms_to_plot <- 20L
 
 # =============================================================================
@@ -355,8 +363,33 @@ map_mouse_symbols <- function(symbols) {
     )
 }
 
+empty_enrichment_table <- function() {
+  data.frame(
+    ID = character(),
+    Description = character(),
+    GeneRatio = character(),
+    BgRatio = character(),
+    pvalue = numeric(),
+    p.adjust = numeric(),
+    qvalue = numeric(),
+    geneID = character(),
+    Count = integer(),
+    BackgroundTermGenes = numeric(),
+    RichFactor = numeric(),
+    stringsAsFactors = FALSE
+  )
+}
+
 add_rich_factor <- function(df) {
   if (nrow(df) == 0) {
+    if (!"BackgroundTermGenes" %in% colnames(df)) {
+      df$BackgroundTermGenes <- numeric(0)
+    }
+    
+    if (!"RichFactor" %in% colnames(df)) {
+      df$RichFactor <- numeric(0)
+    }
+    
     return(df)
   }
   
@@ -370,6 +403,23 @@ add_rich_factor <- function(df) {
         )
       ),
       RichFactor = Count / BackgroundTermGenes
+    )
+}
+
+filter_enrichment_by_adjusted_p <- function(
+    df,
+    enrichment_padj_cutoff) {
+  
+  if (!"p.adjust" %in% colnames(df)) {
+    stop(
+      "Enrichment result table is missing the p.adjust column."
+    )
+  }
+  
+  df %>%
+    dplyr::filter(
+      is.finite(p.adjust),
+      p.adjust < enrichment_padj_cutoff
     )
 }
 
@@ -1110,8 +1160,7 @@ run_thermal_cluster_enrichment <- function(
     heatmap_gene_flow_audit,
     universe_entrez,
     output_root,
-    pvalue_cutoff,
-    qvalue_cutoff,
+    enrichment_padj_cutoff,
     top_terms_to_plot) {
   
   cluster_slug <- tolower(
@@ -1156,6 +1205,18 @@ run_thermal_cluster_enrichment <- function(
     unique(
       usable_rows_here$ENTREZID
     )
+  )
+  
+  heatmap_rows_here <- dplyr::n_distinct(
+    all_heatmap_rows_here$GeneID
+  )
+  
+  rows_used_here <- dplyr::n_distinct(
+    usable_rows_here$GeneID
+  )
+  
+  unique_entrez_here <- length(
+    genes_here
   )
   
   write_csv(
@@ -1226,32 +1287,19 @@ run_thermal_cluster_enrichment <- function(
   )
   cat(
     "All heatmap rows:",
-    dplyr::n_distinct(
-      all_heatmap_rows_here$GeneID
-    ),
+    heatmap_rows_here,
     "\n"
   )
   cat(
     "Rows used for enrichment:",
-    dplyr::n_distinct(
-      usable_rows_here$GeneID
-    ),
+    rows_used_here,
     "\n"
   )
   cat(
     "Unique mouse Entrez IDs:",
-    length(genes_here),
+    unique_entrez_here,
     "\n"
   )
-  
-  if (length(genes_here) == 0) {
-    warning(
-      thermal_cluster,
-      " cluster has no usable mapped genes. Enrichment skipped."
-    )
-    
-    return(NULL)
-  }
   
   if (!all(
     genes_here %in% universe_entrez
@@ -1262,46 +1310,74 @@ run_thermal_cluster_enrichment <- function(
     )
   }
   
-  ego <- clusterProfiler::enrichGO(
-    gene = genes_here,
-    universe = universe_entrez,
-    OrgDb = org.Mm.eg.db,
-    keyType = "ENTREZID",
-    ont = "BP",
-    pAdjustMethod = "BH",
-    pvalueCutoff = pvalue_cutoff,
-    qvalueCutoff = qvalue_cutoff,
-    readable = TRUE
-  )
-  
-  ego_df <- add_rich_factor(
-    as.data.frame(ego)
-  )
-  
-  ekegg <- clusterProfiler::enrichKEGG(
-    gene = genes_here,
-    universe = universe_entrez,
-    organism = "mmu",
-    keyType = "ncbi-geneid",
-    pvalueCutoff = pvalue_cutoff,
-    pAdjustMethod = "BH",
-    qvalueCutoff = qvalue_cutoff
-  )
-  
-  if (nrow(
-    as.data.frame(ekegg)
-  ) > 0) {
-    ekegg <- clusterProfiler::setReadable(
-      ekegg,
+  if (length(genes_here) == 0) {
+    warning(
+      thermal_cluster,
+      " cluster has no usable mapped genes. Enrichment skipped."
+    )
+    
+    ego <- NULL
+    ekegg <- NULL
+    ego_df <- empty_enrichment_table()
+    ekegg_df <- empty_enrichment_table()
+  } else {
+    ego <- clusterProfiler::enrichGO(
+      gene = genes_here,
+      universe = universe_entrez,
       OrgDb = org.Mm.eg.db,
-      keyType = "ENTREZID"
+      keyType = "ENTREZID",
+      ont = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff = enrichment_padj_cutoff,
+      qvalueCutoff = enrichment_padj_cutoff,
+      readable = TRUE
+    )
+    
+    ego_df <- add_rich_factor(
+      as.data.frame(ego)
+    )
+    
+    # Do not rely solely on clusterProfiler's internal cutoff behaviour.
+    # All reported GO results use BH adjusted P < enrichment_padj_cutoff.
+    ego_df <- filter_enrichment_by_adjusted_p(
+      ego_df,
+      enrichment_padj_cutoff = enrichment_padj_cutoff
+    )
+    
+    ekegg <- clusterProfiler::enrichKEGG(
+      gene = genes_here,
+      universe = universe_entrez,
+      organism = "mmu",
+      keyType = "ncbi-geneid",
+      pvalueCutoff = enrichment_padj_cutoff,
+      pAdjustMethod = "BH",
+      qvalueCutoff = enrichment_padj_cutoff
+    )
+    
+    if (nrow(
+      as.data.frame(ekegg)
+    ) > 0) {
+      ekegg <- clusterProfiler::setReadable(
+        ekegg,
+        OrgDb = org.Mm.eg.db,
+        keyType = "ENTREZID"
+      )
+    }
+    
+    ekegg_df <- add_rich_factor(
+      as.data.frame(ekegg)
+    )
+    
+    # All reported KEGG results use the same explicit BH-adjusted threshold.
+    ekegg_df <- filter_enrichment_by_adjusted_p(
+      ekegg_df,
+      enrichment_padj_cutoff = enrichment_padj_cutoff
     )
   }
   
-  ekegg_df <- add_rich_factor(
-    as.data.frame(ekegg)
-  )
-  
+  # Only the explicitly filtered tables below are used for CSV output,
+  # plotting, significant-term counts, and top-term reporting. The raw
+  # clusterProfiler objects are retained solely in the returned result list.
   write_csv(
     ego_df,
     file.path(
@@ -1380,7 +1456,9 @@ run_thermal_cluster_enrichment <- function(
   } else {
     cat(
       thermal_cluster,
-      " cluster: no significant GO BP terms.\n",
+      " cluster: no GO BP terms at BH adjusted P < ",
+      enrichment_padj_cutoff,
+      "\n",
       sep = ""
     )
   }
@@ -1439,10 +1517,67 @@ run_thermal_cluster_enrichment <- function(
   } else {
     cat(
       thermal_cluster,
-      " cluster: no significant KEGG pathways.\n",
+      " cluster: no KEGG pathways at BH adjusted P < ",
+      enrichment_padj_cutoff,
+      "\n",
       sep = ""
     )
   }
+  
+  go_best_index <- if (nrow(ego_df) > 0) {
+    which.min(ego_df$p.adjust)
+  } else {
+    integer(0)
+  }
+  
+  kegg_best_index <- if (nrow(ekegg_df) > 0) {
+    which.min(ekegg_df$p.adjust)
+  } else {
+    integer(0)
+  }
+  
+  summary_table <- dplyr::bind_rows(
+    data.frame(
+      ThermalCluster = thermal_cluster,
+      Database = "GO:BP",
+      HeatmapRows = heatmap_rows_here,
+      RowsUsedForEnrichment = rows_used_here,
+      UniqueMouseEntrezIDs = unique_entrez_here,
+      Threshold = enrichment_padj_cutoff,
+      N_significant_terms = nrow(ego_df),
+      Top_term = if (length(go_best_index) == 1) {
+        as.character(ego_df$Description[go_best_index])
+      } else {
+        NA_character_
+      },
+      Top_term_FDR = if (length(go_best_index) == 1) {
+        as.numeric(ego_df$p.adjust[go_best_index])
+      } else {
+        NA_real_
+      },
+      stringsAsFactors = FALSE
+    ),
+    data.frame(
+      ThermalCluster = thermal_cluster,
+      Database = "KEGG",
+      HeatmapRows = heatmap_rows_here,
+      RowsUsedForEnrichment = rows_used_here,
+      UniqueMouseEntrezIDs = unique_entrez_here,
+      Threshold = enrichment_padj_cutoff,
+      N_significant_terms = nrow(ekegg_df),
+      Top_term = if (length(kegg_best_index) == 1) {
+        as.character(ekegg_df$Description[kegg_best_index])
+      } else {
+        NA_character_
+      },
+      Top_term_FDR = if (length(kegg_best_index) == 1) {
+        as.numeric(ekegg_df$p.adjust[kegg_best_index])
+      } else {
+        NA_real_
+      },
+      stringsAsFactors = FALSE
+    )
+  )
   
   list(
     ThermalCluster = thermal_cluster,
@@ -1451,7 +1586,8 @@ run_thermal_cluster_enrichment <- function(
     GO = ego,
     GO_table = ego_df,
     KEGG = ekegg,
-    KEGG_table = ekegg_df
+    KEGG_table = ekegg_df,
+    summary = summary_table
   )
 }
 
@@ -1473,14 +1609,41 @@ enrichment_results <- lapply(
       heatmap_gene_flow_audit = heatmap_gene_flow_audit,
       universe_entrez = universe_entrez,
       output_root = output_root,
-      pvalue_cutoff = pvalue_cutoff,
-      qvalue_cutoff = qvalue_cutoff,
+      enrichment_padj_cutoff = enrichment_padj_cutoff,
       top_terms_to_plot = top_terms_to_plot
     )
   }
 )
 
 names(enrichment_results) <- thermal_clusters_to_analyse
+
+enrichment_outcome_summary <- dplyr::bind_rows(
+  lapply(
+    enrichment_results,
+    function(x) {
+      x$summary
+    }
+  )
+)
+
+write_csv(
+  enrichment_outcome_summary,
+  file.path(
+    output_root,
+    "warm_cold_GO_KEGG_enrichment_outcome_summary.csv"
+  )
+)
+
+cat(
+  "\nENRICHMENT OUTCOME SUMMARY AT BH ADJUSTED P < ",
+  enrichment_padj_cutoff,
+  "\n",
+  sep = ""
+)
+print(
+  enrichment_outcome_summary,
+  row.names = FALSE
+)
 
 # =============================================================================
 # 12. SAVE OBJECTS AND SESSION INFORMATION
@@ -1538,6 +1701,11 @@ cat(
 cat(
   "Equ03-only rows excluded:",
   exclude_equ03_only_rows,
+  "\n"
+)
+cat(
+  "GO/KEGG manuscript threshold: BH adjusted P <",
+  enrichment_padj_cutoff,
   "\n"
 )
 cat("\nCluster-specific input counts:\n")
