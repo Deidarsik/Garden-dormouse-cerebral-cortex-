@@ -1,0 +1,279 @@
+#!/usr/bin/env Rscript
+
+# =============================================================================
+# Warm vs cold DE genes: ortholog assignment analysis + Fisher's exact test
+# =============================================================================
+# Reports, for the genes upregulated and downregulated in the cold phase,
+# how many have an assigned 1:1 mouse ortholog, and tests whether the two
+# proportions differ.
+#
+# The contrast direction is read from the heatmap row-cluster summary, so the
+# groups are labelled Cold-upregulated / Cold-downregulated automatically
+# rather than by assumption.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+})
+
+# -----------------------------------------------------------------------------
+# 1. Paths
+# -----------------------------------------------------------------------------
+
+base_dir <- "~/Desktop/EQU.03"
+
+heatmap_dir <- file.path(base_dir, "warm_vs_cold_sex_adjusted")
+
+de_file <- file.path(
+  heatmap_dir,
+  "FDR_lt_1e-2_warm_vs_cold_sex_adjusted_full_results.txt"
+)
+
+ann_file <- file.path(base_dir, "20251016_Equ03_CDS_Mmu_genes.txt")
+
+# Used only to confirm the direction of logFC. Optional: if absent, the script
+# falls back to asking you to confirm manually.
+cluster_assignment_file <- file.path(
+  heatmap_dir,
+  "FDR_lt_1e-2_row_cluster_assignments.txt"
+)
+
+cluster_summary_file <- file.path(
+  heatmap_dir,
+  "FDR_lt_1e-2_row_cluster_summary.txt"
+)
+
+output_dir <- heatmap_dir
+
+fdr_cutoff <- 0.01
+
+for (f in c(de_file, ann_file)) {
+  if (!file.exists(f)) stop("File not found:\n", f)
+}
+
+# -----------------------------------------------------------------------------
+# 2. Read data
+# -----------------------------------------------------------------------------
+
+de <- read.delim(de_file, stringsAsFactors = FALSE, check.names = FALSE)
+ann <- read.delim(ann_file, stringsAsFactors = FALSE, check.names = FALSE)
+
+if (!"GeneID" %in% names(ann)) names(ann)[1] <- "GeneID"
+
+required_de <- c("GeneID", "FDR", "logFC")
+missing_de <- setdiff(required_de, names(de))
+if (length(missing_de)) {
+  stop("DE file missing column(s): ", paste(missing_de, collapse = ", "))
+}
+
+if (!"Target_gene" %in% names(ann)) {
+  stop("Annotation file has no Target_gene column. Columns: ",
+       paste(names(ann), collapse = ", "))
+}
+
+# -----------------------------------------------------------------------------
+# 3. Significant genes
+# -----------------------------------------------------------------------------
+
+sig <- de %>%
+  dplyr::filter(!is.na(FDR), FDR < fdr_cutoff, !is.na(logFC), logFC != 0) %>%
+  dplyr::distinct(GeneID, .keep_all = TRUE)
+
+n_pos <- sum(sig$logFC > 0)
+n_neg <- sum(sig$logFC < 0)
+
+cat("\n============================================================\n")
+cat("SIGNIFICANT WARM/COLD GENES (FDR <", fdr_cutoff, ")\n")
+cat("============================================================\n")
+cat("Total:", nrow(sig), "\n")
+cat("Positive logFC:", n_pos, "\n")
+cat("Negative logFC:", n_neg, "\n")
+
+# -----------------------------------------------------------------------------
+# 4. Determine which sign of logFC means "higher in the cold"
+# -----------------------------------------------------------------------------
+#
+# The heatmap cluster summary contains a WarmMinusCold column per row cluster.
+# By joining cluster membership to the DE table, the sign of logFC in the
+# cold-enriched cluster tells us which sign corresponds to cold-upregulated.
+
+cold_up_sign <- NA_integer_
+direction_source <- "not determined"
+
+if (file.exists(cluster_assignment_file) && file.exists(cluster_summary_file)) {
+  
+  clust <- read.delim(cluster_assignment_file, stringsAsFactors = FALSE,
+                      check.names = FALSE)
+  csum  <- read.delim(cluster_summary_file, stringsAsFactors = FALSE,
+                      check.names = FALSE)
+  
+  if (all(c("GeneID", "RowCluster") %in% names(clust)) &&
+      all(c("RowCluster", "WarmMinusCold") %in% names(csum))) {
+    
+    cold_cluster <- csum$RowCluster[which.min(csum$WarmMinusCold)]
+    
+    cold_genes <- clust$GeneID[clust$RowCluster == cold_cluster]
+    
+    median_lfc_cold <- median(
+      sig$logFC[sig$GeneID %in% cold_genes],
+      na.rm = TRUE
+    )
+    
+    if (is.finite(median_lfc_cold) && median_lfc_cold != 0) {
+      cold_up_sign <- sign(median_lfc_cold)
+      direction_source <- "heatmap row-cluster summary"
+    }
+  }
+}
+
+if (is.na(cold_up_sign)) {
+  warning(
+    "Could not determine the contrast direction automatically. ",
+    "Assuming positive logFC = higher in the cold. VERIFY THIS."
+  )
+  cold_up_sign <- 1L
+  direction_source <- "ASSUMED - verify manually"
+}
+
+cat("\nContrast direction determined from:", direction_source, "\n")
+cat("Higher in the cold corresponds to logFC",
+    if (cold_up_sign > 0) "> 0" else "< 0", "\n")
+
+sig$Direction <- ifelse(
+  sign(sig$logFC) == cold_up_sign,
+  "Cold_upregulated",
+  "Cold_downregulated"
+)
+
+cat("\nGroup sizes:\n")
+print(table(sig$Direction))
+
+# -----------------------------------------------------------------------------
+# 5. Add ortholog assignment
+# -----------------------------------------------------------------------------
+
+ann_use <- ann[!duplicated(ann$GeneID), c("GeneID", "Target_gene")]
+
+sig <- merge(sig, ann_use, by = "GeneID", all.x = TRUE, sort = FALSE)
+
+sig$HasOrtholog <- !is.na(sig$Target_gene) &
+  trimws(as.character(sig$Target_gene)) != ""
+
+# -----------------------------------------------------------------------------
+# 6. Contingency table, percentages, Fisher test
+# -----------------------------------------------------------------------------
+
+sig$Direction <- factor(
+  sig$Direction,
+  levels = c("Cold_upregulated", "Cold_downregulated")
+)
+
+tab <- table(Direction = sig$Direction, HasOrtholog = sig$HasOrtholog)
+
+cat("\n============================================================\n")
+cat("ORTHOLOG COUNTS\n")
+cat("============================================================\n")
+print(tab)
+
+cat("\nPercentages within each group:\n")
+print(round(100 * prop.table(tab, 1), 1))
+
+fisher_result <- NULL
+if (all(dim(tab) == c(2, 2))) {
+  fisher_result <- fisher.test(tab, alternative = "two.sided")
+  cat("\n============================================================\n")
+  cat("FISHER'S EXACT TEST\n")
+  cat("============================================================\n")
+  print(fisher_result)
+} else {
+  warning("Contingency table is not 2 x 2; Fisher test not performed.")
+}
+
+# -----------------------------------------------------------------------------
+# 7. Summary table
+# -----------------------------------------------------------------------------
+
+summarise_group <- function(group_name) {
+  x <- sig[sig$Direction == group_name, , drop = FALSE]
+  n <- nrow(x)
+  with_orth <- sum(x$HasOrtholog)
+  data.frame(
+    Direction = group_name,
+    Total_genes = n,
+    With_ortholog = with_orth,
+    With_ortholog_pct = if (n > 0) round(100 * with_orth / n, 1) else NA_real_,
+    Without_ortholog = n - with_orth,
+    Without_ortholog_pct = if (n > 0) round(100 * (n - with_orth) / n, 1) else NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+
+summary_df <- rbind(
+  summarise_group("Cold_upregulated"),
+  summarise_group("Cold_downregulated")
+)
+
+cat("\n============================================================\n")
+cat("SUMMARY\n")
+cat("============================================================\n")
+print(summary_df, row.names = FALSE)
+
+write.csv(
+  summary_df,
+  file.path(output_dir, "warm_cold_ortholog_summary_by_direction.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  sig[, c("GeneID", "logFC", "FDR", "Direction", "Target_gene", "HasOrtholog")],
+  file.path(output_dir, "warm_cold_significant_genes_with_ortholog_status.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------------------------------------------------------
+# 8. Manuscript sentence, filled in
+# -----------------------------------------------------------------------------
+
+if (!is.null(fisher_result)) {
+  
+  up   <- summary_df[summary_df$Direction == "Cold_upregulated", ]
+  down <- summary_df[summary_df$Direction == "Cold_downregulated", ]
+  
+  p_txt <- if (fisher_result$p.value < 1e-4) {
+    format(fisher_result$p.value, digits = 2, scientific = TRUE)
+  } else {
+    format(round(fisher_result$p.value, 4), scientific = FALSE)
+  }
+  
+  cat("\n============================================================\n")
+  cat("SENTENCE FOR THE MANUSCRIPT\n")
+  cat("============================================================\n\n")
+  
+  cat(sprintf(
+    paste0(
+      "A prominent cluster of genes (n = %d) was upregulated during the cold\n",
+      "phase of torpor (Fig. 1D). Only %d of these %d genes (%.1f%%) had an\n",
+      "assigned one-to-one Mus musculus protein-coding ortholog, compared with\n",
+      "%d of %d (%.1f%%) of the genes downregulated in the cold (Fisher exact\n",
+      "test, P = %s).\n\n"
+    ),
+    up$Total_genes,
+    up$With_ortholog, up$Total_genes, up$With_ortholog_pct,
+    down$With_ortholog, down$Total_genes, down$With_ortholog_pct,
+    p_txt
+  ))
+  
+  cat("Genes WITHOUT an ortholog assignment:\n")
+  cat(sprintf("  cold-upregulated:   %d/%d (%.1f%%)\n",
+              up$Without_ortholog, up$Total_genes, up$Without_ortholog_pct))
+  cat(sprintf("  cold-downregulated: %d/%d (%.1f%%)\n\n",
+              down$Without_ortholog, down$Total_genes, down$Without_ortholog_pct))
+  
+  cat("Compare with the pairwise contrasts reported in the manuscript:\n")
+  cat("  TE to TL, genes that decreased:  55.8% had an ortholog\n")
+  cat("  AL to TE, genes that increased:  79.3% had an ortholog\n")
+  cat("If the cold-upregulated percentage above is below 55.8%, the depletion\n")
+  cat("is indeed stronger than in either pairwise stage contrast.\n")
+}
+
+cat("\nOutput written to:\n", normalizePath(output_dir), "\n", sep = "")
