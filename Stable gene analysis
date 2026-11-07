@@ -2110,97 +2110,196 @@ if (run_permutation_check) {
 }
 
 # =============================================================================
-# 14. FIGURES
+# 14. FIGURES  (same style and size as the other manuscript figures)
 # =============================================================================
 
 hdr("9. Figures")
 
+##############################################################
+# FIGURE STYLE  (this block is identical in all figure scripts)
+#
+# All figures share the same canvas size and font sizes, so the
+# text looks identical in every figure. If you change a number
+# here, change it in the other four scripts too so all figures match.
+##############################################################
+
+FIG_WIDTH  <- 10.0   # inches (journal will scale to page width)
+FIG_HEIGHT <- 8.0    # inches
+FIG_DPI    <- 600
+FIG_FONT   <- "sans" # Helvetica/Arial
+
+FS <- list(          # font sizes in points
+  title        = 28,
+  axis_title   = 25,
+  axis_text    = 22,
+  legend_title = 22,
+  legend_text  = 22
+)
+
+LINE_WIDTH <- 1.0    # axis lines and ticks
+
+theme_pub <- function() {
+  ggplot2::theme_classic(base_size = FS$axis_text, base_family = FIG_FONT) +
+    ggplot2::theme(
+      plot.title   = ggplot2::element_text(size = FS$title, face = "bold", hjust = 0.5),
+      axis.title   = ggplot2::element_text(size = FS$axis_title),
+      axis.text    = ggplot2::element_text(size = FS$axis_text, colour = "black"),
+      axis.line    = ggplot2::element_line(linewidth = LINE_WIDTH, colour = "black"),
+      axis.ticks   = ggplot2::element_line(linewidth = LINE_WIDTH, colour = "black"),
+      legend.title = ggplot2::element_text(size = FS$legend_title, face = "bold"),
+      legend.text  = ggplot2::element_text(size = FS$legend_text),
+      legend.key   = ggplot2::element_blank(),
+      plot.margin  = ggplot2::margin(6, 6, 6, 6)
+    )
+}
+
+gp_title        <- grid::gpar(fontsize = FS$title,        fontface = "bold", fontfamily = FIG_FONT)
+gp_axis_title   <- grid::gpar(fontsize = FS$axis_title,   fontfamily = FIG_FONT)
+gp_legend_title <- grid::gpar(fontsize = FS$legend_title, fontface = "bold", fontfamily = FIG_FONT)
+gp_legend_text  <- grid::gpar(fontsize = FS$legend_text,  fontfamily = FIG_FONT)
+
+# Saves a figure as PDF (vector) + PNG + TIFF (600 dpi).
+# fig: a ggplot, a grid grob/gtable, or a function that draws the figure.
+# path_no_ext: full file path WITHOUT extension.
+save_figure <- function(fig, path_no_ext,
+                        width = FIG_WIDTH, height = FIG_HEIGHT,
+                        formats = c("pdf", "png", "tiff")) {
+  draw_fig <- function() {
+    if (inherits(fig, "ggplot")) {
+      print(fig)
+    } else if (is.function(fig)) {
+      fig()
+    } else {
+      grid::grid.newpage()
+      grid::grid.draw(fig)
+    }
+  }
+  if ("pdf" %in% formats) {
+    pdf_file <- paste0(path_no_ext, ".pdf")
+    if (isTRUE(capabilities("cairo"))) {
+      grDevices::cairo_pdf(pdf_file, width = width, height = height, family = FIG_FONT)
+    } else {
+      grDevices::pdf(pdf_file, width = width, height = height,
+                     family = "Helvetica", useDingbats = FALSE)
+    }
+    draw_fig()
+    grDevices::dev.off()
+  }
+  if ("png" %in% formats) {
+    grDevices::png(paste0(path_no_ext, ".png"), width = width, height = height,
+                   units = "in", res = FIG_DPI, bg = "white")
+    draw_fig()
+    grDevices::dev.off()
+  }
+  if ("tiff" %in% formats) {
+    grDevices::tiff(paste0(path_no_ext, ".tiff"), width = width, height = height,
+                    units = "in", res = FIG_DPI, compression = "lzw", bg = "white")
+    draw_fig()
+    grDevices::dev.off()
+  }
+  message("Saved: ", path_no_ext, " (", paste(formats, collapse = ", "), "), ",
+          width, " x ", height, " in, ", FIG_DPI, " dpi")
+  invisible(path_no_ext)
+}
+
+##############################################################
+# END OF FIGURE STYLE
+##############################################################
+
+# --- GO dot-plot settings -----------------------------------------------------
+plot_top_n    <- 10   # GO terms shown per panel (fewer terms = larger, readable labels)
+label_wrap_at <- 38   # characters per line before a GO term name wraps
+
+short_stat_label <- switch(
+  primary_ranking_statistic,
+  stage_F            = "stage F",
+  corrected_variance = "between-stage variance"
+)
+
 fdr_axis <- function(p) pmin(-log10(pmax(p, fgsea_eps)), -log10(fgsea_eps))
 
+wrap_label <- function(x, width = label_wrap_at) {
+  vapply(x, function(s) paste(strwrap(s, width = width), collapse = "\n"),
+         character(1), USE.NAMES = FALSE)
+}
+
 empty_panel <- function(msg) {
-  ggplot() + annotate("text", x = 0, y = 0, label = msg, size = 4) +
-    theme_void(base_size = 12)
+  ggplot() +
+    annotate("text", x = 0, y = 0, label = msg,
+             size = FS$axis_title / .pt, family = FIG_FONT) +
+    theme_void()
 }
 
 prep_plot_df <- function(df, n_show) {
   if (!nrow(df)) return(df)
   df <- df[order(df$padj_primary_global, df$pval), ]
   df <- head(df, n_show)
-  df$label <- make.unique(clean_go_name(df$pathway))
+  df$label <- make.unique(wrap_label(clean_go_name(df$pathway)))
   df$neglog10_fdr <- fdr_axis(df$padj_primary_global)
   df$label <- factor(df$label, levels = rev(df$label))
   df
 }
 
-single_panel <- function(df, title_text) {
-  if (!nrow(df)) return(empty_panel("No terms reached the joint primary FDR threshold."))
-  ggplot(df, aes(x = neglog10_fdr, y = label)) +
-    geom_segment(aes(x = 0, xend = neglog10_fdr, y = label, yend = label),
-                 colour = "grey75") +
-    geom_point(aes(size = size), colour = "grey20") +
-    geom_vline(xintercept = -log10(fdr_cutoff), linetype = "dashed") +
-    scale_size_continuous(name = "Genes in term\n(within universe)") +
-    theme_classic(base_size = 11) +
-    theme(plot.title = element_text(size = 11)) +
-    labs(title = title_text,
-         subtitle = paste0("Benjamini-Hochberg adjusted P calculated JOINTLY over ",
-                           "the stable and variable primary analyses; dashed line = FDR ",
-                           fdr_cutoff, ". Values floored at 1e-", -log10(fgsea_eps), "."),
-         x = expression(-log[10]*"(joint primary adjusted P)"), y = NULL)
-}
+df_stable_plot   <- prep_plot_df(collapsed_stable,   plot_top_n)
+df_variable_plot <- prep_plot_df(collapsed_variable, plot_top_n)
 
-df_stable_plot   <- prep_plot_df(collapsed_stable,   top_n_plot)
-df_variable_plot <- prep_plot_df(collapsed_variable, top_n_plot)
-
-p_stable <- single_panel(
-  df_stable_plot,
-  paste0("GO terms enriched among genes with relatively low ", stat_label))
-p_variable <- single_panel(
-  df_variable_plot,
-  paste0("GO terms enriched among genes with relatively high ", stat_label))
-
-ggsave(file.path(outdir, "figure_primary_stable_neglog10FDR.pdf"),
-       p_stable, width = 9, height = 5.5)
-ggsave(file.path(outdir, "figure_primary_variable_neglog10FDR.pdf"),
-       p_variable, width = 9, height = 5.5)
-
-stable_panel_label   <- paste0("Relatively low ", stat_label)
-variable_panel_label <- paste0("Relatively high ", stat_label)
-
-comb <- rbind(
-  if (nrow(df_stable_plot)) transform(
-    df_stable_plot[, c("pathway", "size", "neglog10_fdr")],
-    panel = stable_panel_label) else NULL,
-  if (nrow(df_variable_plot)) transform(
-    df_variable_plot[, c("pathway", "size", "neglog10_fdr")],
-    panel = variable_panel_label) else NULL
+# Shared x-axis and dot-size scale so both panels can be compared directly
+all_plot_rows <- rbind(
+  if (nrow(df_stable_plot))   df_stable_plot[,   c("neglog10_fdr", "size")] else NULL,
+  if (nrow(df_variable_plot)) df_variable_plot[, c("neglog10_fdr", "size")] else NULL
 )
-
-if (!is.null(comb) && nrow(comb)) {
-  comb$panel <- factor(comb$panel,
-                       levels = c(stable_panel_label, variable_panel_label))
-  comb$plot_key <- paste(clean_go_name(comb$pathway), comb$panel, sep = "___")
-  comb <- comb[order(comb$panel, comb$neglog10_fdr), ]
-  comb$plot_key <- factor(comb$plot_key, levels = unique(comb$plot_key))
-  p_comb <- ggplot(comb, aes(x = neglog10_fdr, y = plot_key)) +
-    geom_segment(aes(x = 0, xend = neglog10_fdr, y = plot_key, yend = plot_key),
-                 colour = "grey75") +
-    geom_point(aes(size = size), colour = "grey20") +
-    geom_vline(xintercept = -log10(fdr_cutoff), linetype = "dashed") +
-    facet_wrap(~panel, ncol = 1, scales = "free_y") +
-    scale_y_discrete(labels = function(x) sub("___.*$", "", x)) +
-    scale_size_continuous(name = "Genes in term") +
-    theme_classic(base_size = 10) +
-    labs(title = paste0("GO biological process terms at the two ends of the ",
-                        stat_label, " ranking"),
-         subtitle = paste0("Two one-sided fgsea analyses on the ", stat_label,
-                           " ranking and its exact reverse; ",
-                           "Benjamini-Hochberg adjusted P calculated jointly over both."),
-         x = expression(-log[10]*"(joint primary adjusted P)"), y = NULL)
+x_max_shared <- max(c(-log10(fdr_cutoff), all_plot_rows$neglog10_fdr), na.rm = TRUE) * 1.05
+size_limits_shared <- if (!is.null(all_plot_rows) && nrow(all_plot_rows)) {
+  range(all_plot_rows$size)
 } else {
-  p_comb <- empty_panel("No terms reached the joint primary FDR threshold.")
+  NULL
 }
-ggsave(file.path(outdir, "figure_primary_combined.pdf"), p_comb, width = 9.5, height = 10)
+
+single_panel <- function(df, title_text) {
+  if (!nrow(df)) return(empty_panel("No significant GO terms"))
+  ggplot(df, aes(x = neglog10_fdr, y = label)) +
+    geom_segment(aes(x = 0, xend = neglog10_fdr, yend = label),
+                 colour = "grey70", linewidth = LINE_WIDTH * 1.5) +
+    geom_point(aes(size = size), colour = "grey20") +
+    geom_vline(xintercept = -log10(fdr_cutoff), linetype = "dashed",
+               linewidth = LINE_WIDTH) +
+    scale_size_continuous(name = "Genes", range = c(3, 9),
+                          limits = size_limits_shared) +
+    scale_x_continuous(limits = c(0, x_max_shared),
+                       expand = expansion(mult = c(0, 0.02))) +
+    labs(title = title_text, x = expression(-log[10]~"FDR"), y = NULL) +
+    theme_pub() +
+    theme(
+      axis.text.y         = element_text(size = FS$axis_text, lineheight = 0.85),
+      plot.title.position = "plot"
+    )
+}
+
+p_stable   <- single_panel(df_stable_plot,
+                           paste0("Stable genes (lowest ", short_stat_label, ")"))
+p_variable <- single_panel(df_variable_plot,
+                           paste0("Variable genes (highest ", short_stat_label, ")"))
+
+save_figure(p_stable,   file.path(outdir, "figure_primary_stable_neglog10FDR"))
+save_figure(p_variable, file.path(outdir, "figure_primary_variable_neglog10FDR"))
+
+# Combined figure: the two standard-size panels stacked, left edges aligned
+g_stable   <- ggplotGrob(p_stable)
+g_variable <- ggplotGrob(p_variable)
+if (length(g_stable$widths) == length(g_variable$widths)) {
+  shared_widths <- grid::unit.pmax(g_stable$widths, g_variable$widths)
+  g_stable$widths   <- shared_widths
+  g_variable$widths <- shared_widths
+}
+p_comb <- gridExtra::arrangeGrob(g_stable, g_variable, ncol = 1)
+
+save_figure(p_comb, file.path(outdir, "figure_primary_combined"),
+            height = 2 * FIG_HEIGHT)
+
+report("GO figures saved as PDF + PNG + TIFF (", FIG_WIDTH, " x ", FIG_HEIGHT,
+       " in, ", FIG_DPI, " dpi; combined figure ", 2 * FIG_HEIGHT, " in tall)")
+
+
 
 # =============================================================================
 # 15. PROVENANCE, SESSION INFO, FILE CHECK
