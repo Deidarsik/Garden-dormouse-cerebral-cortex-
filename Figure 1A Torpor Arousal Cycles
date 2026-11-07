@@ -1,5 +1,105 @@
 #!/usr/bin/env Rscript
+# =============================================================================
+# 5_torpor_arousal_cycle.R
+#
+# Figure: schematic body-temperature cycle, saved as PDF + PNG + TIFF (600 dpi)
+# =============================================================================
+
 library(ggplot2)
+library(grid)
+
+##############################################################
+# FIGURE STYLE  (this block is identical in all five scripts)
+#
+# Every figure is drawn at its FINAL printed size, so the font
+# sizes below are the real sizes on paper. If you change a number
+# here, change it in the other four scripts too so all figures match.
+##############################################################
+
+FIG_WIDTH  <- 7.0    # inches (about 178 mm = full page width)
+FIG_HEIGHT <- 6.0    # inches
+FIG_DPI    <- 600
+FIG_FONT   <- "sans" # Helvetica/Arial
+
+FS <- list(          # font sizes in points
+  title        = 16,
+  axis_title   = 14,
+  axis_text    = 13,
+  legend_title = 13,
+  legend_text  = 13
+)
+
+LINE_WIDTH <- 0.7    # axis lines and ticks
+
+theme_pub <- function() {
+  ggplot2::theme_classic(base_size = FS$axis_text, base_family = FIG_FONT) +
+    ggplot2::theme(
+      plot.title   = ggplot2::element_text(size = FS$title, face = "bold", hjust = 0.5),
+      axis.title   = ggplot2::element_text(size = FS$axis_title),
+      axis.text    = ggplot2::element_text(size = FS$axis_text, colour = "black"),
+      axis.line    = ggplot2::element_line(linewidth = LINE_WIDTH, colour = "black"),
+      axis.ticks   = ggplot2::element_line(linewidth = LINE_WIDTH, colour = "black"),
+      legend.title = ggplot2::element_text(size = FS$legend_title, face = "bold"),
+      legend.text  = ggplot2::element_text(size = FS$legend_text),
+      legend.key   = ggplot2::element_blank(),
+      plot.margin  = ggplot2::margin(6, 6, 6, 6)
+    )
+}
+
+gp_title        <- grid::gpar(fontsize = FS$title,        fontface = "bold", fontfamily = FIG_FONT)
+gp_axis_title   <- grid::gpar(fontsize = FS$axis_title,   fontfamily = FIG_FONT)
+gp_legend_title <- grid::gpar(fontsize = FS$legend_title, fontface = "bold", fontfamily = FIG_FONT)
+gp_legend_text  <- grid::gpar(fontsize = FS$legend_text,  fontfamily = FIG_FONT)
+
+# Saves a figure as PDF (vector) + PNG + TIFF (600 dpi).
+# fig: a ggplot, a grid grob/gtable, or a function that draws the figure.
+# path_no_ext: full file path WITHOUT extension.
+save_figure <- function(fig, path_no_ext,
+                        width = FIG_WIDTH, height = FIG_HEIGHT,
+                        formats = c("pdf", "png", "tiff")) {
+  draw_fig <- function() {
+    if (inherits(fig, "ggplot")) {
+      print(fig)
+    } else if (is.function(fig)) {
+      fig()
+    } else {
+      grid::grid.newpage()
+      grid::grid.draw(fig)
+    }
+  }
+  if ("pdf" %in% formats) {
+    pdf_file <- paste0(path_no_ext, ".pdf")
+    if (isTRUE(capabilities("cairo"))) {
+      grDevices::cairo_pdf(pdf_file, width = width, height = height, family = FIG_FONT)
+    } else {
+      grDevices::pdf(pdf_file, width = width, height = height,
+                     family = "Helvetica", useDingbats = FALSE)
+    }
+    draw_fig()
+    grDevices::dev.off()
+  }
+  if ("png" %in% formats) {
+    grDevices::png(paste0(path_no_ext, ".png"), width = width, height = height,
+                   units = "in", res = FIG_DPI, bg = "white")
+    draw_fig()
+    grDevices::dev.off()
+  }
+  if ("tiff" %in% formats) {
+    grDevices::tiff(paste0(path_no_ext, ".tiff"), width = width, height = height,
+                    units = "in", res = FIG_DPI, compression = "lzw", bg = "white")
+    draw_fig()
+    grDevices::dev.off()
+  }
+  message("Saved: ", path_no_ext, " (", paste(formats, collapse = ", "), "), ",
+          width, " x ", height, " in, ", FIG_DPI, " dpi")
+  invisible(path_no_ext)
+}
+
+##############################################################
+# END OF FIGURE STYLE
+##############################################################
+
+output_dir <- "/Users/adrian/Desktop/EQU.03"
 
 x <- seq(0, 20, length.out = 2000)
 
@@ -8,33 +108,23 @@ low_temp      <- 5
 high_duration <- 2.4
 low_duration  <- 5.4
 period        <- high_duration + low_duration
-
-transition <- 0.15   # width of each smooth edge in days
+transition    <- 0.15   # width of each smooth edge in days
 
 t_mod <- x %% period
-
 y <- numeric(length(x))
 
 for (i in seq_along(t_mod)) {
   t <- t_mod[i]
-  
   if (t < (high_duration - transition)) {
-    # flat high plateau
-    y[i] <- high_temp
-    
+    y[i] <- high_temp                                        # high plateau
   } else if (t < high_duration) {
-    # smooth fall from high to low
-    u <- (t - (high_duration - transition)) / transition
-    s <- 0.5 - 0.5 * cos(pi * u)   # smooth cosine easing
+    u <- (t - (high_duration - transition)) / transition     # smooth fall
+    s <- 0.5 - 0.5 * cos(pi * u)
     y[i] <- high_temp + (low_temp - high_temp) * s
-    
   } else if (t < (period - transition)) {
-    # flat low plateau
-    y[i] <- low_temp
-    
+    y[i] <- low_temp                                         # low plateau
   } else {
-    # smooth rise from low to high
-    u <- (t - (period - transition)) / transition
+    u <- (t - (period - transition)) / transition            # smooth rise
     s <- 0.5 - 0.5 * cos(pi * u)
     y[i] <- low_temp + (high_temp - low_temp) * s
   }
@@ -44,25 +134,11 @@ df <- data.frame(Days = x, Temperature = y)
 
 p <- ggplot(df, aes(x = Days, y = Temperature)) +
   geom_line(linewidth = 1) +
-  scale_x_continuous(
-    breaks = seq(0, 20, by = 5),
-    limits = c(0, 20)
-  ) +
-  scale_y_continuous(
-    breaks = c(4, 20, 37),
-    limits = c(4, 37)
-  ) +
-  labs(x = "Days", y = "Body Temperature (°C)") +
-  theme_classic(base_size = 35) +
-  theme(
-    axis.line   = element_line(color = "black", linewidth = 1.5),
-    axis.text.x = element_text(size = rel(1.5)),
-    axis.text.y = element_text(size = rel(1.5))
-  )
+  scale_x_continuous(breaks = seq(0, 20, by = 5), limits = c(0, 20)) +
+  scale_y_continuous(breaks = c(4, 20, 37), limits = c(4, 37)) +
+  labs(x = "Days", y = "Body temperature (\u00B0C)") +
+  theme_pub()
 
-ggsave("torpor_arousal_cycle.pdf", plot = p, width = 12, height = 8, device = "pdf")
-ggsave("torpor_arousal_cycle.png", plot = p, width = 12, height = 8, dpi = 300)
+print(p)
 
-
-
-
+save_figure(p, file.path(output_dir, "torpor_arousal_cycle"))
